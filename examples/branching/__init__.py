@@ -1,0 +1,33 @@
+"""ST-10 branching example package."""
+
+from .pipeline import (
+    BRANCH_STEP_NAME,
+    BRONZE_ROUTE_HTML_STEP_NAME,
+    BRONZE_ROUTE_JSON_STEP_NAME,
+    BRONZE_STAGE_NAME,
+    GOLD_STAGE_NAME,
+    GOLD_STEP_NAME,
+    HTML_SOURCE_NAME,
+    JSON_SOURCE_NAME,
+    PIPELINE_NAME,
+    SILVER_STAGE_NAME,
+    SILVER_STEP_NAME,
+    build_branching_pipeline,
+    run_branching_pipeline,
+)
+
+__all__ = [
+    "PIPELINE_NAME",
+    "BRONZE_STAGE_NAME",
+    "SILVER_STAGE_NAME",
+    "GOLD_STAGE_NAME",
+    "BRANCH_STEP_NAME",
+    "BRONZE_ROUTE_JSON_STEP_NAME",
+    "BRONZE_ROUTE_HTML_STEP_NAME",
+    "SILVER_STEP_NAME",
+    "GOLD_STEP_NAME",
+    "JSON_SOURCE_NAME",
+    "HTML_SOURCE_NAME",
+    "build_branching_pipeline",
+    "run_branching_pipeline",
+]
