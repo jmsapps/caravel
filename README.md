@@ -129,10 +129,3 @@ Use an example CLI entry point to emit a graph:
 
 The generated content starts with `flowchart TD` and is deterministic for a
 fixed pipeline declaration.
-
-## Azure extension seam
-
-Future adapter work can add Azure Storage container-backed Dataset/Loader
-implementations without changing core runner contracts. That extension seam is
-supported by this framework design, but adapter implementation is out of scope
-for DIPTAI01-4645.
