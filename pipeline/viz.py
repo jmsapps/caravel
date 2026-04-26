@@ -1,5 +1,3 @@
-"""Mermaid visualization helpers for declared pipelines."""
-
 from __future__ import annotations
 
 import re

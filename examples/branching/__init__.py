@@ -1,5 +1,3 @@
-"""ST-10 branching example package."""
-
 from .pipeline import (
     BRANCH_STEP_NAME,
     BRONZE_ROUTE_HTML_STEP_NAME,

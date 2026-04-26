@@ -1,5 +1,3 @@
-"""Pipeline framework core package for PoC orchestration."""
-
 from .branch import Branch
 from .cli import make_cli
 from .datasets import (

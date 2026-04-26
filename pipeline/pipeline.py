@@ -1,5 +1,3 @@
-"""Declaration API for pipeline, stage, and step composition."""
-
 from __future__ import annotations
 
 import copy

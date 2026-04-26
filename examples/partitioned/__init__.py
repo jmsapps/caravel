@@ -1,5 +1,3 @@
-"""Partitioned dataset example pipeline for ST-09b."""
-
 from .pipeline import (
     BRONZE_STAGE_NAME,
     BRONZE_STEP_NAME,

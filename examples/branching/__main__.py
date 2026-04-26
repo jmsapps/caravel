@@ -1,5 +1,3 @@
-"""CLI entry point for the ST-10 branching example pipeline."""
-
 from __future__ import annotations
 
 from pipeline.cli import make_cli

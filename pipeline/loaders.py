@@ -1,5 +1,3 @@
-"""Loader implementations for pipeline input composition."""
-
 from __future__ import annotations
 
 from typing import Callable

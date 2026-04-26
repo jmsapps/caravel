@@ -1,5 +1,3 @@
-"""ST-09 minimal linear example pipeline (JSONDataset-only)."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -83,7 +81,7 @@ def silver_finalize(partitions: dict[str, dict[str, Any]], *, context: object) -
 
 
 def build_minimal_pipeline(input_path: Path | str | None = None) -> Pipeline:
-    """Build the ST-09 minimal example pipeline declaration."""
+    """Build the minimal example pipeline declaration."""
     seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
 
     loader = dataset_as_loader(JSONDataset(name="minimal_seed", path=seed_path))

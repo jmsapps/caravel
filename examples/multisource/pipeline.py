@@ -1,5 +1,3 @@
-"""ST-09c multisource example pipeline (MultiSourceLoader + collision behavior)."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -37,7 +35,7 @@ def make_multisource_loader(
     source_a_dir: Path | str | None = None,
     source_b_dir: Path | str | None = None,
 ) -> MultiSourceLoader:
-    """Build the default multisource loader for ST-09c happy-path fixtures."""
+    """Build the default multisource loader for happy-path fixtures."""
     resolved_a = Path(source_a_dir) if source_a_dir is not None else _DEFAULT_SOURCE_A_DIR
     resolved_b = Path(source_b_dir) if source_b_dir is not None else _DEFAULT_SOURCE_B_DIR
 
@@ -87,7 +85,7 @@ def build_multisource_pipeline(
     source_a_dir: Path | str | None = None,
     source_b_dir: Path | str | None = None,
 ) -> Pipeline:
-    """Build the ST-09c multisource pipeline declaration."""
+    """Build the multisource pipeline declaration."""
     loader = make_multisource_loader(source_a_dir=source_a_dir, source_b_dir=source_b_dir)
 
     return Pipeline(
@@ -103,7 +101,7 @@ def run_multisource_pipeline(
     source_a_dir: Path | str | None = None,
     source_b_dir: Path | str | None = None,
 ) -> Path:
-    """Run the ST-09c multisource example pipeline and return resolved run root."""
+    """Run the multisource example pipeline and return resolved run root."""
     pipeline = build_multisource_pipeline(source_a_dir=source_a_dir, source_b_dir=source_b_dir)
     return run(pipeline, run_root=run_root)
 

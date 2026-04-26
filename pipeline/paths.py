@@ -1,5 +1,3 @@
-"""Path and naming helpers for the PoC pipeline framework."""
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -44,7 +42,7 @@ def resolve_run_root(pipeline_name: str, override: Path | None = None) -> Path:
 
     If ``override`` is provided, it is returned as-is.
     Otherwise defaults to:
-    ``<repo_root>/src/poc/data/<pipeline_name>/<UTC_timestamp>/``
+    ``<repo_root>/data/<pipeline_name>/<UTC_timestamp>/``
     where timestamp format is ``YYYY-MM-DDTHHMMSSZ``.
     """
     if override is not None:

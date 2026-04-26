@@ -1,5 +1,3 @@
-"""ST-09b partitioned example pipeline (text/json partitioned datasets + path-style keys)."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -108,7 +106,7 @@ def gold_partition_by_language(
 
 
 def build_partitioned_pipeline(input_dir: Path | str | None = None) -> Pipeline:
-    """Build the ST-09b partitioned pipeline declaration."""
+    """Build the partitioned pipeline declaration."""
     seed_dir = Path(input_dir) if input_dir is not None else _DEFAULT_INPUT_DIR
 
     loader = dataset_as_loader(PartitionedJSONDataset(name="partitioned_seed", path=seed_dir))

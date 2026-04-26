@@ -1,5 +1,3 @@
-"""Execution runner for declared PoC pipelines."""
-
 from __future__ import annotations
 
 import copy

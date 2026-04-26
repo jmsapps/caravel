@@ -1,5 +1,3 @@
-"""ST-09c multisource example package."""
-
 from .pipeline import (
     PIPELINE_NAME,
     SOURCE_A_NAME,

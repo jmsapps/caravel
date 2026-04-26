@@ -1,8 +1,3 @@
-"""Dataset implementations for pipeline I/O dispatch.
-
-These classes implement the `Dataset` protocol from `pipeline.types`.
-"""
-
 from __future__ import annotations
 
 import json

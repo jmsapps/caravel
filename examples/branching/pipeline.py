@@ -1,5 +1,3 @@
-"""ST-10 branching example pipeline (Branch routing + convergence)."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -53,7 +51,7 @@ def make_branching_loader(
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
 ) -> MultiSourceLoader:
-    """Build ST-10 multisource loader over JSON and HTML fixture directories."""
+    """Build multisource loader over JSON and HTML fixture directories."""
     resolved_json = (
         Path(json_source_dir) if json_source_dir is not None else _DEFAULT_JSON_SOURCE_DIR
     )
@@ -210,7 +208,7 @@ def build_branching_pipeline(
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
 ) -> Pipeline:
-    """Build the ST-10 synthetic branching pipeline declaration."""
+    """Build the synthetic branching pipeline declaration."""
     loader = make_branching_loader(
         json_source_dir=json_source_dir,
         html_source_dir=html_source_dir,
@@ -242,7 +240,7 @@ def run_branching_pipeline(
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
 ) -> Path:
-    """Run the ST-10 branching pipeline and return the resolved run root."""
+    """Run the branching pipeline and return the resolved run root."""
     pipeline = build_branching_pipeline(
         json_source_dir=json_source_dir,
         html_source_dir=html_source_dir,

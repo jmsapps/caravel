@@ -1,5 +1,3 @@
-"""Minimal linear pipeline example for ST-09."""
-
 from .pipeline import (
     BRONZE_STAGE_NAME,
     BRONZE_STEP_NAME,

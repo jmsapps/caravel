@@ -1,12 +1,3 @@
-"""CLI entry point for the minimal example pipeline.
-
-Run from the repo root, for example:
-
-    .\\.venv\\Scripts\\python.exe -m examples.minimal --run-root src\\poc\\data\\minimal_example\\smoke_run
-
-See README.md in this folder for full usage and debug flags.
-"""
-
 from __future__ import annotations
 
 from pipeline.cli import make_cli
