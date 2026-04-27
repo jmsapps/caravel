@@ -1,15 +1,8 @@
-import sys
-from pathlib import Path
-
 import pytest
 
-src_path = Path(__file__).resolve().parents[3]
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from pipeline.branch import Branch  # noqa: E402
-from pipeline.datasets import JSONDataset  # noqa: E402
-from pipeline.pipeline import Pipeline, Stage, Step, step  # noqa: E402
+from caravel.branch import Branch
+from caravel.datasets import JSONDataset
+from caravel.pipeline import Pipeline, Stage, Step, step
 
 
 class _StubLoader:

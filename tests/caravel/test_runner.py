@@ -1,18 +1,13 @@
 import json
 import logging
-import sys
 from pathlib import Path
 
 import pytest
 
-src_path = Path(__file__).resolve().parents[3]
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from pipeline import Branch  # noqa: E402
-from pipeline.datasets import JSONDataset, PartitionedJSONDataset  # noqa: E402
-from pipeline.pipeline import Pipeline, Stage, step  # noqa: E402
-from pipeline.types import KeyCollisionError, MissingPriorOutputError  # noqa: E402
+from caravel import Branch
+from caravel.datasets import JSONDataset, PartitionedJSONDataset
+from caravel.pipeline import Pipeline, Stage, step
+from caravel.types import KeyCollisionError, MissingPriorOutputError
 
 
 class _StubLoader:
@@ -65,7 +60,7 @@ def _make_linear_pipeline(call_counter: dict[str, int] | None = None) -> Pipelin
 def test_run_executes_linear_pipeline_and_writes_canonical_stage_step_layout(
     tmp_path: Path,
 ) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
     run_root = run(pipeline, run_root=tmp_path)
@@ -86,7 +81,7 @@ def test_run_executes_linear_pipeline_and_writes_canonical_stage_step_layout(
 def test_run_uses_resolve_run_root_default_when_override_not_provided(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from pipeline import runner
+    from caravel import runner
 
     pipeline = _make_linear_pipeline()
 
@@ -107,7 +102,7 @@ def test_run_uses_resolve_run_root_default_when_override_not_provided(
 
 
 def test_run_respects_explicit_run_root_override(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
     explicit_root = tmp_path / "explicit_run_root"
@@ -119,7 +114,7 @@ def test_run_respects_explicit_run_root_override(tmp_path: Path) -> None:
 
 
 def test_only_stage_by_name_executes_target_stage_with_prior_load_from_disk(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     calls: dict[str, int] = {}
     pipeline = _make_linear_pipeline(call_counter=calls)
@@ -135,7 +130,7 @@ def test_only_stage_by_name_executes_target_stage_with_prior_load_from_disk(tmp_
 
 
 def test_only_stage_by_index_executes_target_stage(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     calls: dict[str, int] = {}
     pipeline = _make_linear_pipeline(call_counter=calls)
@@ -153,7 +148,7 @@ def test_only_stage_by_index_executes_target_stage(tmp_path: Path) -> None:
 def test_only_step_by_name_executes_target_step_and_requires_prior_output(
     tmp_path: Path,
 ) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
 
@@ -167,7 +162,7 @@ def test_only_step_by_name_executes_target_step_and_requires_prior_output(
 
 
 def test_only_step_by_index_executes_target_step(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
 
@@ -194,7 +189,7 @@ def test_only_step_by_index_executes_target_step(tmp_path: Path) -> None:
 
 
 def test_only_step_by_index_requires_prior_step_output_from_same_stage(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     @step(output=PartitionedJSONDataset(name="bronze_partitions"))
     def first_step(
@@ -232,7 +227,7 @@ def test_missing_prior_output_under_selective_execution_raises_meaningful_error(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
 
@@ -251,7 +246,7 @@ def test_invalid_selective_selector_logs_context_before_raise(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
 
@@ -265,7 +260,7 @@ def test_invalid_selective_selector_logs_context_before_raise(
 
 
 def test_only_step_target_recomputes_when_output_already_exists(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     calls: dict[str, int] = {}
     pipeline = _make_linear_pipeline(call_counter=calls)
@@ -284,9 +279,9 @@ def test_only_step_target_recomputes_when_output_already_exists(tmp_path: Path) 
 
 
 def test_run_passes_custom_params_to_step_context(tmp_path: Path) -> None:
-    from pipeline.runner import run
-    from pipeline.datasets import JSONDataset
-    from pipeline.pipeline import Pipeline, Stage, step
+    from caravel.runner import run
+    from caravel.datasets import JSONDataset
+    from caravel.pipeline import Pipeline, Stage, step
 
     @step(output=JSONDataset(name="capture_params"))
     def capture_params(
@@ -314,7 +309,7 @@ def test_run_passes_custom_params_to_step_context(tmp_path: Path) -> None:
 
 
 def test_branch_entry_executes_routes_and_persists_route_lineage_paths(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     @step(output=PartitionedJSONDataset(name="json_norm"))
     def normalize_json(
@@ -380,7 +375,7 @@ def test_branch_entry_executes_routes_and_persists_route_lineage_paths(tmp_path:
 
 
 def test_branch_route_overlap_propagates_key_collision_error(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     @step(output=PartitionedJSONDataset(name="json_norm"))
     def normalize_json(
@@ -421,7 +416,7 @@ def test_branch_route_overlap_propagates_key_collision_error(tmp_path: Path) -> 
 
 
 def test_keep_source_tag_false_strips_source_field_before_save(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     @step(output=PartitionedJSONDataset(name="bronze_partitions"))
     def passthrough(
@@ -445,7 +440,7 @@ def test_keep_source_tag_false_strips_source_field_before_save(tmp_path: Path) -
 
 
 def test_keep_source_tag_true_preserves_source_field(tmp_path: Path) -> None:
-    from pipeline.runner import run
+    from caravel.runner import run
 
     @step(output=PartitionedJSONDataset(name="bronze_partitions"))
     def passthrough(
@@ -471,11 +466,11 @@ def test_keep_source_tag_true_preserves_source_field(tmp_path: Path) -> None:
 def test_runner_logs_step_start_end_with_dataset_describe_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from pipeline import runner
+    from caravel import runner
 
     pipeline = _make_linear_pipeline()
 
-    logger = logging.getLogger("pipeline.runner.test")
+    logger = logging.getLogger("caravel.runner.test")
     logger.setLevel(logging.INFO)
 
     def _fake_get_logger(

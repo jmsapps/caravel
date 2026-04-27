@@ -21,12 +21,23 @@ Use this framework to declare and run deterministic data pipelines with:
 - selective stage/step execution
 - optional Mermaid graph rendering
 
+See [AGENTS.md](AGENTS.md) for the production-readiness roadmap.
+
+## Project Layout
+
+```text
+src/caravel/        # installable library package
+examples/           # runnable example pipelines
+tests/caravel/      # framework tests
+tests/examples/     # example pipeline tests
+```
+
 ## Setup
 
-Install the test dependency in your active environment:
+Install Caravel in editable mode with test dependencies:
 
 ```bash
-python3 -m pip install -r requirements.txt
+python3 -m pip install -e ".[test]"
 ```
 
 Run the test suite:
@@ -40,7 +51,7 @@ python3 -m pytest -q
 ```python
 from pathlib import Path
 
-from pipeline import (
+from caravel import (
     Branch,
     MultiSourceLoader,
     PartitionedJSONDataset,

@@ -77,7 +77,7 @@ python3 -m examples.branching --mermaid data/branching_example/graph.mmd
 ### Run The Branching Tests
 
 ```bash
-python3 -m pytest -q examples/tests/test_branching_pipeline.py
+python3 -m pytest -q tests/examples/test_branching_pipeline.py
 ```
 
 ## Where To Inspect Outputs

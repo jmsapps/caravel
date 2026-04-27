@@ -4,12 +4,11 @@ from pathlib import Path
 
 import pytest
 
-repo_root = Path(__file__).resolve().parents[4]
-src_path = repo_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
+repo_root = Path(__file__).resolve().parents[2]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
-from examples.minimal.pipeline import (  # noqa: E402
+from examples.minimal.pipeline import (
     BRONZE_STAGE_NAME,
     BRONZE_STEP_NAME,
     PIPELINE_NAME,
@@ -18,7 +17,7 @@ from examples.minimal.pipeline import (  # noqa: E402
     SILVER_TRANSFORM_STEP_NAME,
     build_minimal_pipeline,
 )
-from pipeline.runner import run  # noqa: E402
+from caravel.runner import run
 
 
 def _step_output_file(
@@ -167,15 +166,15 @@ def test_minimal_pipeline_loader_fixture_missing_raises_file_not_found(tmp_path:
 
 
 def test_minimal_pipeline_smoke_readme_tracks_actual_stage_step_names() -> None:
-    readme_path = repo_root / "src" / "poc" / "examples" / "minimal" / "README.md"
+    readme_path = repo_root / "examples" / "minimal" / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
 
     for required_section in [
         "## Purpose",
         "## Fixtures",
-        "## Smoke test flow",
-        "## Expected behaviors",
-        "## Failure signals",
+        "## Smoke Test Flow",
+        "## Expected Behaviors",
+        "## Failure Signals",
     ]:
         assert required_section in readme
 

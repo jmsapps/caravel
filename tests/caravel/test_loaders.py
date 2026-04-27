@@ -1,15 +1,10 @@
-import sys
 from pathlib import Path
 
 import pytest
 
-src_path = Path(__file__).resolve().parents[3]
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from pipeline.datasets import PartitionedJSONDataset  # noqa: E402
-from pipeline.loaders import CallableLoader, MultiSourceLoader, dataset_as_loader  # noqa: E402
-from pipeline.types import KeyCollisionError, Partitions  # noqa: E402
+from caravel.datasets import PartitionedJSONDataset
+from caravel.loaders import CallableLoader, MultiSourceLoader, dataset_as_loader
+from caravel.types import KeyCollisionError, Partitions
 
 
 class _StubLoader:

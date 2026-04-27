@@ -4,12 +4,11 @@ from pathlib import Path
 
 import pytest
 
-repo_root = Path(__file__).resolve().parents[4]
-src_path = repo_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
+repo_root = Path(__file__).resolve().parents[2]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
-from examples.branching.pipeline import (  # noqa: E402
+from examples.branching.pipeline import (
     _DEFAULT_COLLISION_HTML_SOURCE_DIR,
     _DEFAULT_COLLISION_JSON_SOURCE_DIR,
     BRANCH_STEP_NAME,
@@ -25,8 +24,8 @@ from examples.branching.pipeline import (  # noqa: E402
     SILVER_STEP_NAME,
     build_branching_pipeline,
 )
-from pipeline import Branch, KeyCollisionError  # noqa: E402
-from pipeline.runner import run  # noqa: E402
+from caravel import Branch, KeyCollisionError
+from caravel.runner import run
 
 
 def _partition_file(
@@ -242,15 +241,15 @@ def test_branching_pipeline_repeat_run_preserves_gold_key_set(tmp_path: Path) ->
 
 
 def test_branching_pipeline_smoke_readme_tracks_branch_stage_step_and_route_names() -> None:
-    readme_path = repo_root / "src" / "poc" / "examples" / "branching" / "README.md"
+    readme_path = repo_root / "examples" / "branching" / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
 
     for required_section in [
         "## Purpose",
         "## Fixtures",
-        "## Smoke test flow",
-        "## Expected behaviors",
-        "## Failure signals",
+        "## Smoke Test Flow",
+        "## Expected Behaviors",
+        "## Failure Signals",
     ]:
         assert required_section in readme
 

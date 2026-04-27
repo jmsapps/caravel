@@ -1,14 +1,9 @@
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
-src_path = Path(__file__).resolve().parents[3]
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from pipeline.datasets import (  # noqa: E402
+from caravel.datasets import (
     BytesDataset,
     JSONDataset,
     PartitionedBytesDataset,

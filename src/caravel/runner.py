@@ -4,7 +4,7 @@ import copy
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from utils.logger import get_logger
+from .logger import get_logger
 
 from .branch import Branch
 from .paths import resolve_run_root
@@ -169,7 +169,7 @@ def run(
     )
     resolved_run_root.mkdir(parents=True, exist_ok=True)
 
-    logger = get_logger(f"pipeline.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
+    logger = get_logger(f"caravel.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
     is_selective = only_stage is not None or only_step is not None
     run_params = dict(params) if params is not None else {}
 

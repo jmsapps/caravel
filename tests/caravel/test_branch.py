@@ -1,14 +1,7 @@
-import sys
-from pathlib import Path
-
 import pytest
 
-src_path = Path(__file__).resolve().parents[3]
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from pipeline.branch import Branch  # noqa: E402
-from pipeline.types import KeyCollisionError, MissingSourceTagError  # noqa: E402
+from caravel.branch import Branch
+from caravel.types import KeyCollisionError, MissingSourceTagError
 
 
 def test_branch_by_source_groups_partitions_by_source_tag() -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pipeline.cli import make_cli
+from caravel.cli import make_cli
 
 from .pipeline import build_minimal_pipeline
 

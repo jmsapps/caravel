@@ -2,12 +2,11 @@ import json
 import sys
 from pathlib import Path
 
-repo_root = Path(__file__).resolve().parents[4]
-src_path = repo_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
+repo_root = Path(__file__).resolve().parents[2]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
-from examples.partitioned.pipeline import (  # noqa: E402
+from examples.partitioned.pipeline import (
     BRONZE_STAGE_NAME,
     BRONZE_STEP_NAME,
     GOLD_STAGE_NAME,
@@ -17,7 +16,7 @@ from examples.partitioned.pipeline import (  # noqa: E402
     SILVER_STEP_NAME,
     build_partitioned_pipeline,
 )
-from pipeline.runner import run  # noqa: E402
+from caravel.runner import run
 
 
 def _partition_output_file(
@@ -187,15 +186,15 @@ def test_partitioned_pipeline_repeat_run_with_explicit_root_is_value_determinist
 
 
 def test_partitioned_pipeline_smoke_readme_tracks_actual_stage_and_step_names() -> None:
-    readme_path = repo_root / "src" / "poc" / "examples" / "partitioned" / "README.md"
+    readme_path = repo_root / "examples" / "partitioned" / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
 
     for required_section in [
         "## Purpose",
         "## Fixtures",
-        "## Smoke test flow",
-        "## Expected behaviors",
-        "## Failure signals",
+        "## Smoke Test Flow",
+        "## Expected Behaviors",
+        "## Failure Signals",
     ]:
         assert required_section in readme
 

@@ -1,12 +1,6 @@
 import re
-import sys
-from pathlib import Path
 
-src_path = Path(__file__).resolve().parents[3]
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from pipeline import Branch, JSONDataset, Pipeline, Stage, step, to_mermaid  # noqa: E402
+from caravel import Branch, JSONDataset, Pipeline, Stage, step, to_mermaid
 
 
 class _StubLoader:

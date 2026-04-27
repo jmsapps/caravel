@@ -4,12 +4,11 @@ from pathlib import Path
 
 import pytest
 
-repo_root = Path(__file__).resolve().parents[4]
-src_path = repo_root / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
+repo_root = Path(__file__).resolve().parents[2]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
-from examples.multisource.pipeline import (  # noqa: E402
+from examples.multisource.pipeline import (
     _DEFAULT_COLLISION_SOURCE_A_DIR,
     _DEFAULT_COLLISION_SOURCE_B_DIR,
     _DEFAULT_SOURCE_A_DIR,
@@ -22,8 +21,8 @@ from examples.multisource.pipeline import (  # noqa: E402
     build_multisource_pipeline,
     make_multisource_loader,
 )
-from pipeline import KeyCollisionError, PartitionedJSONDataset  # noqa: E402
-from pipeline.runner import run  # noqa: E402
+from caravel import KeyCollisionError, PartitionedJSONDataset
+from caravel.runner import run
 
 
 def _step_output_file(
@@ -121,15 +120,15 @@ def test_multisource_pipeline_repeat_run_with_explicit_root_is_value_determinist
 
 
 def test_multisource_pipeline_smoke_readme_tracks_stage_step_and_source_names() -> None:
-    readme_path = repo_root / "src" / "poc" / "examples" / "multisource" / "README.md"
+    readme_path = repo_root / "examples" / "multisource" / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
 
     for required_section in [
         "## Purpose",
         "## Fixtures",
-        "## Smoke test flow",
-        "## Expected behaviors",
-        "## Failure signals",
+        "## Smoke Test Flow",
+        "## Expected Behaviors",
+        "## Failure Signals",
     ]:
         assert required_section in readme
 

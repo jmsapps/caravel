@@ -1,4 +1,4 @@
-"""Core type contracts for the PoC pipeline framework.
+"""Core type contracts for the Caravel pipeline framework.
 
 This module intentionally keeps runtime behavior minimal and defines stable type
 surfaces used by path/dataset/runner/branch modules.

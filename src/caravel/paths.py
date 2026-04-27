@@ -49,8 +49,8 @@ def resolve_run_root(pipeline_name: str, override: Path | None = None) -> Path:
         return Path(override)
 
     timestamp = _utc_now().strftime("%Y-%m-%dT%H%M%SZ")
-    repo_root = Path(__file__).resolve().parents[3]
-    return repo_root / "src" / "poc" / "data" / pipeline_name / timestamp
+    repo_root = Path(__file__).resolve().parents[2]
+    return repo_root / "data" / pipeline_name / timestamp
 
 
 def validate_partition_key(key: str) -> None:

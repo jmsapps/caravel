@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-from pipeline import JSONDataset, Pipeline, Stage, dataset_as_loader, run, step
+from caravel import JSONDataset, Pipeline, Stage, dataset_as_loader, run, step
 
 PIPELINE_NAME = "minimal_example"
 BRONZE_STAGE_NAME = "bronze"

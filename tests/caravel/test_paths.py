@@ -1,14 +1,9 @@
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-src_path = Path(__file__).resolve().parents[3]
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from pipeline import paths  # noqa: E402
+from caravel import paths
 
 
 def test_format_stage_dir_zero_pads_index() -> None:
@@ -46,9 +41,7 @@ def test_resolve_run_root_uses_default_layout(monkeypatch: pytest.MonkeyPatch) -
 
     result = paths.resolve_run_root("demo_pipeline")
 
-    assert result.parts[-5:] == (
-        "src",
-        "poc",
+    assert result.parts[-3:] == (
         "data",
         "demo_pipeline",
     ) + ("2026-04-24T131415Z",)

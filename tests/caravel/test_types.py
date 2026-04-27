@@ -1,15 +1,10 @@
 import logging
-import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
-src_path = Path(__file__).resolve().parents[3]
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
-
-from pipeline.types import (  # noqa: E402
+from caravel.types import (
     SOURCE_FIELD,
     Dataset,
     KeyCollisionError,

@@ -58,7 +58,7 @@ python3 -m examples.multisource --mermaid data/multisource_example/graph.mmd
 ### Run The Multisource Tests
 
 ```bash
-python3 -m pytest -q examples/tests/test_multisource_pipeline.py
+python3 -m pytest -q tests/examples/test_multisource_pipeline.py
 ```
 
 ## Where To Inspect Outputs
