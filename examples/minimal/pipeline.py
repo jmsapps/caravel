@@ -100,7 +100,7 @@ def run_minimal_pipeline(
     *,
     run_root: Path | str | None = None,
     input_path: Path | str | None = None,
-) -> Path:
+) -> Path | str:
     """Run the minimal example pipeline and return the resolved run root."""
     pipeline = build_minimal_pipeline(input_path=input_path)
     return run(pipeline, run_root=run_root)

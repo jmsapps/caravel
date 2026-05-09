@@ -5,10 +5,11 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
 from .runner import run
+from .storage import is_url_path
 from .types import MissingPriorOutputError
 from .viz import to_mermaid
 
-RunFn = Callable[..., Path]
+RunFn = Callable[..., Path | str]
 MermaidFn = Callable[[Any], str]
 
 
@@ -100,7 +101,12 @@ def make_cli(
 
         only_stage = _coerce_selector(args.stage)
         only_step = _coerce_selector(args.step)
-        run_root = Path(args.run_root) if args.run_root is not None else None
+        if args.run_root is None:
+            run_root: Path | str | None = None
+        elif is_url_path(args.run_root):
+            run_root = args.run_root
+        else:
+            run_root = Path(args.run_root)
 
         try:
             params = _parse_params(args.params)

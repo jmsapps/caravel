@@ -170,3 +170,97 @@ def test_describe_contains_stable_minimum_keys() -> None:
     assert description["name"] == "txt_desc"
     assert "path" in description
     assert "suffix" in description
+
+
+def test_json_dataset_round_trip_memory_filesystem() -> None:
+    dataset = JSONDataset(name="json_mem")
+    out_dir = "memory://caravel/datasets/json/_001_step"
+    payload = {"alpha": {"value": 1}}
+
+    dataset.save(payload, out_dir)
+
+    loader = JSONDataset(
+        name="json_mem",
+        path="memory://caravel/datasets/json/_001_step/_001_step.json",
+    )
+    assert loader.load() == payload
+    assert dataset.exists(out_dir) is True
+
+
+def test_partitioned_json_dataset_round_trip_memory_filesystem() -> None:
+    dataset = PartitionedJSONDataset(name="json_parts_mem")
+    out_dir = "memory://caravel/datasets/parts_json/_001_step"
+    payload = {"en/alpha": {"value": 1}, "fr/beta": {"value": 2}}
+
+    dataset.save(payload, out_dir)
+
+    loader = PartitionedJSONDataset(
+        name="json_parts_mem",
+        path="memory://caravel/datasets/parts_json/_001_step",
+    )
+    assert loader.load() == payload
+    assert dataset.exists(out_dir) is True
+
+
+def test_text_dataset_round_trip_memory_filesystem() -> None:
+    dataset = TextDataset(name="text_mem", suffix=".html")
+    out_dir = "memory://caravel/datasets/text/_001_step"
+    payload = "<p>hello</p>"
+
+    dataset.save(payload, out_dir)
+
+    loader = TextDataset(
+        name="text_mem",
+        path="memory://caravel/datasets/text/_001_step/_001_step.html",
+        suffix=".html",
+    )
+    assert loader.load() == payload
+    assert dataset.exists(out_dir) is True
+
+
+def test_partitioned_text_dataset_round_trip_memory_filesystem() -> None:
+    dataset = PartitionedTextDataset(name="text_parts_mem", suffix=".txt")
+    out_dir = "memory://caravel/datasets/parts_text/_001_step"
+    payload = {"en/alpha": "hello", "fr/beta": "bonjour"}
+
+    dataset.save(payload, out_dir)
+
+    loader = PartitionedTextDataset(
+        name="text_parts_mem",
+        path="memory://caravel/datasets/parts_text/_001_step",
+        suffix=".txt",
+    )
+    assert loader.load() == payload
+    assert dataset.exists(out_dir) is True
+
+
+def test_bytes_dataset_round_trip_memory_filesystem() -> None:
+    dataset = BytesDataset(name="bytes_mem", suffix=".bin")
+    out_dir = "memory://caravel/datasets/bytes/_001_step"
+    payload = b"binary-data"
+
+    dataset.save(payload, out_dir)
+
+    loader = BytesDataset(
+        name="bytes_mem",
+        path="memory://caravel/datasets/bytes/_001_step/_001_step.bin",
+        suffix=".bin",
+    )
+    assert loader.load() == payload
+    assert dataset.exists(out_dir) is True
+
+
+def test_partitioned_bytes_dataset_round_trip_memory_filesystem() -> None:
+    dataset = PartitionedBytesDataset(name="bytes_parts_mem", suffix=".bin")
+    out_dir = "memory://caravel/datasets/parts_bytes/_001_step"
+    payload = {"en/alpha": b"a", "fr/beta": b"b"}
+
+    dataset.save(payload, out_dir)
+
+    loader = PartitionedBytesDataset(
+        name="bytes_parts_mem",
+        path="memory://caravel/datasets/parts_bytes/_001_step",
+        suffix=".bin",
+    )
+    assert loader.load() == payload
+    assert dataset.exists(out_dir) is True

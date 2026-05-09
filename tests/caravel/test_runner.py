@@ -2,6 +2,7 @@ import json
 import logging
 from pathlib import Path
 
+import fsspec
 import pytest
 
 from caravel import Branch
@@ -18,6 +19,10 @@ class _StubLoader:
 
     def load(self) -> dict[str, dict[str, object]]:
         return self._partitions
+
+
+def _memory_run_root(name: str) -> str:
+    return f"memory://caravel/test_runner/{name}"
 
 
 def _make_linear_pipeline(call_counter: dict[str, int] | None = None) -> Pipeline:
@@ -113,6 +118,22 @@ def test_run_respects_explicit_run_root_override(tmp_path: Path) -> None:
     assert (explicit_root / "_001_bronze" / "_001_bronze_map" / "a.json").exists()
 
 
+def test_run_supports_remote_memory_run_root_and_writes_outputs() -> None:
+    from caravel.runner import run
+
+    pipeline = _make_linear_pipeline()
+    run_root = _memory_run_root("remote_full")
+
+    resolved = run(pipeline, run_root=run_root)
+    assert resolved == run_root
+    assert isinstance(resolved, str)
+
+    fs, root = fsspec.core.url_to_fs(run_root)
+    assert fs.exists(f"{root}/_001_bronze/_001_bronze_map/a.json")
+    assert fs.exists(f"{root}/_001_bronze/_001_bronze_map/b.json")
+    assert fs.exists(f"{root}/_002_silver/_001_silver_summary/_001_silver_summary.json")
+
+
 def test_only_stage_by_name_executes_target_stage_with_prior_load_from_disk(tmp_path: Path) -> None:
     from caravel.runner import run
 
@@ -140,6 +161,23 @@ def test_only_stage_by_index_executes_target_stage(tmp_path: Path) -> None:
     before_silver = calls.get("silver_summary", 0)
 
     run(pipeline, run_root=tmp_path, only_stage=2)
+
+    assert calls.get("bronze_map", 0) == before_bronze
+    assert calls.get("silver_summary", 0) == before_silver + 1
+
+
+def test_only_stage_by_name_executes_target_stage_with_remote_prior_load() -> None:
+    from caravel.runner import run
+
+    calls: dict[str, int] = {}
+    pipeline = _make_linear_pipeline(call_counter=calls)
+    run_root = _memory_run_root("remote_only_stage")
+
+    run(pipeline, run_root=run_root)
+    before_bronze = calls.get("bronze_map", 0)
+    before_silver = calls.get("silver_summary", 0)
+
+    run(pipeline, run_root=run_root, only_stage="silver")
 
     assert calls.get("bronze_map", 0) == before_bronze
     assert calls.get("silver_summary", 0) == before_silver + 1
@@ -223,6 +261,28 @@ def test_only_step_by_index_requires_prior_step_output_from_same_stage(tmp_path:
         )
 
 
+def test_only_step_by_name_executes_target_step_with_remote_prior_output() -> None:
+    from caravel.runner import run
+
+    calls: dict[str, int] = {}
+    pipeline = _make_linear_pipeline(call_counter=calls)
+    run_root = _memory_run_root("remote_only_step")
+
+    run(pipeline, run_root=run_root)
+    before_bronze = calls.get("bronze_map", 0)
+    before_silver = calls.get("silver_summary", 0)
+
+    run(
+        pipeline,
+        run_root=run_root,
+        only_stage="silver",
+        only_step="silver_summary",
+    )
+
+    assert calls.get("bronze_map", 0) == before_bronze
+    assert calls.get("silver_summary", 0) == before_silver + 1
+
+
 def test_missing_prior_output_under_selective_execution_raises_meaningful_error(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -240,6 +300,18 @@ def test_missing_prior_output_under_selective_execution_raises_meaningful_error(
     joined = "\n".join(record.getMessage() for record in caplog.records)
     assert "SELECTIVE FAILURE" in joined
     assert "missing-prior-output" in joined
+
+
+def test_missing_prior_output_under_remote_selective_execution_raises_meaningful_error() -> None:
+    from caravel.runner import run
+
+    pipeline = _make_linear_pipeline()
+    run_root = _memory_run_root("remote_missing_prior")
+
+    with pytest.raises(MissingPriorOutputError, match="Required prior output missing") as exc:
+        run(pipeline, run_root=run_root, only_stage="silver")
+
+    assert "memory://caravel/test_runner/remote_missing_prior" in str(exc.value)
 
 
 def test_invalid_selective_selector_logs_context_before_raise(
