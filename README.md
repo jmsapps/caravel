@@ -40,6 +40,14 @@ Install Caravel in editable mode with test dependencies:
 python3 -m pip install -e ".[test]"
 ```
 
+Install with cloud extras when needed:
+
+```bash
+python3 -m pip install -e ".[azure]"
+python3 -m pip install -e ".[gcp]"
+python3 -m pip install -e ".[s3]"
+```
+
 Run the test suite:
 
 ```bash
@@ -120,6 +128,13 @@ def build_pipeline() -> Pipeline:
 Partition keys may use path-style nesting like `en/record_001`; partitioned
 datasets resolve those keys into nested output directories.
 
+Dataset `path` values can be local paths or `fsspec` URLs such as:
+
+- `./examples/fsspec/data/input_partitions.json`
+- `abfs://caravel/input/input_partitions.json`
+- `gs://my-bucket/prefix/input_partitions.json`
+- `s3://my-bucket/prefix/input_partitions.json`
+
 ## Multi-Source And Branch Pattern
 
 - Use `MultiSourceLoader([...])` to combine named source datasets.
@@ -163,10 +178,26 @@ consistent:
 - `--keep-source-tag`
 - `--mermaid <out_path>`
 
+`--run-root` accepts local paths and `fsspec` URL roots.
+
 Run an example from the repo root:
 
 ```bash
 python3 -m examples.minimal --run-root data/minimal_example/smoke_run
+```
+
+Fsspec-backed input example:
+
+```bash
+CARAVEL_INPUT_URL=./examples/fsspec/data/input_partitions.json \
+python3 -m examples.fsspec --run-root data/fsspec_example/smoke_run
+```
+
+Remote run-root example:
+
+```bash
+CARAVEL_INPUT_URL=abfs://caravel/input/input_partitions.json \
+python3 -m examples.fsspec --run-root abfs://caravel/output/smoke_run
 ```
 
 `--mermaid` is diagram-only mode and is mutually exclusive with execution flags:

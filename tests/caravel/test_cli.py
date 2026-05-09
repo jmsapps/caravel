@@ -46,6 +46,22 @@ def test_make_cli_forwards_run_root_to_runner(tmp_path: Path) -> None:
     assert calls[0]["run_root"] == run_root
 
 
+def test_make_cli_preserves_url_run_root_as_string(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
+        calls.append(kwargs)
+        return tmp_path
+
+    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
+    remote_root = "memory://caravel/runs/demo"
+
+    exit_code = cli(["--run-root", remote_root])
+
+    assert exit_code == 0
+    assert calls[0]["run_root"] == remote_root
+
+
 def test_make_cli_forwards_stage_and_step_selectors(tmp_path: Path) -> None:
     calls: list[dict[str, object]] = []
 

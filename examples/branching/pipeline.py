@@ -239,7 +239,7 @@ def run_branching_pipeline(
     run_root: Path | str | None = None,
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
-) -> Path:
+) -> Path | str:
     """Run the branching pipeline and return the resolved run root."""
     pipeline = build_branching_pipeline(
         json_source_dir=json_source_dir,

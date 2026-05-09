@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .logger import get_logger
-
 from .branch import Branch
-from .paths import resolve_run_root
+from .paths import format_stage_dir, format_step_dir, resolve_run_root
 from .pipeline import Step
+from .storage import is_url_path, join_path, leaf_name
 from .types import (
     SOURCE_FIELD,
     Dataset,
@@ -19,6 +19,7 @@ from .types import (
 )
 
 _DECORATED_OUTPUT_ATTR = "__poc_step_output_dataset__"
+RunPath = Path | str
 
 
 def _step_name(fn: Callable[..., Any]) -> str:
@@ -55,19 +56,50 @@ def _normalize_route_step(step_like: Step | Callable[..., Any]) -> Step:
     return Step(fn=step_like, output=output)
 
 
-def _dataset_at_path(dataset: Dataset, path: Path) -> Dataset:
+def _is_remote_path(path: RunPath) -> bool:
+    return isinstance(path, str) and is_url_path(path)
+
+
+def _join_run_path(base: RunPath, *parts: str) -> RunPath:
+    if _is_remote_path(base):
+        return join_path(base, *parts)
+    resolved = base if isinstance(base, Path) else Path(base)
+    return resolved.joinpath(*parts)
+
+
+def _run_path_name(path: RunPath) -> str:
+    if _is_remote_path(path):
+        name = leaf_name(path)
+        return name or "remote_run"
+    resolved = path if isinstance(path, Path) else Path(path)
+    return resolved.name
+
+
+def _dataset_at_path(dataset: Dataset, path: RunPath) -> Dataset:
     bound = copy.copy(dataset)
     if hasattr(bound, "path"):
         dataset_name = type(dataset).__name__
-        target_path = Path(path)
-        if dataset_name == "JSONDataset":
-            target_path = target_path / f"{target_path.name}.json"
-        elif dataset_name == "TextDataset":
-            suffix = str(getattr(dataset, "suffix", ".txt"))
-            target_path = target_path / f"{target_path.name}{suffix}"
-        elif dataset_name == "BytesDataset":
-            suffix = str(getattr(dataset, "suffix", ".bin"))
-            target_path = target_path / f"{target_path.name}{suffix}"
+        if _is_remote_path(path):
+            target_path: Path | str = path
+            path_name = _run_path_name(path)
+            if dataset_name == "JSONDataset":
+                target_path = join_path(path, f"{path_name}.json")
+            elif dataset_name == "TextDataset":
+                suffix = str(getattr(dataset, "suffix", ".txt"))
+                target_path = join_path(path, f"{path_name}{suffix}")
+            elif dataset_name == "BytesDataset":
+                suffix = str(getattr(dataset, "suffix", ".bin"))
+                target_path = join_path(path, f"{path_name}{suffix}")
+        else:
+            target_path = Path(path)
+            if dataset_name == "JSONDataset":
+                target_path = target_path / f"{target_path.name}.json"
+            elif dataset_name == "TextDataset":
+                suffix = str(getattr(dataset, "suffix", ".txt"))
+                target_path = target_path / f"{target_path.name}{suffix}"
+            elif dataset_name == "BytesDataset":
+                suffix = str(getattr(dataset, "suffix", ".bin"))
+                target_path = target_path / f"{target_path.name}{suffix}"
 
         setattr(bound, "path", target_path)
         return bound
@@ -76,7 +108,7 @@ def _dataset_at_path(dataset: Dataset, path: Path) -> Dataset:
     )
 
 
-def _load_from_step_output(dataset: Dataset, step_dir: Path) -> Any:
+def _load_from_step_output(dataset: Dataset, step_dir: RunPath) -> Any:
     reader = _dataset_at_path(dataset, step_dir)
     return reader.load()
 
@@ -147,7 +179,7 @@ def _resolve_step_entry_index(stage: Any, selector: str | int | None) -> int | N
     raise ValueError(f"Invalid step selector type: {type(selector).__name__}.")
 
 
-def _missing_prior_error(path: Path, stage_name: str, step_name: str) -> MissingPriorOutputError:
+def _missing_prior_error(path: RunPath, stage_name: str, step_name: str) -> MissingPriorOutputError:
     return MissingPriorOutputError(
         "Required prior output missing for selective execution: "
         f"stage='{stage_name}' step='{step_name}' path='{path}'."
@@ -162,12 +194,15 @@ def run(
     only_step: str | int | None = None,
     params: Mapping[str, str] | None = None,
     keep_source_tag: bool = False,
-) -> Path:
+) -> RunPath:
     """Execute a pipeline declaration and persist outputs per step."""
-    resolved_run_root = resolve_run_root(
-        pipeline.name, Path(run_root) if run_root is not None else None
-    )
-    resolved_run_root.mkdir(parents=True, exist_ok=True)
+    if run_root is not None and _is_remote_path(run_root):
+        resolved_run_root: RunPath = run_root
+    else:
+        resolved_run_root = resolve_run_root(
+            pipeline.name, Path(run_root) if run_root is not None else None
+        )
+        resolved_run_root.mkdir(parents=True, exist_ok=True)
 
     logger = get_logger(f"caravel.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
     is_selective = only_stage is not None or only_step is not None
@@ -252,10 +287,10 @@ def run(
             )
 
         prev_step_name = _step_decl_name(prev_last_entry)
-        prev_dir = (
-            resolved_run_root
-            / f"_{stage_index:03d}_{prev_stage.name}"
-            / f"_{len(prev_stage.entries):03d}_{prev_step_name}"
+        prev_dir = _join_run_path(
+            resolved_run_root,
+            format_stage_dir(stage_index, prev_stage.name),
+            format_step_dir(len(prev_stage.entries), prev_step_name),
         )
         if not prev_last_entry.output.exists(prev_dir):
             _log_selective_failure(
@@ -282,10 +317,12 @@ def run(
 
     for stage_index in stage_indexes:
         stage = pipeline.stages[stage_index]
-        stage_dir = resolved_run_root / f"_{stage_index + 1:03d}_{stage.name}"
+        stage_dir = _join_run_path(
+            resolved_run_root, format_stage_dir(stage_index + 1, stage.name)
+        )
 
         partitions: Partitions = _load_stage_seed(stage_index)
-        previous_step_ref: tuple[Dataset, Path, str, str] | None = None
+        previous_step_ref: tuple[Dataset, RunPath, str, str] | None = None
 
         entry_indexes: list[int]
         if selected_stage_idx == stage_index and selected_step_entry_idx is not None:
@@ -313,27 +350,32 @@ def run(
                 )
 
             prior_step_name = _step_decl_name(prior_entry)
-            prior_step_dir = stage_dir / f"_{prior_entry_index + 1:03d}_{prior_step_name}"
+            prior_step_dir = _join_run_path(
+                stage_dir,
+                format_step_dir(prior_entry_index + 1, prior_step_name),
+            )
             previous_step_ref = (prior_entry.output, prior_step_dir, stage.name, prior_step_name)
 
         for entry_index in entry_indexes:
             entry = stage.entries[entry_index]
 
             if isinstance(entry, Branch):
-                branch_dir = stage_dir / f"_{entry_index + 1:03d}_{entry.name}"
+                branch_dir = _join_run_path(
+                    stage_dir, format_step_dir(entry_index + 1, entry.name)
+                )
                 grouped = entry.route_partitions(partitions)
                 route_outputs: dict[str, Partitions] = {}
 
                 for route_key in entry.routes:
                     route_steps = entry.routes[route_key]
                     route_partitions = grouped.get(route_key, {})
-                    route_prev_ref: tuple[Dataset, Path, str] | None = None
+                    route_prev_ref: tuple[Dataset, RunPath, str] | None = None
                     route_current: Any = route_partitions
 
                     for route_step_index, route_step_like in enumerate(route_steps, start=1):
                         route_step = _normalize_route_step(route_step_like)
                         route_step_name = _step_decl_name(route_step)
-                        route_step_dir = branch_dir / route_key / route_step_name
+                        route_step_dir = _join_run_path(branch_dir, route_key, route_step_name)
 
                         if route_step_index > 1 and route_prev_ref is not None:
                             prev_dataset, prev_dir, prev_name = route_prev_ref
@@ -344,7 +386,7 @@ def run(
                         step_ctx = StepContext(
                             run_root=resolved_run_root,
                             pipeline_name=pipeline.name,
-                            run_id=resolved_run_root.name,
+                            run_id=_run_path_name(resolved_run_root),
                             stage_index=stage_index + 1,
                             stage_name=stage.name,
                             step_index=route_step_index,
@@ -402,7 +444,7 @@ def run(
                 )
 
             entry_name = _step_decl_name(entry)
-            step_dir = stage_dir / f"_{entry_index + 1:03d}_{entry_name}"
+            step_dir = _join_run_path(stage_dir, format_step_dir(entry_index + 1, entry_name))
 
             explicit_target = (
                 selected_stage_idx == stage_index and selected_step_entry_idx == entry_index
@@ -434,7 +476,7 @@ def run(
             step_ctx = StepContext(
                 run_root=resolved_run_root,
                 pipeline_name=pipeline.name,
-                run_id=resolved_run_root.name,
+                run_id=_run_path_name(resolved_run_root),
                 stage_index=stage_index + 1,
                 stage_name=stage.name,
                 step_index=entry_index + 1,

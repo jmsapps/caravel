@@ -126,7 +126,7 @@ def run_partitioned_pipeline(
     *,
     run_root: Path | str | None = None,
     input_dir: Path | str | None = None,
-) -> Path:
+) -> Path | str:
     """Run the partitioned example pipeline and return resolved run root."""
     pipeline = build_partitioned_pipeline(input_dir=input_dir)
     return run(pipeline, run_root=run_root)

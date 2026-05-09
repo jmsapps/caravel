@@ -28,15 +28,15 @@ class StepContext:
           and optional diagnostics only.
     """
 
-    run_root: Path
+    run_root: Path | str
     pipeline_name: str
     run_id: str
     stage_index: int
     stage_name: str
     step_index: int
     step_name: str
-    step_dir: Path
-    prev_step_dir: Path | None
+    step_dir: Path | str
+    prev_step_dir: Path | str | None
     logger: logging.Logger
     params: Mapping[str, str]
 
@@ -57,11 +57,11 @@ class Dataset(Protocol):
         """Load and return payload from the dataset's configured path."""
         ...
 
-    def save(self, payload: Any, dest: Path) -> None:
+    def save(self, payload: Any, dest: Path | str) -> None:
         """Persist payload into destination folder ``dest``."""
         ...
 
-    def exists(self, dest: Path) -> bool:
+    def exists(self, dest: Path | str) -> bool:
         """Return whether expected output already exists under ``dest``."""
         ...
 

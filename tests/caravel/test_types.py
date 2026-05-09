@@ -21,11 +21,13 @@ class _StubDataset:
     def load(self) -> dict[str, str]:
         return {"k": "v"}
 
-    def save(self, payload: object, dest: Path) -> None:
-        (dest / "saved.txt").write_text(str(payload), encoding="utf-8")
+    def save(self, payload: object, dest: Path | str) -> None:
+        resolved = Path(dest)
+        (resolved / "saved.txt").write_text(str(payload), encoding="utf-8")
 
-    def exists(self, dest: Path) -> bool:
-        return (dest / "saved.txt").exists()
+    def exists(self, dest: Path | str) -> bool:
+        resolved = Path(dest)
+        return (resolved / "saved.txt").exists()
 
     def describe(self) -> dict[str, str]:
         return {"name": self.name}
@@ -71,6 +73,24 @@ def test_step_context_is_frozen_and_has_expected_fields(tmp_path: Path) -> None:
 
     with pytest.raises(FrozenInstanceError):
         context.step_name = "mutated"  # type: ignore[misc]
+
+
+def test_step_context_supports_string_paths_for_remote_roots() -> None:
+    context = StepContext(
+        run_root="memory://caravel/runs/demo",
+        pipeline_name="demo_pipeline",
+        run_id="demo",
+        stage_index=1,
+        stage_name="bronze",
+        step_index=1,
+        step_name="collect",
+        step_dir="memory://caravel/runs/demo/_001_bronze/_001_collect",
+        prev_step_dir=None,
+        logger=logging.getLogger("test-step-context-remote"),
+        params={},
+    )
+    assert isinstance(context.run_root, str)
+    assert isinstance(context.step_dir, str)
 
 
 def test_source_field_constant_is_reserved_source_tag() -> None:

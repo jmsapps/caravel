@@ -100,7 +100,7 @@ def run_multisource_pipeline(
     run_root: Path | str | None = None,
     source_a_dir: Path | str | None = None,
     source_b_dir: Path | str | None = None,
-) -> Path:
+) -> Path | str:
     """Run the multisource example pipeline and return resolved run root."""
     pipeline = build_multisource_pipeline(source_a_dir=source_a_dir, source_b_dir=source_b_dir)
     return run(pipeline, run_root=run_root)

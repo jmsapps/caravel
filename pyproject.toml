@@ -12,11 +12,30 @@ license = { file = "LICENSE" }
 authors = [
   { name = "JMS Apps" },
 ]
-dependencies = []
+dependencies = [
+  "fsspec",
+  "python-dotenv==1.2.2"
+]
 
 [project.optional-dependencies]
 test = [
   "pytest",
+]
+azure = [
+  "adlfs",
+  "azure-identity",
+]
+gcp = [
+  "gcsfs",
+]
+s3 = [
+  "s3fs",
+]
+cloud = [
+  "adlfs",
+  "azure-identity",
+  "gcsfs",
+  "s3fs",
 ]
 
 [tool.setuptools.packages.find]
