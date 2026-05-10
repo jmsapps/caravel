@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from caravel.branch import Branch
@@ -128,6 +130,27 @@ def test_stage_preserves_branch_entries_without_wrapping() -> None:
 def test_stage_rejects_unsupported_entry_type() -> None:
     with pytest.raises(TypeError, match="Stage 'bronze'"):
         Stage(name="bronze", entries=[123])  # type: ignore[list-item]
+
+
+def test_stage_accepts_stage_root_path_or_url() -> None:
+    local_stage = Stage(name="bronze", entries=[_plain_step], stage_root=Path("data/bronze"))
+    remote_stage = Stage(name="silver", entries=[_plain_step], stage_root="abfs://container/silver")
+
+    assert local_stage.stage_root == Path("data/bronze")
+    assert remote_stage.stage_root == "abfs://container/silver"
+
+
+def test_stage_rejects_invalid_or_empty_stage_root() -> None:
+    with pytest.raises(TypeError, match="stage_root"):
+        Stage(name="bronze", entries=[_plain_step], stage_root=123)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        Stage(name="bronze", entries=[_plain_step], stage_root="")
+
+
+def test_stage_requires_clean_dirs_to_be_bool() -> None:
+    with pytest.raises(TypeError, match="clean_dirs"):
+        Stage(name="bronze", entries=[_plain_step], clean_dirs="yes")  # type: ignore[arg-type]
 
 
 def test_pipeline_requires_loader_protocol_and_preserves_stage_order() -> None:

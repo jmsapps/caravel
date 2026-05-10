@@ -145,11 +145,8 @@ Dataset `path` values can be local paths or `fsspec` URLs such as:
 
 ## Output Folder Layout
 
-By default, each run is written under:
-
-```text
-data/<pipeline_name>/<UTC_timestamp>/
-```
+`run_root` is required for execution. The caller chooses the run root path
+or URL (for example a local directory, `abfs://...`, `gs://...`, or `s3://...`).
 
 Inside a run root, outputs are stage/step-scoped:
 
@@ -178,9 +175,17 @@ consistent:
 - `--keep-source-tag`
 - `--mermaid <out_path>`
 
-`--run-root` accepts local paths and `fsspec` URL roots.
+`--run-root` is optional. If omitted, Caravel writes under
+`data/output/<pipeline_name>/...`.
+When provided, `--run-root` accepts local paths and `fsspec` URL roots.
 
 Run an example from the repo root:
+
+```bash
+python3 -m examples.minimal
+```
+
+Explicit root override:
 
 ```bash
 python3 -m examples.minimal --run-root data/minimal_example/smoke_run

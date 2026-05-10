@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from .branch import Branch
 from .datasets import JSONDataset
 from .types import Dataset, Loader, StepFn
 
-_STEP_OUTPUT_ATTR = "__poc_step_output_dataset__"
+_STEP_OUTPUT_ATTR = "__step_output_dataset__"
 
 
 def _callable_name(fn: Callable[..., Any]) -> str:
@@ -92,8 +93,24 @@ class Stage:
 
     name: str
     entries: list[Step | Branch | Callable[..., Any]]
+    stage_root: Path | str | None = None
+    clean_dirs: bool = False
 
     def __post_init__(self) -> None:
+        if self.stage_root is not None:
+            if isinstance(self.stage_root, Path):
+                pass
+            elif isinstance(self.stage_root, str):
+                if self.stage_root.strip() == "":
+                    raise ValueError("Stage.stage_root cannot be empty when provided.")
+            else:
+                raise TypeError(
+                    f"Stage.stage_root must be Path | str | None, got {type(self.stage_root).__name__}."
+                )
+
+        if not isinstance(self.clean_dirs, bool):
+            raise TypeError(f"Stage.clean_dirs must be bool, got {type(self.clean_dirs).__name__}.")
+
         normalized: list[Step | Branch | Callable[..., Any]] = []
 
         for entry in self.entries:

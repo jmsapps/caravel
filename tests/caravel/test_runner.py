@@ -25,6 +25,10 @@ def _memory_run_root(name: str) -> str:
     return f"memory://caravel/test_runner/{name}"
 
 
+def _default_stage_base(run_root: Path, pipeline_name: str, index: int, stage_name: str) -> Path:
+    return run_root / pipeline_name / f"_{index:03d}_{stage_name}"
+
+
 def _make_linear_pipeline(call_counter: dict[str, int] | None = None) -> Pipeline:
     @step(output=PartitionedJSONDataset(name="bronze_partitions"))
     def bronze_map(
@@ -72,8 +76,8 @@ def test_run_executes_linear_pipeline_and_writes_canonical_stage_step_layout(
 
     assert run_root == tmp_path
 
-    bronze_step_dir = tmp_path / "_001_bronze" / "_001_bronze_map"
-    silver_step_dir = tmp_path / "_002_silver" / "_001_silver_summary"
+    bronze_step_dir = _default_stage_base(tmp_path, pipeline.name, 1, "bronze") / "_001_bronze_map"
+    silver_step_dir = _default_stage_base(tmp_path, pipeline.name, 2, "silver") / "_001_silver_summary"
 
     assert (bronze_step_dir / "a.json").exists()
     assert (bronze_step_dir / "b.json").exists()
@@ -83,27 +87,23 @@ def test_run_executes_linear_pipeline_and_writes_canonical_stage_step_layout(
     assert silver_payload["count"] == 2
 
 
-def test_run_uses_resolve_run_root_default_when_override_not_provided(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from caravel import runner
+def test_run_defaults_run_root_to_data_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
+    monkeypatch.chdir(tmp_path)
 
-    captured: dict[str, object] = {}
+    resolved = run(pipeline)
 
-    def _fake_resolve_run_root(pipeline_name: str, override: Path | None = None) -> Path:
-        captured["pipeline_name"] = pipeline_name
-        captured["override"] = override
-        return tmp_path / "resolved-default"
-
-    monkeypatch.setattr(runner, "resolve_run_root", _fake_resolve_run_root)
-
-    resolved = runner.run(pipeline)
-
-    assert resolved == tmp_path / "resolved-default"
-    assert captured["pipeline_name"] == "demo_runner"
-    assert captured["override"] is None
+    assert resolved == Path("data/output")
+    bronze_file = (
+        Path("data/output")
+        / pipeline.name
+        / "_001_bronze"
+        / "_001_bronze_map"
+        / "a.json"
+    )
+    assert bronze_file.exists()
 
 
 def test_run_respects_explicit_run_root_override(tmp_path: Path) -> None:
@@ -115,7 +115,9 @@ def test_run_respects_explicit_run_root_override(tmp_path: Path) -> None:
     resolved = run(pipeline, run_root=explicit_root)
 
     assert resolved == explicit_root
-    assert (explicit_root / "_001_bronze" / "_001_bronze_map" / "a.json").exists()
+    assert (
+        explicit_root / pipeline.name / "_001_bronze" / "_001_bronze_map" / "a.json"
+    ).exists()
 
 
 def test_run_supports_remote_memory_run_root_and_writes_outputs() -> None:
@@ -129,9 +131,200 @@ def test_run_supports_remote_memory_run_root_and_writes_outputs() -> None:
     assert isinstance(resolved, str)
 
     fs, root = fsspec.core.url_to_fs(run_root)
-    assert fs.exists(f"{root}/_001_bronze/_001_bronze_map/a.json")
-    assert fs.exists(f"{root}/_001_bronze/_001_bronze_map/b.json")
-    assert fs.exists(f"{root}/_002_silver/_001_silver_summary/_001_silver_summary.json")
+    assert fs.exists(f"{root}/{pipeline.name}/_001_bronze/_001_bronze_map/a.json")
+    assert fs.exists(f"{root}/{pipeline.name}/_001_bronze/_001_bronze_map/b.json")
+    assert fs.exists(
+        f"{root}/{pipeline.name}/_002_silver/_001_silver_summary/_001_silver_summary.json"
+    )
+
+
+def test_stage_root_override_bypasses_default_stage_folder_and_keeps_step_layout(
+    tmp_path: Path,
+) -> None:
+    from caravel.runner import run
+
+    pipeline = _make_linear_pipeline()
+    run_root = tmp_path / "fallback_run_root"
+    stage_root = tmp_path / "bronze_container" / "run_001"
+    pipeline.stages[0].stage_root = stage_root
+
+    run(pipeline, run_root=run_root)
+
+    assert (stage_root / "_001_bronze_map" / "a.json").exists()
+    assert (stage_root / "_001_bronze_map" / "b.json").exists()
+    assert not (stage_root / "_001_bronze").exists()
+    assert (
+        run_root
+        / pipeline.name
+        / "_002_silver"
+        / "_001_silver_summary"
+        / "_001_silver_summary.json"
+    ).exists()
+
+
+def test_clean_dirs_true_clears_existing_stage_contents_before_stage_run(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="cleaned_stage"))
+    def pass_through(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return partitions
+
+    stage_root = tmp_path / "stage_clean_target"
+    stale_file = stage_root / "stale.txt"
+    stage_root.mkdir(parents=True, exist_ok=True)
+    stale_file.write_text("stale", encoding="utf-8")
+
+    pipeline = Pipeline(
+        name="clean_dirs_pipeline",
+        loader=_StubLoader({"a": {"id": "a", "value": 1}}),
+        stages=[Stage(name="bronze", entries=[pass_through], stage_root=stage_root, clean_dirs=True)],
+    )
+
+    run(pipeline, run_root=tmp_path / "fallback_root")
+
+    assert not stale_file.exists()
+    assert stage_root.exists()
+    assert (stage_root / "_001_pass_through" / "a.json").exists()
+
+
+def test_clean_dirs_true_without_stage_root_clears_run_root_contents_before_stage_run(
+    tmp_path: Path,
+) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="run_root_cleaned"))
+    def pass_through(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return partitions
+
+    run_root = tmp_path / "run_root_clean_target"
+    stale_file = run_root / "stale.txt"
+    stale_dir_file = run_root / "obsolete" / "old.json"
+    stale_dir_file.parent.mkdir(parents=True, exist_ok=True)
+    stale_file.write_text("stale", encoding="utf-8")
+    stale_dir_file.write_text("stale", encoding="utf-8")
+
+    pipeline = Pipeline(
+        name="run_root_clean_dirs_pipeline",
+        loader=_StubLoader({"a": {"id": "a", "value": 1}}),
+        stages=[Stage(name="bronze", entries=[pass_through], clean_dirs=True)],
+    )
+
+    run(pipeline, run_root=run_root)
+
+    assert run_root.exists()
+    assert not stale_file.exists()
+    assert not stale_dir_file.exists()
+    assert (
+        run_root
+        / pipeline.name
+        / "_001_bronze"
+        / "_001_pass_through"
+        / "a.json"
+    ).exists()
+
+
+def test_clean_dirs_true_fails_fast_for_selective_non_first_step_without_deleting(
+    tmp_path: Path,
+) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="first_output"))
+    def first_step(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return partitions
+
+    @step(output=JSONDataset(name="second_output"))
+    def second_step(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = context
+        return {"count": len(partitions)}
+
+    stage_root = tmp_path / "stage_failfast_target"
+    sentinel = stage_root / "sentinel.txt"
+    stage_root.mkdir(parents=True, exist_ok=True)
+    sentinel.write_text("preserve", encoding="utf-8")
+
+    pipeline = Pipeline(
+        name="failfast_pipeline",
+        loader=_StubLoader({"a": {"id": "a", "value": 1}}),
+        stages=[
+            Stage(
+                name="bronze",
+                entries=[first_step, second_step],
+                stage_root=stage_root,
+                clean_dirs=True,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="clean_dirs=True cannot be used"):
+        run(
+            pipeline,
+            run_root=tmp_path / "fallback_root",
+            only_stage="bronze",
+            only_step="second_step",
+        )
+
+    assert sentinel.exists()
+
+
+def test_clean_dirs_on_later_default_stage_loads_seed_before_run_root_cleanup(
+    tmp_path: Path,
+) -> None:
+    from caravel.runner import run
+
+    pipeline = _make_linear_pipeline()
+    pipeline.stages[1].clean_dirs = True
+
+    run(pipeline, run_root=tmp_path)
+
+    bronze_file = (
+        tmp_path
+        / pipeline.name
+        / "_001_bronze"
+        / "_001_bronze_map"
+        / "a.json"
+    )
+    silver_file = (
+        tmp_path
+        / pipeline.name
+        / "_002_silver"
+        / "_001_silver_summary"
+        / "_001_silver_summary.json"
+    )
+
+    assert not bronze_file.exists()
+    assert silver_file.exists()
+
+
+def test_default_collision_behavior_overwrites_existing_step_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    pipeline = _make_linear_pipeline()
+
+    run(pipeline, run_root=tmp_path)
+    silver_file = (
+        tmp_path
+        / pipeline.name
+        / "_002_silver"
+        / "_001_silver_summary"
+        / "_001_silver_summary.json"
+    )
+    silver_file.write_text('{"count": 999}', encoding="utf-8")
+
+    run(pipeline, run_root=tmp_path, only_stage="silver")
+
+    payload = json.loads(silver_file.read_text("utf-8"))
+    assert payload["count"] == 2
 
 
 def test_only_stage_by_name_executes_target_stage_with_prior_load_from_disk(tmp_path: Path) -> None:
@@ -204,7 +397,7 @@ def test_only_step_by_index_executes_target_step(tmp_path: Path) -> None:
 
     pipeline = _make_linear_pipeline()
 
-    bronze_dir = tmp_path / "_001_bronze" / "_001_bronze_map"
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map"
     bronze_dataset = PartitionedJSONDataset(name="seed", path=bronze_dir)
     bronze_dataset.save(
         {
@@ -221,7 +414,13 @@ def test_only_step_by_index_executes_target_step(tmp_path: Path) -> None:
         only_step=1,
     )
 
-    silver_file = tmp_path / "_002_silver" / "_001_silver_summary" / "_001_silver_summary.json"
+    silver_file = (
+        tmp_path
+        / pipeline.name
+        / "_002_silver"
+        / "_001_silver_summary"
+        / "_001_silver_summary.json"
+    )
     payload = json.loads(silver_file.read_text("utf-8"))
     assert payload["count"] == 2
 
@@ -375,7 +574,13 @@ def test_run_passes_custom_params_to_step_context(tmp_path: Path) -> None:
         params={"refresh": "hard", "lang": "en"},
     )
 
-    out_file = tmp_path / "_001_single" / "_001_capture_params" / "_001_capture_params.json"
+    out_file = (
+        tmp_path
+        / pipeline.name
+        / "_001_single"
+        / "_001_capture_params"
+        / "_001_capture_params.json"
+    )
     payload = json.loads(out_file.read_text("utf-8"))
     assert payload["params"] == {"refresh": "hard", "lang": "en"}
 
@@ -427,6 +632,7 @@ def test_branch_entry_executes_routes_and_persists_route_lineage_paths(tmp_path:
 
     json_file = (
         tmp_path
+        / pipeline.name
         / "_001_bronze"
         / "_001_normalize_by_source"
         / "json"
@@ -435,6 +641,7 @@ def test_branch_entry_executes_routes_and_persists_route_lineage_paths(tmp_path:
     )
     html_file = (
         tmp_path
+        / pipeline.name
         / "_001_bronze"
         / "_001_normalize_by_source"
         / "html"
@@ -506,7 +713,9 @@ def test_keep_source_tag_false_strips_source_field_before_save(tmp_path: Path) -
     run(pipeline, run_root=tmp_path, keep_source_tag=False)
 
     stored = json.loads(
-        (tmp_path / "_001_bronze" / "_001_passthrough" / "a.json").read_text("utf-8")
+        (tmp_path / pipeline.name / "_001_bronze" / "_001_passthrough" / "a.json").read_text(
+            "utf-8"
+        )
     )
     assert "__source__" not in stored
 
@@ -530,7 +739,9 @@ def test_keep_source_tag_true_preserves_source_field(tmp_path: Path) -> None:
     run(pipeline, run_root=tmp_path, keep_source_tag=True)
 
     stored = json.loads(
-        (tmp_path / "_001_bronze" / "_001_passthrough" / "a.json").read_text("utf-8")
+        (tmp_path / pipeline.name / "_001_bronze" / "_001_passthrough" / "a.json").read_text(
+            "utf-8"
+        )
     )
     assert stored["__source__"] == "src_a"
 

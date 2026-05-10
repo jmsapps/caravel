@@ -29,6 +29,7 @@ def _step_output_file(
 ) -> Path:
     return (
         run_root
+        / PIPELINE_NAME
         / f"_{stage_index:03d}_{stage_name}"
         / f"_{step_index:03d}_{step_name}"
         / f"_{step_index:03d}_{step_name}.json"

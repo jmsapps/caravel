@@ -53,7 +53,11 @@ def make_cli(
         prog=pipeline.name,
         description=f"Run pipeline '{pipeline.name}' or emit Mermaid graph.",
     )
-    parser.add_argument("--run-root", dest="run_root", help="Output run root path override.")
+    parser.add_argument(
+        "--run-root",
+        dest="run_root",
+        help="Output run root (local path or URL root). Defaults to data/output.",
+    )
     parser.add_argument("--stage", dest="stage", help="Stage selector (name or 1-based index).")
     parser.add_argument("--step", dest="step", help="Step selector (name or 1-based index).")
     parser.add_argument(

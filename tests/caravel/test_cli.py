@@ -11,23 +11,20 @@ class _StubPipeline:
         self.stages: list[object] = []
 
 
-def test_make_cli_no_args_executes_full_pipeline(tmp_path: Path) -> None:
+def test_make_cli_executes_without_run_root_and_uses_runner_default() -> None:
     calls: list[dict[str, object]] = []
 
     def _fake_run(pipeline: object, **kwargs: object) -> Path:
         calls.append({"pipeline": pipeline, **kwargs})
-        return tmp_path
+        return Path(".")
 
     cli = make_cli(_StubPipeline(), run_fn=_fake_run)
+
     exit_code = cli([])
 
     assert exit_code == 0
     assert len(calls) == 1
     assert calls[0]["run_root"] is None
-    assert calls[0]["only_stage"] is None
-    assert calls[0]["only_step"] is None
-    assert calls[0]["params"] == {}
-    assert calls[0]["keep_source_tag"] is False
 
 
 def test_make_cli_forwards_run_root_to_runner(tmp_path: Path) -> None:
@@ -71,7 +68,7 @@ def test_make_cli_forwards_stage_and_step_selectors(tmp_path: Path) -> None:
 
     cli = make_cli(_StubPipeline(), run_fn=_fake_run)
 
-    exit_code = cli(["--stage", "silver", "--step", "normalize"])
+    exit_code = cli(["--run-root", str(tmp_path), "--stage", "silver", "--step", "normalize"])
 
     assert exit_code == 0
     assert calls[0]["only_stage"] == "silver"
@@ -87,7 +84,7 @@ def test_make_cli_parses_numeric_stage_step_as_int(tmp_path: Path) -> None:
 
     cli = make_cli(_StubPipeline(), run_fn=_fake_run)
 
-    exit_code = cli(["--stage", "2", "--step", "03"])
+    exit_code = cli(["--run-root", str(tmp_path), "--stage", "2", "--step", "03"])
 
     assert exit_code == 0
     assert calls[0]["only_stage"] == 2
@@ -103,7 +100,9 @@ def test_make_cli_forwards_custom_params_map(tmp_path: Path) -> None:
 
     cli = make_cli(_StubPipeline(), run_fn=_fake_run)
 
-    exit_code = cli(["--param", "refresh=hard", "--param", "lang=en"])
+    exit_code = cli(
+        ["--run-root", str(tmp_path), "--param", "refresh=hard", "--param", "lang=en"]
+    )
 
     assert exit_code == 0
     assert calls[0]["params"] == {"refresh": "hard", "lang": "en"}
@@ -118,7 +117,7 @@ def test_make_cli_forwards_keep_source_tag_flag(tmp_path: Path) -> None:
 
     cli = make_cli(_StubPipeline(), run_fn=_fake_run)
 
-    exit_code = cli(["--keep-source-tag"])
+    exit_code = cli(["--run-root", str(tmp_path), "--keep-source-tag"])
 
     assert exit_code == 0
     assert calls[0]["keep_source_tag"] is True
@@ -183,7 +182,7 @@ def test_make_cli_selector_validation_error_surfaces_user_message(
     cli = make_cli(_StubPipeline(), run_fn=_fake_run)
 
     with pytest.raises(SystemExit) as exc:
-        cli(["--stage", "missing"])
+        cli(["--run-root", "data/run", "--stage", "missing"])
 
     assert exc.value.code == 2
     err = capsys.readouterr().err

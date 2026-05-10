@@ -1,4 +1,3 @@
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -32,19 +31,16 @@ def test_resolve_step_output_dir_builds_canonical_path(tmp_path: Path) -> None:
 
 def test_resolve_run_root_returns_override_as_is(tmp_path: Path) -> None:
     override = tmp_path / "custom" / "run"
-    assert paths.resolve_run_root("education_hub", override=override) == override
+    assert paths.resolve_run_root(override=override) == override
 
 
-def test_resolve_run_root_uses_default_layout(monkeypatch: pytest.MonkeyPatch) -> None:
-    fixed = datetime(2026, 4, 24, 13, 14, 15, tzinfo=timezone.utc)
-    monkeypatch.setattr(paths, "_utc_now", lambda: fixed)
+def test_resolve_run_root_defaults_to_data_output() -> None:
+    assert paths.resolve_run_root() == Path("data/output")
 
-    result = paths.resolve_run_root("demo_pipeline")
 
-    assert result.parts[-3:] == (
-        "data",
-        "demo_pipeline",
-    ) + ("2026-04-24T131415Z",)
+def test_resolve_run_root_coerces_string_input() -> None:
+    result = paths.resolve_run_root("data/demo_run")
+    assert result == Path("data/demo_run")
 
 
 def test_validate_partition_key_allows_nested_keys() -> None:

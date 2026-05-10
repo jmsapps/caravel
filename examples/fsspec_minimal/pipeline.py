@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from caravel import JSONDataset, Pipeline, Stage, dataset_as_loader, run, step
+from caravel.storage import is_url_path
 
 PIPELINE_NAME = "fsspec_example"
 BRONZE_STAGE_NAME = "bronze"
@@ -25,6 +26,16 @@ def _runtime_params(context: object) -> Mapping[str, str]:
     if isinstance(params, dict):
         return {str(key): str(value) for key, value in params.items()}
     return {}
+
+
+def _as_path_or_url(value: Path | str | None) -> Path | str | None:
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return value
+    if is_url_path(value):
+        return value
+    return Path(value)
 
 
 def _azure_storage_options_from_env() -> dict[str, str] | None:
@@ -54,7 +65,7 @@ def _azure_storage_options_from_env() -> dict[str, str] | None:
     return options or None
 
 
-def _storage_options_for_url(path: str | Path) -> Mapping[str, Any] | None:
+def _storage_options_for_url(path: str | Path | None) -> Mapping[str, Any] | None:
     rendered = str(path)
     if rendered.startswith("abfs://") or rendered.startswith("az://"):
         return _azure_storage_options_from_env()
@@ -114,10 +125,27 @@ def silver_finalize(partitions: dict[str, dict[str, Any]], *, context: object) -
     return payload
 
 
-def build_fsspec_pipeline(input_path: Path | str | None = None) -> Pipeline:
+def build_fsspec_pipeline(
+    input_path: Path | str | None = None,
+    *,
+    bronze_stage_root: Path | str | None = None,
+    silver_stage_root: Path | str | None = None,
+) -> Pipeline:
     env_path = os.getenv("CARAVEL_INPUT_URL")
-    seed_path = input_path if input_path is not None else (env_path or _DEFAULT_INPUT_PATH)
+    seed_path = _as_path_or_url(input_path if input_path is not None else (env_path or _DEFAULT_INPUT_PATH))
     storage_options = _storage_options_for_url(seed_path)
+
+    resolved_bronze_stage_root = _as_path_or_url(
+        bronze_stage_root
+        if bronze_stage_root is not None
+        else os.getenv("CARAVEL_BRONZE_STAGE_ROOT")
+    )
+    resolved_silver_stage_root = _as_path_or_url(
+        silver_stage_root
+        if silver_stage_root is not None
+        else os.getenv("CARAVEL_SILVER_STAGE_ROOT")
+    )
+
     loader = dataset_as_loader(
         JSONDataset(
             name="fsspec_seed",
@@ -130,8 +158,16 @@ def build_fsspec_pipeline(input_path: Path | str | None = None) -> Pipeline:
         name=PIPELINE_NAME,
         loader=loader,
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[bronze_collect]),
-            Stage(name=SILVER_STAGE_NAME, entries=[silver_transform, silver_finalize]),
+            Stage(
+                name=BRONZE_STAGE_NAME,
+                stage_root=resolved_bronze_stage_root,
+                entries=[bronze_collect],
+            ),
+            Stage(
+                name=SILVER_STAGE_NAME,
+                stage_root=resolved_silver_stage_root,
+                entries=[silver_transform, silver_finalize],
+            ),
         ],
     )
 
@@ -140,8 +176,14 @@ def run_fsspec_pipeline(
     *,
     run_root: Path | str | None = None,
     input_path: Path | str | None = None,
+    bronze_stage_root: Path | str | None = None,
+    silver_stage_root: Path | str | None = None,
 ) -> Path | str:
-    pipeline = build_fsspec_pipeline(input_path=input_path)
+    pipeline = build_fsspec_pipeline(
+        input_path=input_path,
+        bronze_stage_root=bronze_stage_root,
+        silver_stage_root=silver_stage_root,
+    )
     return run(pipeline, run_root=run_root)
 
 

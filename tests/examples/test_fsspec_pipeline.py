@@ -7,7 +7,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from caravel.runner import run
-from examples.fsspec.pipeline import (
+from examples.fsspec_minimal.pipeline import (
     BRONZE_STAGE_NAME,
     BRONZE_STEP_NAME,
     PIPELINE_NAME,
@@ -21,6 +21,9 @@ from examples.fsspec.pipeline import (
 def _clear_fsspec_env(monkeypatch) -> None:
     for key in [
         "CARAVEL_INPUT_URL",
+        "CARAVEL_RUN_ROOT",
+        "CARAVEL_BRONZE_STAGE_ROOT",
+        "CARAVEL_SILVER_STAGE_ROOT",
         "AZURE_STORAGE_ACCOUNT_NAME",
         "AZURE_STORAGE_ACCOUNT_KEY",
         "AZURE_STORAGE_SAS_TOKEN",
@@ -40,6 +43,7 @@ def _step_output_file(
 ) -> Path:
     return (
         run_root
+        / PIPELINE_NAME
         / f"_{stage_index:03d}_{stage_name}"
         / f"_{step_index:03d}_{step_name}"
         / f"_{step_index:03d}_{step_name}.json"
@@ -98,7 +102,7 @@ def test_fsspec_pipeline_env_input_url_is_honored(
     monkeypatch,
 ) -> None:
     _clear_fsspec_env(monkeypatch)
-    fixture = repo_root / "examples" / "fsspec" / "data" / "input_partitions.json"
+    fixture = repo_root / "examples" / "fsspec_minimal" / "data" / "input_partitions.json"
     monkeypatch.setenv("CARAVEL_INPUT_URL", str(fixture))
 
     pipeline = build_fsspec_pipeline()

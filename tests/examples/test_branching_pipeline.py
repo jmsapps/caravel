@@ -39,6 +39,7 @@ def _partition_file(
 ) -> Path:
     return (
         run_root
+        / PIPELINE_NAME
         / f"_{stage_index:03d}_{stage_name}"
         / f"_{step_index:03d}_{step_name}"
         / Path(f"{partition_key}{suffix}")
@@ -54,6 +55,7 @@ def _branch_route_partition_file(
 ) -> Path:
     return (
         run_root
+        / PIPELINE_NAME
         / f"_001_{BRONZE_STAGE_NAME}"
         / f"_001_{BRANCH_STEP_NAME}"
         / route_name
@@ -63,7 +65,7 @@ def _branch_route_partition_file(
 
 
 def _gold_step_dir(run_root: Path) -> Path:
-    return run_root / f"_003_{GOLD_STAGE_NAME}" / f"_001_{GOLD_STEP_NAME}"
+    return run_root / PIPELINE_NAME / f"_003_{GOLD_STAGE_NAME}" / f"_001_{GOLD_STEP_NAME}"
 
 
 def _gold_partition_keys(run_root: Path) -> set[str]:
@@ -208,7 +210,9 @@ def test_branching_pipeline_unmapped_route_fails_before_silver(tmp_path: Path) -
     with pytest.raises(KeyError, match=HTML_SOURCE_NAME):
         run(pipeline, run_root=tmp_path)
 
-    silver_step_dir = tmp_path / f"_002_{SILVER_STAGE_NAME}" / f"_001_{SILVER_STEP_NAME}"
+    silver_step_dir = (
+        tmp_path / PIPELINE_NAME / f"_002_{SILVER_STAGE_NAME}" / f"_001_{SILVER_STEP_NAME}"
+    )
     assert not silver_step_dir.exists()
 
 

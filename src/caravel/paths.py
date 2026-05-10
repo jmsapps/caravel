@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -29,28 +28,11 @@ def resolve_step_output_dir(
     )
 
 
-def _utc_now() -> datetime:
-    """Return current UTC datetime.
-
-    Kept as a helper to make tests deterministic via monkeypatch.
-    """
-    return datetime.now(timezone.utc)
-
-
-def resolve_run_root(pipeline_name: str, override: Path | None = None) -> Path:
-    """Resolve run root path.
-
-    If ``override`` is provided, it is returned as-is.
-    Otherwise defaults to:
-    ``<repo_root>/data/<pipeline_name>/<UTC_timestamp>/``
-    where timestamp format is ``YYYY-MM-DDTHHMMSSZ``.
-    """
-    if override is not None:
-        return Path(override)
-
-    timestamp = _utc_now().strftime("%Y-%m-%dT%H%M%SZ")
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "data" / pipeline_name / timestamp
+def resolve_run_root(override: Path | str | None = None) -> Path:
+    """Resolve run root path, defaulting to ``data/output`` when omitted."""
+    if override is None:
+        return Path("data/output")
+    return Path(override)
 
 
 def validate_partition_key(key: str) -> None:

@@ -30,6 +30,7 @@ def _partition_output_file(
 ) -> Path:
     return (
         run_root
+        / PIPELINE_NAME
         / f"_{stage_index:03d}_{stage_name}"
         / f"_{step_index:03d}_{step_name}"
         / Path(f"{partition_key}{suffix}")
@@ -42,9 +43,9 @@ def test_partitioned_pipeline_run_writes_three_stage_canonical_layout(tmp_path: 
     run_root = run(pipeline, run_root=tmp_path)
 
     assert run_root == tmp_path
-    assert (run_root / "_001_bronze" / "_001_bronze_render_html").exists()
-    assert (run_root / "_002_silver" / "_001_silver_extract_structured").exists()
-    assert (run_root / "_003_gold" / "_001_gold_partition_by_language").exists()
+    assert (run_root / PIPELINE_NAME / "_001_bronze" / "_001_bronze_render_html").exists()
+    assert (run_root / PIPELINE_NAME / "_002_silver" / "_001_silver_extract_structured").exists()
+    assert (run_root / PIPELINE_NAME / "_003_gold" / "_001_gold_partition_by_language").exists()
 
 
 def test_partitioned_bronze_outputs_html_partitions_with_expected_suffix(tmp_path: Path) -> None:

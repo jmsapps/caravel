@@ -8,7 +8,7 @@ from .logger import get_logger
 from .branch import Branch
 from .paths import format_stage_dir, format_step_dir, resolve_run_root
 from .pipeline import Step
-from .storage import is_url_path, join_path, leaf_name
+from .storage import is_dir, is_url_path, join_path, leaf_name, resolve_fs
 from .types import (
     SOURCE_FIELD,
     Dataset,
@@ -18,7 +18,7 @@ from .types import (
     StepContext,
 )
 
-_DECORATED_OUTPUT_ATTR = "__poc_step_output_dataset__"
+_DECORATED_OUTPUT_ATTR = "__step_output_dataset__"
 RunPath = Path | str
 
 
@@ -58,6 +58,14 @@ def _normalize_route_step(step_like: Step | Callable[..., Any]) -> Step:
 
 def _is_remote_path(path: RunPath) -> bool:
     return isinstance(path, str) and is_url_path(path)
+
+
+def _coerce_run_path(path: Path | str) -> RunPath:
+    if isinstance(path, Path):
+        return path
+    if _is_remote_path(path):
+        return path
+    return Path(path)
 
 
 def _join_run_path(base: RunPath, *parts: str) -> RunPath:
@@ -186,6 +194,42 @@ def _missing_prior_error(path: RunPath, stage_name: str, step_name: str) -> Miss
     )
 
 
+def _validate_stage_clean_policy(
+    *, clean_dirs: bool, only_step_index: int | None, stage_name: str
+) -> None:
+    if clean_dirs and only_step_index is not None and only_step_index > 1:
+        raise ValueError(
+            "Stage clean_dirs=True cannot be used with selective non-first-step execution; "
+            f"stage='{stage_name}' step_index={only_step_index}. "
+            "Run the full stage, disable clean_dirs, or target step 1."
+        )
+
+
+def _clean_stage_base_if_needed(clean_root: RunPath, clean_dirs: bool) -> None:
+    if not clean_dirs:
+        return
+    fs, root = resolve_fs(clean_root)
+    if not fs.exists(root):
+        fs.makedirs(root, exist_ok=True)
+        return
+
+    if not is_dir(fs, root):
+        fs.rm(root)
+        fs.makedirs(root, exist_ok=True)
+        return
+
+    root_prefix = root.rstrip("/")
+    for child in fs.ls(root, detail=False):
+        child_path = str(child["name"]) if isinstance(child, dict) else str(child)
+        if root_prefix and not child_path.startswith(f"{root_prefix}/") and child_path != root:
+            child_path = join_path(root, child_path)
+        if child_path == root:
+            continue
+        fs.rm(child_path, recursive=True)
+
+    fs.makedirs(root, exist_ok=True)
+
+
 def run(
     pipeline: Any,
     run_root: Path | str | None = None,
@@ -199,9 +243,7 @@ def run(
     if run_root is not None and _is_remote_path(run_root):
         resolved_run_root: RunPath = run_root
     else:
-        resolved_run_root = resolve_run_root(
-            pipeline.name, Path(run_root) if run_root is not None else None
-        )
+        resolved_run_root = resolve_run_root(run_root)
         resolved_run_root.mkdir(parents=True, exist_ok=True)
 
     logger = get_logger(f"caravel.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
@@ -258,7 +300,23 @@ def run(
     else:
         stage_indexes = [selected_stage_idx]
 
-    def _load_stage_seed(stage_index: int) -> Partitions:
+    def _resolve_stage_base(stage_index: int) -> RunPath:
+        stage_decl = pipeline.stages[stage_index]
+        if stage_decl.stage_root is not None:
+            return _coerce_run_path(stage_decl.stage_root)
+        return _join_run_path(
+            resolved_run_root,
+            pipeline.name,
+            format_stage_dir(stage_index + 1, stage_decl.name),
+        )
+
+    def _resolve_stage_clean_root(stage_index: int) -> RunPath:
+        stage_decl = pipeline.stages[stage_index]
+        if stage_decl.stage_root is not None:
+            return _coerce_run_path(stage_decl.stage_root)
+        return resolved_run_root
+
+    def _load_stage_seed(stage_index: int, target_stage_name: str) -> Partitions:
         if stage_index == 0:
             return pipeline.loader.load()
 
@@ -266,7 +324,7 @@ def run(
         if not prev_stage.entries:
             _log_selective_failure(
                 "missing-prior-stage-entries",
-                target_stage=stage.name,
+                target_stage=target_stage_name,
                 required_stage=prev_stage.name,
             )
             raise MissingPriorOutputError(
@@ -277,7 +335,7 @@ def run(
         if not isinstance(prev_last_entry, Step):
             _log_selective_failure(
                 "prior-stage-terminal-entry-not-step",
-                target_stage=stage.name,
+                target_stage=target_stage_name,
                 required_stage=prev_stage.name,
                 required_entry_type=type(prev_last_entry).__name__,
             )
@@ -287,9 +345,9 @@ def run(
             )
 
         prev_step_name = _step_decl_name(prev_last_entry)
+        prev_stage_dir = _resolve_stage_base(stage_index - 1)
         prev_dir = _join_run_path(
-            resolved_run_root,
-            format_stage_dir(stage_index, prev_stage.name),
+            prev_stage_dir,
             format_step_dir(len(prev_stage.entries), prev_step_name),
         )
         if not prev_last_entry.output.exists(prev_dir):
@@ -317,11 +375,18 @@ def run(
 
     for stage_index in stage_indexes:
         stage = pipeline.stages[stage_index]
-        stage_dir = _join_run_path(
-            resolved_run_root, format_stage_dir(stage_index + 1, stage.name)
-        )
+        stage_dir = _resolve_stage_base(stage_index)
 
-        partitions: Partitions = _load_stage_seed(stage_index)
+        if selected_stage_idx == stage_index and selected_step_entry_idx is not None:
+            _validate_stage_clean_policy(
+                clean_dirs=stage.clean_dirs,
+                only_step_index=selected_step_entry_idx + 1,
+                stage_name=stage.name,
+            )
+
+        partitions: Partitions = _load_stage_seed(stage_index, stage.name)
+        clean_root = _resolve_stage_clean_root(stage_index)
+        _clean_stage_base_if_needed(clean_root, stage.clean_dirs)
         previous_step_ref: tuple[Dataset, RunPath, str, str] | None = None
 
         entry_indexes: list[int]
