@@ -21,8 +21,6 @@ Use this framework to declare and run deterministic data pipelines with:
 - selective stage/step execution
 - optional Mermaid graph rendering
 
-See [AGENTS.md](AGENTS.md) for the production-readiness roadmap.
-
 ## Project Layout
 
 ```text
@@ -218,3 +216,7 @@ fixed pipeline declaration.
 
 The framework is currently suitable for local development, examples, smoke tests, and
 non-critical internal runs.
+
+## Contributing
+
+Please feel free to raise issues, make pull requests, and/or fork this repo!
