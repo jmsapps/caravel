@@ -1,3 +1,5 @@
+![Caravel Logo](./public/logo.png)
+
 # Caravel: A Lightweight Pipeline Runner
 
 Caravel is a small Python framework for declaring and running deterministic data
