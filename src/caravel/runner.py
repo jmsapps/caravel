@@ -19,6 +19,7 @@ from .types import (
 )
 
 _DECORATED_OUTPUT_ATTR = "__step_output_dataset__"
+_DECORATED_PERSIST_ATTR = "__step_persist__"
 RunPath = Path | str
 
 
@@ -40,10 +41,17 @@ def _normalize_route_step(step_like: Step | Callable[..., Any]) -> Step:
         raise TypeError(f"Route step must be Step or callable, got {type(step_like).__name__}.")
 
     decorated_output = getattr(step_like, _DECORATED_OUTPUT_ATTR, None)
+    decorated_persist = getattr(step_like, _DECORATED_PERSIST_ATTR, None)
     if decorated_output is not None and not isinstance(decorated_output, Dataset):
         raise TypeError(
             f"Route callable '{_step_name(step_like)}' has invalid decorated output "
             f"type {type(decorated_output).__name__}; expected Dataset."
+        )
+
+    if decorated_persist is not None and not isinstance(decorated_persist, bool):
+        raise TypeError(
+            f"Route callable '{_step_name(step_like)}' has invalid decorated persist "
+            f"type {type(decorated_persist).__name__}; expected bool."
         )
 
     if isinstance(decorated_output, Dataset):
@@ -53,7 +61,8 @@ def _normalize_route_step(step_like: Step | Callable[..., Any]) -> Step:
 
         output = JSONDataset(name=_step_name(step_like))
 
-    return Step(fn=step_like, output=output)
+    persist = True if decorated_persist is None else decorated_persist
+    return Step(fn=step_like, output=output, persist=persist)
 
 
 def _is_remote_path(path: RunPath) -> bool:
@@ -194,6 +203,13 @@ def _missing_prior_error(path: RunPath, stage_name: str, step_name: str) -> Miss
     )
 
 
+def _non_persistent_prior_error(stage_name: str, step_name: str) -> MissingPriorOutputError:
+    return MissingPriorOutputError(
+        "Required prior output is non-persistent for selective execution: "
+        f"stage='{stage_name}' step='{step_name}'."
+    )
+
+
 def _validate_stage_clean_policy(
     *, clean_dirs: bool, only_step_index: int | None, stage_name: str
 ) -> None:
@@ -239,7 +255,7 @@ def run(
     params: Mapping[str, str] | None = None,
     keep_source_tag: bool = False,
 ) -> RunPath:
-    """Execute a pipeline declaration and persist outputs per step."""
+    """Execute a pipeline declaration and persist outputs per configured step."""
     if run_root is not None and _is_remote_path(run_root):
         resolved_run_root: RunPath = run_root
     else:
@@ -345,6 +361,14 @@ def run(
             )
 
         prev_step_name = _step_decl_name(prev_last_entry)
+        if not prev_last_entry.persist:
+            _log_selective_failure(
+                "non-persistent-prior-output",
+                required_stage=prev_stage.name,
+                required_step=prev_step_name,
+            )
+            raise _non_persistent_prior_error(prev_stage.name, prev_step_name)
+
         prev_stage_dir = _resolve_stage_base(stage_index - 1)
         prev_dir = _join_run_path(
             prev_stage_dir,
@@ -388,6 +412,7 @@ def run(
         clean_root = _resolve_stage_clean_root(stage_index)
         _clean_stage_base_if_needed(clean_root, stage.clean_dirs)
         previous_step_ref: tuple[Dataset, RunPath, str, str] | None = None
+        previous_step_payload: Any | None = None
 
         entry_indexes: list[int]
         if selected_stage_idx == stage_index and selected_step_entry_idx is not None:
@@ -415,11 +440,29 @@ def run(
                 )
 
             prior_step_name = _step_decl_name(prior_entry)
+            if not prior_entry.persist:
+                _log_selective_failure(
+                    "non-persistent-prior-output",
+                    required_stage=stage.name,
+                    required_step=prior_step_name,
+                )
+                raise _non_persistent_prior_error(stage.name, prior_step_name)
             prior_step_dir = _join_run_path(
                 stage_dir,
                 format_step_dir(prior_entry_index + 1, prior_step_name),
             )
             previous_step_ref = (prior_entry.output, prior_step_dir, stage.name, prior_step_name)
+            prev_dataset, prev_dir, prev_stage_name, prev_step_name = previous_step_ref
+            if not prev_dataset.exists(prev_dir):
+                logger.error(
+                    "Missing prior output pipeline=%s stage=%s step=%s path=%s",
+                    pipeline.name,
+                    prev_stage_name,
+                    prev_step_name,
+                    prev_dir,
+                )
+                raise _missing_prior_error(prev_dir, prev_stage_name, prev_step_name)
+            previous_step_payload = _load_from_step_output(prev_dataset, prev_dir)
 
         for entry_index in entry_indexes:
             entry = stage.entries[entry_index]
@@ -434,19 +477,13 @@ def run(
                 for route_key in entry.routes:
                     route_steps = entry.routes[route_key]
                     route_partitions = grouped.get(route_key, {})
-                    route_prev_ref: tuple[Dataset, RunPath, str] | None = None
                     route_current: Any = route_partitions
+                    route_prev_step_dir: RunPath | None = None
 
                     for route_step_index, route_step_like in enumerate(route_steps, start=1):
                         route_step = _normalize_route_step(route_step_like)
                         route_step_name = _step_decl_name(route_step)
                         route_step_dir = _join_run_path(branch_dir, route_key, route_step_name)
-
-                        if route_step_index > 1 and route_prev_ref is not None:
-                            prev_dataset, prev_dir, prev_name = route_prev_ref
-                            if not prev_dataset.exists(prev_dir):
-                                raise _missing_prior_error(prev_dir, stage.name, prev_name)
-                            route_current = _load_from_step_output(prev_dataset, prev_dir)
 
                         step_ctx = StepContext(
                             run_root=resolved_run_root,
@@ -456,44 +493,47 @@ def run(
                             stage_name=stage.name,
                             step_index=route_step_index,
                             step_name=route_step_name,
+                            persist=route_step.persist,
                             step_dir=route_step_dir,
-                            prev_step_dir=route_prev_ref[1] if route_prev_ref else None,
+                            prev_step_dir=route_prev_step_dir,
                             logger=logger,
                             params=run_params,
                         )
 
                         logger.info(
-                            "STEP START pipeline=%s stage=%s step=%s dataset=%s",
+                            "STEP START pipeline=%s stage=%s step=%s persist=%s dataset=%s",
                             pipeline.name,
                             stage.name,
                             route_step_name,
+                            route_step.persist,
                             route_step.output.describe(),
                         )
                         produced = route_step.fn(route_current, context=step_ctx)
                         persisted = _strip_source_field(produced, keep_source_tag)
-                        route_step.output.save(persisted, route_step_dir)
+                        checkpoint_written = False
+                        if route_step.persist:
+                            route_step.output.save(persisted, route_step_dir)
+                            checkpoint_written = True
                         logger.info(
-                            "STEP END pipeline=%s stage=%s step=%s dataset=%s",
+                            "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
                             pipeline.name,
                             stage.name,
                             route_step_name,
+                            route_step.persist,
+                            checkpoint_written,
                             route_step.output.describe(),
                         )
+                        route_current = persisted
+                        route_prev_step_dir = route_step_dir
 
-                        route_prev_ref = (route_step.output, route_step_dir, route_step_name)
-
-                    if route_prev_ref is None:
+                    if not route_steps:
                         route_outputs[route_key] = route_partitions
                     else:
-                        last_dataset, last_dir, last_name = route_prev_ref
-                        if not last_dataset.exists(last_dir):
-                            raise _missing_prior_error(last_dir, stage.name, last_name)
-                        loaded = _load_from_step_output(last_dataset, last_dir)
-                        if not isinstance(loaded, dict):
+                        if not isinstance(route_current, dict):
                             raise TypeError(
                                 f"Branch route '{route_key}' final output must load as dict partitions."
                             )
-                        route_outputs[route_key] = loaded
+                        route_outputs[route_key] = route_current
 
                 try:
                     partitions = entry.merge_route_outputs(route_outputs)
@@ -525,18 +565,8 @@ def run(
                 )
 
             step_input = partitions
-            if previous_step_ref is not None:
-                prev_dataset, prev_dir, prev_stage_name, prev_step_name = previous_step_ref
-                if not prev_dataset.exists(prev_dir):
-                    logger.error(
-                        "Missing prior output pipeline=%s stage=%s step=%s path=%s",
-                        pipeline.name,
-                        prev_stage_name,
-                        prev_step_name,
-                        prev_dir,
-                    )
-                    raise _missing_prior_error(prev_dir, prev_stage_name, prev_step_name)
-                step_input = _load_from_step_output(prev_dataset, prev_dir)
+            if previous_step_payload is not None:
+                step_input = previous_step_payload
 
             step_ctx = StepContext(
                 run_root=resolved_run_root,
@@ -546,6 +576,7 @@ def run(
                 stage_name=stage.name,
                 step_index=entry_index + 1,
                 step_name=entry_name,
+                persist=entry.persist,
                 step_dir=step_dir,
                 prev_step_dir=previous_step_ref[1] if previous_step_ref else None,
                 logger=logger,
@@ -553,24 +584,31 @@ def run(
             )
 
             logger.info(
-                "STEP START pipeline=%s stage=%s step=%s dataset=%s",
+                "STEP START pipeline=%s stage=%s step=%s persist=%s dataset=%s",
                 pipeline.name,
                 stage.name,
                 entry_name,
+                entry.persist,
                 entry.output.describe(),
             )
             produced = entry.fn(step_input, context=step_ctx)
             persisted = _strip_source_field(produced, keep_source_tag)
-            entry.output.save(persisted, step_dir)
+            checkpoint_written = False
+            if entry.persist:
+                entry.output.save(persisted, step_dir)
+                checkpoint_written = True
             logger.info(
-                "STEP END pipeline=%s stage=%s step=%s dataset=%s",
+                "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
                 pipeline.name,
                 stage.name,
                 entry_name,
+                entry.persist,
+                checkpoint_written,
                 entry.output.describe(),
             )
 
             partitions = persisted if isinstance(persisted, dict) else partitions
+            previous_step_payload = persisted
             previous_step_ref = (entry.output, step_dir, stage.name, entry_name)
 
     return resolved_run_root
