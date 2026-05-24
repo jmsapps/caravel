@@ -770,4 +770,119 @@ def test_runner_logs_step_start_end_with_dataset_describe_payload(
     joined = "\n".join(record.getMessage() for record in caplog.records)
     assert "STEP START" in joined
     assert "STEP END" in joined
+    assert "checkpoint_written" in joined
     assert "dataset" in joined
+
+
+def test_full_run_supports_non_persistent_intermediate_steps(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="s1"), persist=False)
+    def step_1(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return {k: {**v, "a": 1} for k, v in partitions.items()}
+
+    @step(output=PartitionedJSONDataset(name="s2"), persist=False)
+    def step_2(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return {k: {**v, "b": 2} for k, v in partitions.items()}
+
+    @step(output=JSONDataset(name="final"), persist=True)
+    def step_3(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = context
+        return {"keys": sorted(partitions.keys()), "sample": partitions["a"]}
+
+    pipeline = Pipeline(
+        name="mixed_persist_linear",
+        loader=_StubLoader({"a": {"id": "a"}, "b": {"id": "b"}}),
+        stages=[Stage(name="bronze", entries=[step_1, step_2, step_3])],
+    )
+    run(pipeline, run_root=tmp_path)
+
+    base = tmp_path / pipeline.name / "_001_bronze"
+    assert not (base / "_001_step_1").exists()
+    assert not (base / "_002_step_2").exists()
+    out_file = base / "_003_step_3" / "_003_step_3.json"
+    assert out_file.exists()
+    payload = json.loads(out_file.read_text("utf-8"))
+    assert payload["sample"]["a"] == 1
+    assert payload["sample"]["b"] == 2
+
+
+def test_selective_step_fails_when_required_prior_is_non_persistent(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="first"), persist=False)
+    def step_1(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return partitions
+
+    @step(output=JSONDataset(name="second"), persist=True)
+    def step_2(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = context
+        return {"count": len(partitions)}
+
+    pipeline = Pipeline(
+        name="nonpersist_selective_fail",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[step_1, step_2])],
+    )
+
+    with pytest.raises(MissingPriorOutputError, match="non-persistent"):
+        run(pipeline, run_root=tmp_path, only_stage="bronze", only_step="step_2")
+
+
+def test_branch_route_steps_support_mixed_persistence(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="json_norm"), persist=False)
+    def normalize_json(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return {k: {**v, "kind": "json"} for k, v in partitions.items()}
+
+    @step(output=PartitionedJSONDataset(name="html_norm"), persist=False)
+    def normalize_html(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return {k: {**v, "kind": "html"} for k, v in partitions.items()}
+
+    @step(output=PartitionedJSONDataset(name="bronze_converged"), persist=True)
+    def converge(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return partitions
+
+    branch = Branch(
+        name="normalize_by_source",
+        by="source",
+        routes={"json": [normalize_json], "html": [normalize_html]},
+    )
+    pipeline = Pipeline(
+        name="branch_mixed_persist",
+        loader=_StubLoader(
+            {"j1": {"id": "j1", "__source__": "json"}, "h1": {"id": "h1", "__source__": "html"}}
+        ),
+        stages=[Stage(name="bronze", entries=[branch, converge])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+
+    branch_root = tmp_path / pipeline.name / "_001_bronze" / "_001_normalize_by_source"
+    assert not (branch_root / "json" / "normalize_json").exists()
+    assert not (branch_root / "html" / "normalize_html").exists()
+    assert (tmp_path / pipeline.name / "_001_bronze" / "_002_converge" / "j1.json").exists()
+    assert (tmp_path / pipeline.name / "_001_bronze" / "_002_converge" / "h1.json").exists()

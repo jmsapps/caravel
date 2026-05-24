@@ -10,6 +10,7 @@ from .datasets import JSONDataset
 from .types import Dataset, Loader, StepFn
 
 _STEP_OUTPUT_ATTR = "__step_output_dataset__"
+_STEP_PERSIST_ATTR = "__step_persist__"
 
 
 def _callable_name(fn: Callable[..., Any]) -> str:
@@ -46,16 +47,31 @@ def _with_default_dataset_name(output: Dataset, *, step_name: str) -> Dataset:
     return output
 
 
-def step(*, output: Dataset) -> Callable[[StepFn], StepFn]:
+def _get_decorated_persist(fn: Callable[..., Any]) -> bool | None:
+    persist = getattr(fn, _STEP_PERSIST_ATTR, None)
+    if persist is None:
+        return None
+    if not isinstance(persist, bool):
+        raise TypeError(
+            f"Callable '{_callable_name(fn)}' has invalid decorated persist "
+            f"type {type(persist).__name__}; expected bool."
+        )
+    return persist
+
+
+def step(*, output: Dataset, persist: bool = True) -> Callable[[StepFn], StepFn]:
     """Attach a Dataset to a step function without wrapping callable identity."""
     if not isinstance(output, Dataset):
         raise TypeError(f"step(output=...) expected Dataset, got {type(output).__name__}.")
+    if not isinstance(persist, bool):
+        raise TypeError(f"step(..., persist=...) expected bool, got {type(persist).__name__}.")
 
     def decorator(fn: StepFn) -> StepFn:
         if not callable(fn):
             raise TypeError(f"step decorator expected callable, got {type(fn).__name__}.")
         attached_output = _with_default_dataset_name(output, step_name=_callable_name(fn))
         setattr(fn, _STEP_OUTPUT_ATTR, attached_output)
+        setattr(fn, _STEP_PERSIST_ATTR, persist)
         return fn
 
     return decorator
@@ -67,6 +83,7 @@ class Step:
 
     fn: StepFn
     output: Dataset
+    persist: bool = True
     name: str | None = None
 
     def __post_init__(self) -> None:
@@ -77,6 +94,9 @@ class Step:
             raise TypeError(
                 f"Step.output must satisfy Dataset protocol, got {type(self.output).__name__}."
             )
+
+        if not isinstance(self.persist, bool):
+            raise TypeError(f"Step.persist must be bool, got {type(self.persist).__name__}.")
 
         if self.name is None or self.name == "":
             self.name = _callable_name(self.fn)
@@ -120,8 +140,10 @@ class Stage:
 
             if callable(entry):
                 decorated_output = _get_decorated_output(entry)
+                decorated_persist = _get_decorated_persist(entry)
                 output = decorated_output or JSONDataset()
-                normalized.append(Step(fn=entry, output=output))
+                persist = True if decorated_persist is None else decorated_persist
+                normalized.append(Step(fn=entry, output=output, persist=persist))
                 continue
 
             raise TypeError(

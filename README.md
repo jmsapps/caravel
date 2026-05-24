@@ -110,9 +110,35 @@ def build_pipeline() -> Pipeline:
 
 1. Define a function that accepts the prior step payload as the first positional
    argument and `context` as a keyword-only argument.
-2. Attach output persistence with `@step(output=<Dataset>)`.
+2. Attach output and persistence policy with `@step(output=<Dataset>, persist=<bool>)`.
+   `persist` defaults to `True`.
 3. Add the function to the target `Stage(entries=[...])` in declaration order.
 4. Add or update pytest coverage for the happy path and at least one edge path.
+
+### Persistence Policy
+
+- `persist=True` (default): Caravel writes the step output to the step folder.
+- `persist=False`: Caravel keeps the step output in memory for downstream steps in
+  the same run and does not write step files.
+
+Example with five steps where only the final step writes checkpoint files:
+
+```python
+@step(output=JSONDataset(), persist=False)
+def step_1(payload, *, context): ...
+
+@step(output=JSONDataset(), persist=False)
+def step_2(payload, *, context): ...
+
+@step(output=JSONDataset(), persist=False)
+def step_3(payload, *, context): ...
+
+@step(output=JSONDataset(), persist=False)
+def step_4(payload, *, context): ...
+
+@step(output=JSONDataset(), persist=True)
+def step_5(payload, *, context): ...
+```
 
 ## Dataset Quick Reference
 
@@ -178,6 +204,10 @@ consistent:
 `--run-root` is optional. If omitted, Caravel writes under
 `data/output/<pipeline_name>/...`.
 When provided, `--run-root` accepts local paths and `fsspec` URL roots.
+
+Selective execution (`--stage`, `--step`) requires persisted upstream checkpoints.
+If a required predecessor step is configured as `persist=False`, Caravel fails
+fast and asks you to run from an earlier persisted boundary.
 
 Run an example from the repo root:
 

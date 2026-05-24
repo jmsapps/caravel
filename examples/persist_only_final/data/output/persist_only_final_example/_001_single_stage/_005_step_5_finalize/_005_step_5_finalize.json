@@ -1,0 +1,32 @@
+{
+  "count": 3,
+  "total_scaled": 60,
+  "ids": [
+    "a",
+    "b",
+    "c"
+  ],
+  "records": {
+    "a": {
+      "id": "a",
+      "value": 1,
+      "seen": true,
+      "scaled": 10,
+      "tag": "row-a"
+    },
+    "b": {
+      "id": "b",
+      "value": 2,
+      "seen": true,
+      "scaled": 20,
+      "tag": "row-b"
+    },
+    "c": {
+      "id": "c",
+      "value": 3,
+      "seen": true,
+      "scaled": 30,
+      "tag": "row-c"
+    }
+  }
+}

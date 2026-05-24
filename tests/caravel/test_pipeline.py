@@ -26,6 +26,7 @@ def test_step_defaults_name_from_function_name() -> None:
     s = Step(fn=_plain_step, output=JSONDataset(name="custom_name"))
 
     assert s.name == "_plain_step"
+    assert s.persist is True
 
 
 def test_step_rejects_non_callable_fn() -> None:
@@ -50,6 +51,11 @@ def test_step_decorator_attaches_dataset_metadata_without_wrapping() -> None:
 def test_step_decorator_rejects_non_dataset_output() -> None:
     with pytest.raises(TypeError, match="Dataset"):
         step(output="not-a-dataset")  # type: ignore[arg-type]
+
+
+def test_step_decorator_rejects_non_bool_persist() -> None:
+    with pytest.raises(TypeError, match="persist"):
+        step(output=JSONDataset(name="x"), persist="yes")  # type: ignore[arg-type]
 
 
 def test_step_decorator_last_applied_output_wins() -> None:
@@ -88,6 +94,17 @@ def test_stage_uses_decorator_dataset_when_present() -> None:
 
     assert isinstance(stage.entries[0], Step)
     assert stage.entries[0].output is dataset
+
+
+def test_stage_uses_decorator_persist_when_present() -> None:
+    @step(output=JSONDataset(name="decorator_dataset"), persist=False)
+    def decorated(payload: dict[str, str], *, _context: object) -> dict[str, str]:
+        return payload
+
+    stage = Stage(name="bronze", entries=[decorated])
+
+    assert isinstance(stage.entries[0], Step)
+    assert stage.entries[0].persist is False
 
 
 def test_stage_defaults_decorator_dataset_name_to_function_name_when_omitted() -> None:

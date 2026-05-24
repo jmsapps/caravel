@@ -35,6 +35,7 @@ class StepContext:
     stage_name: str
     step_index: int
     step_name: str
+    persist: bool
     step_dir: Path | str
     prev_step_dir: Path | str | None
     logger: logging.Logger
