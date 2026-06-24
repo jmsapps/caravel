@@ -254,6 +254,7 @@ def run(
     only_step: str | int | None = None,
     params: Mapping[str, str] | None = None,
     keep_source_tag: bool = False,
+    context_factory: Callable[[StepContext], Any] | None = None
 ) -> RunPath:
     """Execute a pipeline declaration and persist outputs per configured step."""
     if run_root is not None and _is_remote_path(run_root):
@@ -315,6 +316,25 @@ def run(
         stage_indexes = list(range(len(pipeline.stages)))
     else:
         stage_indexes = [selected_stage_idx]
+
+    def _materialize_context(base_ctx: StepContext) -> Any:
+        if context_factory is None:
+            return base_ctx
+
+        runtime_context = context_factory(base_ctx)
+
+        if isinstance(runtime_context, StepContext):
+            return runtime_context
+
+        runtime_context_base = getattr(runtime_context, "base", None)
+
+        if isinstance(runtime_context_base, StepContext):
+            return runtime_context
+
+        raise TypeError(
+            "context_factory must return StepContext or an object exposing "
+            "a StepContext at '.base'"
+        )
 
     def _resolve_stage_base(stage_index: int) -> RunPath:
         stage_decl = pipeline.stages[stage_index]
@@ -500,6 +520,8 @@ def run(
                             params=run_params,
                         )
 
+                        runtime_context = _materialize_context(step_ctx)
+
                         logger.info(
                             "STEP START pipeline=%s stage=%s step=%s persist=%s dataset=%s",
                             pipeline.name,
@@ -508,7 +530,7 @@ def run(
                             route_step.persist,
                             route_step.output.describe(),
                         )
-                        produced = route_step.fn(route_current, context=step_ctx)
+                        produced = route_step.fn(route_current, context=runtime_context)
                         persisted = _strip_source_field(produced, keep_source_tag)
                         checkpoint_written = False
                         if route_step.persist:
@@ -583,6 +605,8 @@ def run(
                 params=run_params,
             )
 
+            runtime_context = _materialize_context(step_ctx)
+
             logger.info(
                 "STEP START pipeline=%s stage=%s step=%s persist=%s dataset=%s",
                 pipeline.name,
@@ -591,7 +615,8 @@ def run(
                 entry.persist,
                 entry.output.describe(),
             )
-            produced = entry.fn(step_input, context=step_ctx)
+
+            produced = entry.fn(step_input, context=runtime_context)
             persisted = _strip_source_field(produced, keep_source_tag)
             checkpoint_written = False
             if entry.persist:

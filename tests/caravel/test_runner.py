@@ -1,5 +1,6 @@
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import fsspec
@@ -583,6 +584,158 @@ def test_run_passes_custom_params_to_step_context(tmp_path: Path) -> None:
     )
     payload = json.loads(out_file.read_text("utf-8"))
     assert payload["params"] == {"refresh": "hard", "lang": "en"}
+
+
+def test_run_passes_custom_context_from_factory_to_step(tmp_path: Path) -> None:
+    from caravel.runner import run
+    from caravel.types import StepContext
+
+    @dataclass(frozen=True)
+    class JobContext:
+        base: StepContext
+        tenant: str
+
+    @step(output=JSONDataset(name="custom_context"))
+    def capture_context(
+        partitions: dict[str, dict[str, object]], *, context: JobContext
+    ) -> dict[str, object]:
+        _ = partitions
+        return {
+            "tenant": context.tenant,
+            "pipeline": context.base.pipeline_name,
+            "stage": context.base.stage_name,
+            "step": context.base.step_name,
+        }
+
+    pipeline = Pipeline(
+        name="custom_context_runner",
+        loader=_StubLoader({"k": {"id": "k", "value": 1}}),
+        stages=[Stage(name="single", entries=[capture_context])],
+    )
+
+    run(
+        pipeline,
+        run_root=tmp_path,
+        context_factory=lambda base: JobContext(base=base, tenant="acme"),
+    )
+
+    out_file = (
+        tmp_path
+        / pipeline.name
+        / "_001_single"
+        / "_001_capture_context"
+        / "_001_capture_context.json"
+    )
+    payload = json.loads(out_file.read_text("utf-8"))
+    assert payload == {
+        "tenant": "acme",
+        "pipeline": "custom_context_runner",
+        "stage": "single",
+        "step": "capture_context",
+    }
+
+
+def test_run_accepts_context_factory_returning_step_context(tmp_path: Path) -> None:
+    from caravel.runner import run
+    from caravel.types import StepContext
+
+    @step(output=JSONDataset(name="native_context"))
+    def capture_context(
+        partitions: dict[str, dict[str, object]], *, context: StepContext
+    ) -> dict[str, object]:
+        _ = partitions
+        return {"step": context.step_name}
+
+    pipeline = Pipeline(
+        name="native_context_runner",
+        loader=_StubLoader({"k": {"id": "k", "value": 1}}),
+        stages=[Stage(name="single", entries=[capture_context])],
+    )
+
+    run(pipeline, run_root=tmp_path, context_factory=lambda base: base)
+
+    out_file = (
+        tmp_path
+        / pipeline.name
+        / "_001_single"
+        / "_001_capture_context"
+        / "_001_capture_context.json"
+    )
+    payload = json.loads(out_file.read_text("utf-8"))
+    assert payload == {"step": "capture_context"}
+
+
+def test_run_rejects_invalid_custom_context_factory_result(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    @step(output=JSONDataset(name="unused"))
+    def capture_context(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = (partitions, context)
+        return {}
+
+    pipeline = Pipeline(
+        name="invalid_custom_context_runner",
+        loader=_StubLoader({"k": {"id": "k", "value": 1}}),
+        stages=[Stage(name="single", entries=[capture_context])],
+    )
+
+    with pytest.raises(TypeError, match="context_factory must return StepContext"):
+        run(pipeline, run_root=tmp_path, context_factory=lambda _base: object())
+
+
+def test_branch_route_steps_receive_custom_context(tmp_path: Path) -> None:
+    from caravel.runner import run
+    from caravel.types import StepContext
+
+    @dataclass(frozen=True)
+    class JobContext:
+        base: StepContext
+        batch_id: str
+
+    @step(output=PartitionedJSONDataset(name="json_norm"))
+    def normalize_json(
+        partitions: dict[str, dict[str, object]], *, context: JobContext
+    ) -> dict[str, dict[str, object]]:
+        return {
+            key: {
+                **record,
+                "batch_id": context.batch_id,
+                "step": context.base.step_name,
+            }
+            for key, record in partitions.items()
+        }
+
+    branch = Branch(
+        name="normalize_by_source",
+        by="source",
+        routes={"json": [normalize_json]},
+    )
+    pipeline = Pipeline(
+        name="branch_custom_context",
+        loader=_StubLoader({"j1": {"id": "j1", "__source__": "json"}}),
+        stages=[Stage(name="bronze", entries=[branch])],
+    )
+
+    run(
+        pipeline,
+        run_root=tmp_path,
+        context_factory=lambda base: JobContext(base=base, batch_id="batch-001"),
+    )
+
+    out_file = (
+        tmp_path
+        / pipeline.name
+        / "_001_bronze"
+        / "_001_normalize_by_source"
+        / "json"
+        / "normalize_json"
+        / "j1.json"
+    )
+    payload = json.loads(out_file.read_text("utf-8"))
+    assert payload["batch_id"] == "batch-001"
+    assert payload["step"] == "normalize_json"
 
 
 def test_branch_entry_executes_routes_and_persists_route_lineage_paths(tmp_path: Path) -> None:
