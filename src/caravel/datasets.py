@@ -13,6 +13,9 @@ from .storage import (
     is_file,
     iter_files_with_suffix,
     join_path,
+    mark_partitioned_save_complete,
+    partitioned_output_exists,
+    prepare_partitioned_save,
     relative_key_from_file,
     resolve_fs,
     single_output_path,
@@ -102,7 +105,7 @@ class PartitionedJSONDataset:
             )
 
         fs, destination = resolve_fs(dest, self.storage_options)
-        fs.makedirs(destination, exist_ok=True)
+        prepare_partitioned_save(fs, destination)
 
         for key, record in payload.items():
             if not isinstance(key, str):
@@ -114,8 +117,10 @@ class PartitionedJSONDataset:
             with fs.open(output_file, mode="wt", encoding="utf-8") as handle:
                 json.dump(record, handle, ensure_ascii=False, indent=self.indent)
 
+        mark_partitioned_save_complete(fs, destination)
+
     def exists(self, dest: Path | str) -> bool:
-        return bool(iter_files_with_suffix(dest, ".json", self.storage_options))
+        return partitioned_output_exists(dest, ".json", self.storage_options)
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -218,7 +223,7 @@ class PartitionedTextDataset:
             )
 
         fs, destination = resolve_fs(dest, self.storage_options)
-        fs.makedirs(destination, exist_ok=True)
+        prepare_partitioned_save(fs, destination)
 
         for key, record in payload.items():
             if not isinstance(key, str):
@@ -234,8 +239,10 @@ class PartitionedTextDataset:
             with fs.open(output_file, mode="wt", encoding=self.encoding) as handle:
                 handle.write(record)
 
+        mark_partitioned_save_complete(fs, destination)
+
     def exists(self, dest: Path | str) -> bool:
-        return bool(iter_files_with_suffix(dest, self.suffix, self.storage_options))
+        return partitioned_output_exists(dest, self.suffix, self.storage_options)
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -334,7 +341,7 @@ class PartitionedBytesDataset:
             )
 
         fs, destination = resolve_fs(dest, self.storage_options)
-        fs.makedirs(destination, exist_ok=True)
+        prepare_partitioned_save(fs, destination)
 
         for key, record in payload.items():
             if not isinstance(key, str):
@@ -350,8 +357,10 @@ class PartitionedBytesDataset:
             with fs.open(output_file, mode="wb") as handle:
                 handle.write(record)
 
+        mark_partitioned_save_complete(fs, destination)
+
     def exists(self, dest: Path | str) -> bool:
-        return bool(iter_files_with_suffix(dest, self.suffix, self.storage_options))
+        return partitioned_output_exists(dest, self.suffix, self.storage_options)
 
     def describe(self) -> dict[str, Any]:
         return {

@@ -8,6 +8,7 @@ import fsspec
 
 
 StoragePath = str | Path
+PARTITIONED_COMPLETION_MARKER = ".caravel_complete"
 
 
 def is_url_path(path: StoragePath) -> bool:
@@ -106,10 +107,42 @@ def iter_files_with_suffix(
     file_paths: list[str] = []
     for candidate in candidates:
         path = str(candidate)
-        if path.endswith(suffix) and is_file(fs, path):
+        if (
+            leaf_name(path) != PARTITIONED_COMPLETION_MARKER
+            and path.endswith(suffix)
+            and is_file(fs, path)
+        ):
             file_paths.append(path)
 
     return sorted(file_paths)
+
+
+def prepare_partitioned_save(fs: Any, destination: str) -> None:
+    """Create a partition destination and invalidate any prior completion marker."""
+    fs.makedirs(destination, exist_ok=True)
+    marker = join_path(destination, PARTITIONED_COMPLETION_MARKER)
+    if fs.exists(marker):
+        fs.rm(marker)
+
+
+def mark_partitioned_save_complete(fs: Any, destination: str) -> None:
+    """Mark a partitioned output, including an empty output, as fully written."""
+    marker = join_path(destination, PARTITIONED_COMPLETION_MARKER)
+    with fs.open(marker, mode="wb") as handle:
+        handle.write(b"")
+
+
+def partitioned_output_exists(
+    root: StoragePath,
+    suffix: str,
+    storage_options: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether a completed or legacy partitioned output exists."""
+    fs, root_path = resolve_fs(root, storage_options)
+    marker = join_path(root_path, PARTITIONED_COMPLETION_MARKER)
+    if fs.exists(marker):
+        return True
+    return bool(iter_files_with_suffix(root, suffix, storage_options))
 
 
 def relative_key_from_file(root: StoragePath, file_path: StoragePath, suffix: str) -> str:
