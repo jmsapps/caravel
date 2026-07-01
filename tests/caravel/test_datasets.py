@@ -162,6 +162,46 @@ def test_exists_partitioned_false_when_no_matching_files(tmp_path: Path) -> None
     assert dataset.exists(out_dir) is False
 
 
+@pytest.mark.parametrize(
+    "dataset",
+    [
+        PartitionedJSONDataset(name="empty_json"),
+        PartitionedTextDataset(name="empty_text"),
+        PartitionedBytesDataset(name="empty_bytes"),
+    ],
+)
+def test_empty_partitioned_save_is_a_valid_loadable_checkpoint(
+    dataset: object, tmp_path: Path
+) -> None:
+    out_dir = tmp_path / "_012_empty"
+
+    dataset.save({}, out_dir)  # type: ignore[attr-defined]
+
+    assert dataset.exists(out_dir) is True  # type: ignore[attr-defined]
+    assert (out_dir / ".caravel_empty").exists()
+
+    dataset.path = out_dir  # type: ignore[attr-defined]
+    assert dataset.load() == {}  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "dataset,payload",
+    [
+        (PartitionedJSONDataset(name="json"), {"a": {"id": "a"}}),
+        (PartitionedTextDataset(name="text"), {"a": "value"}),
+        (PartitionedBytesDataset(name="bytes"), {"a": b"value"}),
+    ],
+)
+def test_nonempty_partitioned_save_does_not_write_internal_marker(
+    dataset: object, payload: dict[str, object], tmp_path: Path
+) -> None:
+    out_dir = tmp_path / "_013_nonempty"
+
+    dataset.save(payload, out_dir)  # type: ignore[attr-defined]
+
+    assert not (out_dir / ".caravel_empty").exists()
+
+
 def test_describe_contains_stable_minimum_keys() -> None:
     dataset = TextDataset(name="txt_desc", path=Path("seed.txt"), suffix=".txt")
     description = dataset.describe()

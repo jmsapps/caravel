@@ -1027,6 +1027,46 @@ def test_selective_step_fails_when_required_prior_is_non_persistent(tmp_path: Pa
         run(pipeline, run_root=tmp_path, only_stage="bronze", only_step="step_2")
 
 
+def test_selective_step_loads_empty_persisted_partitioned_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    calls = {"second": 0}
+
+    @step(output=PartitionedJSONDataset(name="empty"), persist=True)
+    def step_1(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = (partitions, context)
+        return {}
+
+    @step(output=JSONDataset(name="summary"), persist=True)
+    def step_2(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = context
+        calls["second"] += 1
+        return {"count": len(partitions)}
+
+    pipeline = Pipeline(
+        name="empty_partition_checkpoint",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[step_1, step_2])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    run(pipeline, run_root=tmp_path, only_stage="bronze", only_step="step_2")
+
+    assert calls["second"] == 2
+    output_file = (
+        tmp_path
+        / pipeline.name
+        / "_001_bronze"
+        / "_002_step_2"
+        / "_002_step_2.json"
+    )
+    assert json.loads(output_file.read_text("utf-8")) == {"count": 0}
+
+
 def test_branch_route_steps_support_mixed_persistence(tmp_path: Path) -> None:
     from caravel.runner import run
 
