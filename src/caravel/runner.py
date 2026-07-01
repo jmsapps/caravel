@@ -42,10 +42,10 @@ def _normalize_route_step(step_like: Step | Callable[..., Any]) -> Step:
 
     decorated_output = getattr(step_like, _DECORATED_OUTPUT_ATTR, None)
     decorated_persist = getattr(step_like, _DECORATED_PERSIST_ATTR, None)
-    if decorated_output is not None and not isinstance(decorated_output, Dataset):
+    if not isinstance(decorated_output, Dataset):
         raise TypeError(
-            f"Route callable '{_step_name(step_like)}' has invalid decorated output "
-            f"type {type(decorated_output).__name__}; expected Dataset."
+            f"Route callable '{_step_name(step_like)}' must be decorated with "
+            "@step(output=Dataset(...))."
         )
 
     if decorated_persist is not None and not isinstance(decorated_persist, bool):
@@ -54,15 +54,8 @@ def _normalize_route_step(step_like: Step | Callable[..., Any]) -> Step:
             f"type {type(decorated_persist).__name__}; expected bool."
         )
 
-    if isinstance(decorated_output, Dataset):
-        output = decorated_output
-    else:
-        from .datasets import JSONDataset
-
-        output = JSONDataset(name=_step_name(step_like))
-
     persist = True if decorated_persist is None else decorated_persist
-    return Step(fn=step_like, output=output, persist=persist)
+    return Step(fn=step_like, output=decorated_output, persist=persist)
 
 
 def _is_remote_path(path: RunPath) -> bool:

@@ -67,6 +67,38 @@ def _make_linear_pipeline(call_counter: dict[str, int] | None = None) -> Pipelin
     )
 
 
+def test_branch_route_callable_must_be_decorated() -> None:
+    from caravel.runner import _normalize_route_step
+
+    def undecorated(partitions: object, *, context: object) -> object:
+        _ = context
+        return partitions
+
+    with pytest.raises(TypeError, match=r"must be decorated with @step"):
+        _normalize_route_step(undecorated)
+
+
+def test_branch_route_normalization_preserves_dataset_storage_options_and_persist() -> None:
+    from caravel.runner import _normalize_route_step
+
+    storage_options = {"account_name": "test-account", "credential": "test-credential"}
+    output = PartitionedJSONDataset(
+        name="azure_output",
+        storage_options=storage_options,
+    )
+
+    @step(output=output, persist=False)
+    def decorated(partitions: object, *, context: object) -> object:
+        _ = context
+        return partitions
+
+    normalized = _normalize_route_step(decorated)
+
+    assert normalized.output is output
+    assert normalized.output.storage_options == storage_options
+    assert normalized.persist is False
+
+
 def test_run_executes_linear_pipeline_and_writes_canonical_stage_step_layout(
     tmp_path: Path,
 ) -> None:

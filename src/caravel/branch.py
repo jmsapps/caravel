@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .types import (
     SOURCE_FIELD,
@@ -13,6 +13,9 @@ from .types import (
     StepFn,
 )
 
+if TYPE_CHECKING:
+    from .pipeline import Step
+
 
 class Branch:
     """Route partitions across source-specific (or predicate-specific) branches."""
@@ -21,7 +24,7 @@ class Branch:
         self,
         name: str,
         by: str | BranchPredicate,
-        routes: dict[str, list[StepFn]],
+        routes: dict[str, list[StepFn | Step]],
     ) -> None:
         self.name = name
         self.by = by
