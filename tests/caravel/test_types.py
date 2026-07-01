@@ -7,6 +7,7 @@ import pytest
 from caravel.types import (
     SOURCE_FIELD,
     Dataset,
+    EmptyOutputError,
     KeyCollisionError,
     Loader,
     MissingPriorOutputError,
@@ -100,7 +101,12 @@ def test_source_field_constant_is_reserved_source_tag() -> None:
 
 
 def test_custom_exceptions_are_raisable_and_inherit_exception() -> None:
-    for exc_cls in (KeyCollisionError, MissingSourceTagError, MissingPriorOutputError):
+    for exc_cls in (
+        KeyCollisionError,
+        MissingSourceTagError,
+        MissingPriorOutputError,
+        EmptyOutputError,
+    ):
         assert issubclass(exc_cls, Exception)
 
     with pytest.raises(KeyCollisionError, match="collision"):

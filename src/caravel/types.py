@@ -95,3 +95,7 @@ class MissingSourceTagError(Exception):
 
 class MissingPriorOutputError(Exception):
     """Raised when selective execution requires prior output that is absent."""
+
+
+class EmptyOutputError(Exception):
+    """Raised when a dataset rejects an empty output payload."""

@@ -11,6 +11,7 @@ from caravel.datasets import (
     PartitionedTextDataset,
     TextDataset,
 )
+from caravel.types import EmptyOutputError
 
 
 def test_json_dataset_round_trip_single_file(tmp_path: Path) -> None:
@@ -165,9 +166,9 @@ def test_exists_partitioned_false_when_no_matching_files(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     "dataset",
     [
-        PartitionedJSONDataset(name="empty_json"),
-        PartitionedTextDataset(name="empty_text"),
-        PartitionedBytesDataset(name="empty_bytes"),
+        PartitionedJSONDataset(name="empty_json", allow_empty=True),
+        PartitionedTextDataset(name="empty_text", allow_empty=True),
+        PartitionedBytesDataset(name="empty_bytes", allow_empty=True),
     ],
 )
 def test_empty_partitioned_save_is_a_valid_loadable_checkpoint(
@@ -200,6 +201,74 @@ def test_nonempty_partitioned_save_does_not_write_internal_marker(
     dataset.save(payload, out_dir)  # type: ignore[attr-defined]
 
     assert not (out_dir / ".caravel_empty").exists()
+
+
+@pytest.mark.parametrize(
+    "dataset",
+    [
+        PartitionedJSONDataset(name="empty_json"),
+        PartitionedTextDataset(name="empty_text"),
+        PartitionedBytesDataset(name="empty_bytes"),
+    ],
+)
+def test_partitioned_save_rejects_empty_output_by_default(
+    dataset: object, tmp_path: Path
+) -> None:
+    out_dir = tmp_path / "_014_rejected_empty"
+
+    with pytest.raises(EmptyOutputError, match="allow_empty=True"):
+        dataset.save({}, out_dir)  # type: ignore[attr-defined]
+
+    assert not out_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "dataset_type",
+    [PartitionedJSONDataset, PartitionedTextDataset, PartitionedBytesDataset],
+)
+def test_partitioned_dataset_rejects_non_bool_allow_empty(dataset_type: type[object]) -> None:
+    with pytest.raises(TypeError, match="allow_empty must be bool"):
+        dataset_type(allow_empty="yes")  # type: ignore[call-arg]
+
+
+def test_empty_marker_takes_precedence_over_stale_partition_files(tmp_path: Path) -> None:
+    out_dir = tmp_path / "_015_empty_overwrite"
+    dataset = PartitionedJSONDataset(name="json", allow_empty=True)
+    dataset.save({"stale": {"id": "stale"}}, out_dir)
+    dataset.save({}, out_dir)
+
+    loader = PartitionedJSONDataset(name="json", path=out_dir)
+    assert loader.load() == {}
+
+
+def test_nonempty_save_removes_prior_empty_marker(tmp_path: Path) -> None:
+    out_dir = tmp_path / "_016_nonempty_overwrite"
+    dataset = PartitionedJSONDataset(name="json", allow_empty=True)
+    dataset.save({}, out_dir)
+
+    dataset.save({"current": {"id": "current"}}, out_dir)
+
+    assert not (out_dir / ".caravel_empty").exists()
+    loader = PartitionedJSONDataset(name="json", path=out_dir)
+    assert loader.load() == {"current": {"id": "current"}}
+
+
+def test_rejected_empty_save_preserves_existing_checkpoint(tmp_path: Path) -> None:
+    out_dir = tmp_path / "_017_preserved"
+    allowed = PartitionedJSONDataset(name="json", allow_empty=True)
+    allowed.save({}, out_dir)
+
+    strict = PartitionedJSONDataset(name="json")
+    with pytest.raises(EmptyOutputError):
+        strict.save({}, out_dir)
+
+    assert (out_dir / ".caravel_empty").exists()
+    allowed.path = out_dir
+    assert allowed.load() == {}
+
+
+def test_partitioned_describe_includes_allow_empty() -> None:
+    assert PartitionedJSONDataset(allow_empty=True).describe()["allow_empty"] is True
 
 
 def test_describe_contains_stable_minimum_keys() -> None:
@@ -240,6 +309,17 @@ def test_partitioned_json_dataset_round_trip_memory_filesystem() -> None:
     )
     assert loader.load() == payload
     assert dataset.exists(out_dir) is True
+
+
+def test_empty_partitioned_dataset_round_trip_memory_filesystem() -> None:
+    dataset = PartitionedJSONDataset(name="empty_json_mem", allow_empty=True)
+    out_dir = "memory://caravel/datasets/empty_parts_json/_001_step"
+
+    dataset.save({}, out_dir)
+
+    loader = PartitionedJSONDataset(name="empty_json_mem", path=out_dir)
+    assert dataset.exists(out_dir) is True
+    assert loader.load() == {}
 
 
 def test_text_dataset_round_trip_memory_filesystem() -> None:
