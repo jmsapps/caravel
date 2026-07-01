@@ -13,7 +13,7 @@ from .storage import (
     is_file,
     iter_files_with_suffix,
     join_path,
-    mark_partitioned_save_complete,
+    mark_partitioned_output_empty,
     partitioned_output_exists,
     prepare_partitioned_save,
     relative_key_from_file,
@@ -117,7 +117,8 @@ class PartitionedJSONDataset:
             with fs.open(output_file, mode="wt", encoding="utf-8") as handle:
                 json.dump(record, handle, ensure_ascii=False, indent=self.indent)
 
-        mark_partitioned_save_complete(fs, destination)
+        if not payload:
+            mark_partitioned_output_empty(fs, destination)
 
     def exists(self, dest: Path | str) -> bool:
         return partitioned_output_exists(dest, ".json", self.storage_options)
@@ -239,7 +240,8 @@ class PartitionedTextDataset:
             with fs.open(output_file, mode="wt", encoding=self.encoding) as handle:
                 handle.write(record)
 
-        mark_partitioned_save_complete(fs, destination)
+        if not payload:
+            mark_partitioned_output_empty(fs, destination)
 
     def exists(self, dest: Path | str) -> bool:
         return partitioned_output_exists(dest, self.suffix, self.storage_options)
@@ -357,7 +359,8 @@ class PartitionedBytesDataset:
             with fs.open(output_file, mode="wb") as handle:
                 handle.write(record)
 
-        mark_partitioned_save_complete(fs, destination)
+        if not payload:
+            mark_partitioned_output_empty(fs, destination)
 
     def exists(self, dest: Path | str) -> bool:
         return partitioned_output_exists(dest, self.suffix, self.storage_options)

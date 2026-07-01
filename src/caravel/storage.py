@@ -8,7 +8,7 @@ import fsspec
 
 
 StoragePath = str | Path
-PARTITIONED_COMPLETION_MARKER = ".caravel_complete"
+PARTITIONED_EMPTY_MARKER = ".caravel_empty"
 
 
 def is_url_path(path: StoragePath) -> bool:
@@ -108,7 +108,7 @@ def iter_files_with_suffix(
     for candidate in candidates:
         path = str(candidate)
         if (
-            leaf_name(path) != PARTITIONED_COMPLETION_MARKER
+            leaf_name(path) != PARTITIONED_EMPTY_MARKER
             and path.endswith(suffix)
             and is_file(fs, path)
         ):
@@ -118,16 +118,16 @@ def iter_files_with_suffix(
 
 
 def prepare_partitioned_save(fs: Any, destination: str) -> None:
-    """Create a partition destination and invalidate any prior completion marker."""
+    """Create a partition destination and remove any prior empty-output marker."""
     fs.makedirs(destination, exist_ok=True)
-    marker = join_path(destination, PARTITIONED_COMPLETION_MARKER)
+    marker = join_path(destination, PARTITIONED_EMPTY_MARKER)
     if fs.exists(marker):
         fs.rm(marker)
 
 
-def mark_partitioned_save_complete(fs: Any, destination: str) -> None:
-    """Mark a partitioned output, including an empty output, as fully written."""
-    marker = join_path(destination, PARTITIONED_COMPLETION_MARKER)
+def mark_partitioned_output_empty(fs: Any, destination: str) -> None:
+    """Persist an otherwise object-less empty partitioned output."""
+    marker = join_path(destination, PARTITIONED_EMPTY_MARKER)
     with fs.open(marker, mode="wb") as handle:
         handle.write(b"")
 
@@ -137,9 +137,9 @@ def partitioned_output_exists(
     suffix: str,
     storage_options: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Return whether a completed or legacy partitioned output exists."""
+    """Return whether an empty marker or at least one partition exists."""
     fs, root_path = resolve_fs(root, storage_options)
-    marker = join_path(root_path, PARTITIONED_COMPLETION_MARKER)
+    marker = join_path(root_path, PARTITIONED_EMPTY_MARKER)
     if fs.exists(marker):
         return True
     return bool(iter_files_with_suffix(root, suffix, storage_options))
