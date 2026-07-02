@@ -9,7 +9,7 @@ import pytest
 from caravel import Branch
 from caravel.datasets import JSONDataset, PartitionedJSONDataset
 from caravel.pipeline import Pipeline, Stage, step
-from caravel.types import KeyCollisionError, MissingPriorOutputError
+from caravel.types import EmptyOutputError, KeyCollisionError, MissingPriorOutputError
 
 
 class _StubLoader:
@@ -1032,7 +1032,7 @@ def test_selective_step_loads_empty_persisted_partitioned_output(tmp_path: Path)
 
     calls = {"second": 0}
 
-    @step(output=PartitionedJSONDataset(name="empty"), persist=True)
+    @step(output=PartitionedJSONDataset(name="empty", allow_empty=True), persist=True)
     def step_1(
         partitions: dict[str, dict[str, object]], *, context: object
     ) -> dict[str, dict[str, object]]:
@@ -1065,6 +1065,31 @@ def test_selective_step_loads_empty_persisted_partitioned_output(tmp_path: Path)
         / "_002_step_2.json"
     )
     assert json.loads(output_file.read_text("utf-8")) == {"count": 0}
+
+
+def test_persisted_empty_output_fails_at_producing_step_when_disallowed(
+    tmp_path: Path,
+) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="strict_empty"), persist=True)
+    def strict_empty(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = (partitions, context)
+        return {}
+
+    pipeline = Pipeline(
+        name="strict_empty_checkpoint",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[strict_empty])],
+    )
+
+    with pytest.raises(EmptyOutputError, match="strict_empty"):
+        run(pipeline, run_root=tmp_path)
+
+    output_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_strict_empty"
+    assert not output_dir.exists()
 
 
 def test_branch_route_steps_support_mixed_persistence(tmp_path: Path) -> None:

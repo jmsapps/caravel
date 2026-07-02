@@ -15,11 +15,28 @@ from .storage import (
     join_path,
     mark_partitioned_output_empty,
     partitioned_output_exists,
+    partitioned_output_is_marked_empty,
     prepare_partitioned_save,
     relative_key_from_file,
     resolve_fs,
     single_output_path,
 )
+from .types import EmptyOutputError
+
+
+def _validate_allow_empty(allow_empty: bool) -> None:
+    if not isinstance(allow_empty, bool):
+        raise TypeError(f"allow_empty must be bool, got {type(allow_empty).__name__}.")
+
+
+def _reject_disallowed_empty_output(
+    payload: dict[str, Any], *, allow_empty: bool, dataset_name: str
+) -> None:
+    if not payload and not allow_empty:
+        raise EmptyOutputError(
+            f"Dataset '{dataset_name}' rejected empty partitioned output; "
+            "set allow_empty=True to persist it."
+        )
 
 
 class JSONDataset:
@@ -78,17 +95,22 @@ class PartitionedJSONDataset:
         path: str | Path | None = None,
         indent: int | None = 2,
         storage_options: Mapping[str, Any] | None = None,
+        allow_empty: bool = False,
     ) -> None:
+        _validate_allow_empty(allow_empty)
         self.name = name
         self.path = coerce_optional_storage_path(path)
         self.indent = indent
         self.storage_options = dict(storage_options) if storage_options is not None else None
+        self.allow_empty = allow_empty
 
     def load(self) -> dict[str, Any]:
         source = ensure_storage_path_set(self.name, self.path)
         fs, source_path = resolve_fs(source, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
             raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
+        if partitioned_output_is_marked_empty(source, self.storage_options):
+            return {}
 
         loaded: dict[str, Any] = {}
         for file_path in iter_files_with_suffix(source, ".json", self.storage_options):
@@ -103,6 +125,9 @@ class PartitionedJSONDataset:
             raise TypeError(
                 f"{self.__class__.__name__}.save expected dict payload, got {type(payload).__name__}."
             )
+        _reject_disallowed_empty_output(
+            payload, allow_empty=self.allow_empty, dataset_name=self.name
+        )
 
         fs, destination = resolve_fs(dest, self.storage_options)
         prepare_partitioned_save(fs, destination)
@@ -129,6 +154,7 @@ class PartitionedJSONDataset:
             "name": self.name,
             "path": str(self.path) if self.path is not None else None,
             "indent": self.indent,
+            "allow_empty": self.allow_empty,
             "storage_options_configured": self.storage_options is not None,
         }
 
@@ -196,18 +222,23 @@ class PartitionedTextDataset:
         suffix: str = ".txt",
         encoding: str = "utf-8",
         storage_options: Mapping[str, Any] | None = None,
+        allow_empty: bool = False,
     ) -> None:
+        _validate_allow_empty(allow_empty)
         self.name = name
         self.path = coerce_optional_storage_path(path)
         self.suffix = suffix
         self.encoding = encoding
         self.storage_options = dict(storage_options) if storage_options is not None else None
+        self.allow_empty = allow_empty
 
     def load(self) -> dict[str, str]:
         source = ensure_storage_path_set(self.name, self.path)
         fs, source_path = resolve_fs(source, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
             raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
+        if partitioned_output_is_marked_empty(source, self.storage_options):
+            return {}
 
         loaded: dict[str, str] = {}
         for file_path in iter_files_with_suffix(source, self.suffix, self.storage_options):
@@ -222,6 +253,9 @@ class PartitionedTextDataset:
             raise TypeError(
                 f"{self.__class__.__name__}.save expected dict payload, got {type(payload).__name__}."
             )
+        _reject_disallowed_empty_output(
+            payload, allow_empty=self.allow_empty, dataset_name=self.name
+        )
 
         fs, destination = resolve_fs(dest, self.storage_options)
         prepare_partitioned_save(fs, destination)
@@ -253,6 +287,7 @@ class PartitionedTextDataset:
             "path": str(self.path) if self.path is not None else None,
             "suffix": self.suffix,
             "encoding": self.encoding,
+            "allow_empty": self.allow_empty,
             "storage_options_configured": self.storage_options is not None,
         }
 
@@ -316,17 +351,22 @@ class PartitionedBytesDataset:
         path: str | Path | None = None,
         suffix: str = ".bin",
         storage_options: Mapping[str, Any] | None = None,
+        allow_empty: bool = False,
     ) -> None:
+        _validate_allow_empty(allow_empty)
         self.name = name
         self.path = coerce_optional_storage_path(path)
         self.suffix = suffix
         self.storage_options = dict(storage_options) if storage_options is not None else None
+        self.allow_empty = allow_empty
 
     def load(self) -> dict[str, bytes]:
         source = ensure_storage_path_set(self.name, self.path)
         fs, source_path = resolve_fs(source, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
             raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
+        if partitioned_output_is_marked_empty(source, self.storage_options):
+            return {}
 
         loaded: dict[str, bytes] = {}
         for file_path in iter_files_with_suffix(source, self.suffix, self.storage_options):
@@ -341,6 +381,9 @@ class PartitionedBytesDataset:
             raise TypeError(
                 f"{self.__class__.__name__}.save expected dict payload, got {type(payload).__name__}."
             )
+        _reject_disallowed_empty_output(
+            payload, allow_empty=self.allow_empty, dataset_name=self.name
+        )
 
         fs, destination = resolve_fs(dest, self.storage_options)
         prepare_partitioned_save(fs, destination)
@@ -371,5 +414,6 @@ class PartitionedBytesDataset:
             "name": self.name,
             "path": str(self.path) if self.path is not None else None,
             "suffix": self.suffix,
+            "allow_empty": self.allow_empty,
             "storage_options_configured": self.storage_options is not None,
         }

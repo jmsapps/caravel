@@ -132,15 +132,23 @@ def mark_partitioned_output_empty(fs: Any, destination: str) -> None:
         handle.write(b"")
 
 
+def partitioned_output_is_marked_empty(
+    root: StoragePath,
+    storage_options: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether a partitioned output has an explicit empty marker."""
+    fs, root_path = resolve_fs(root, storage_options)
+    marker = join_path(root_path, PARTITIONED_EMPTY_MARKER)
+    return bool(fs.exists(marker))
+
+
 def partitioned_output_exists(
     root: StoragePath,
     suffix: str,
     storage_options: Mapping[str, Any] | None = None,
 ) -> bool:
     """Return whether an empty marker or at least one partition exists."""
-    fs, root_path = resolve_fs(root, storage_options)
-    marker = join_path(root_path, PARTITIONED_EMPTY_MARKER)
-    if fs.exists(marker):
+    if partitioned_output_is_marked_empty(root, storage_options):
         return True
     return bool(iter_files_with_suffix(root, suffix, storage_options))
 

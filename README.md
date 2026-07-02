@@ -151,6 +151,18 @@ def step_5(payload, *, context): ...
 | `BytesDataset`            | `bytes`                        | Single binary file                     |
 | `PartitionedBytesDataset` | `dict[str, bytes]`             | One binary file per partition key      |
 
+Partitioned datasets reject empty mappings by default. Set `allow_empty=True`
+when an empty result is valid and should be persisted as a reloadable checkpoint:
+
+```python
+output = PartitionedJSONDataset(name="optional_records", allow_empty=True)
+```
+
+Allowed empty outputs use an internal `.caravel_empty` sentinel because object
+stores do not have durable empty directories. Non-empty outputs do not contain
+the sentinel. With the default `allow_empty=False`, saving `{}` raises
+`EmptyOutputError` at the producing step.
+
 Partition keys may use path-style nesting like `en/record_001`; partitioned
 datasets resolve those keys into nested output directories.
 
