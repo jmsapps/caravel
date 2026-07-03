@@ -95,7 +95,7 @@ def test_branch_route_normalization_preserves_dataset_storage_options_and_persis
     normalized = _normalize_route_step(decorated)
 
     assert normalized.output is output
-    assert normalized.output.storage_options == storage_options # type: ignore
+    assert normalized.output.storage_options == storage_options  # type: ignore
     assert normalized.persist is False
 
 
