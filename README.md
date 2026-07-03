@@ -40,6 +40,12 @@ Install Caravel in editable mode with test dependencies:
 python3 -m pip install -e ".[test]"
 ```
 
+Install only the dependencies used by the examples:
+
+```bash
+python3 -m pip install -e ".[examples]"
+```
+
 Install with cloud extras when needed:
 
 ```bash
@@ -48,10 +54,13 @@ python3 -m pip install -e ".[gcp]"
 python3 -m pip install -e ".[s3]"
 ```
 
-Run the test suite:
+Run the same local checks enforced by CI:
 
 ```bash
 python3 -m pytest -q
+python3 -m ruff check src tests examples
+python3 -m ruff format --check src tests examples
+python3 -m mypy src/caravel
 ```
 
 ## Core Declaration Pattern

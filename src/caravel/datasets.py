@@ -74,7 +74,7 @@ class JSONDataset:
     def exists(self, dest: Path | str) -> bool:
         output_file = single_output_path(dest, ".json")
         fs, output_path = resolve_fs(output_file, self.storage_options)
-        return fs.exists(output_path)
+        return bool(fs.exists(output_path))
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -199,7 +199,7 @@ class TextDataset:
     def exists(self, dest: Path | str) -> bool:
         output_file = single_output_path(dest, self.suffix)
         fs, output_path = resolve_fs(output_file, self.storage_options)
-        return fs.exists(output_path)
+        return bool(fs.exists(output_path))
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -330,7 +330,7 @@ class BytesDataset:
     def exists(self, dest: Path | str) -> bool:
         output_file = single_output_path(dest, self.suffix)
         fs, output_path = resolve_fs(output_file, self.storage_options)
-        return fs.exists(output_path)
+        return bool(fs.exists(output_path))
 
     def describe(self) -> dict[str, Any]:
         return {

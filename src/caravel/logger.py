@@ -19,9 +19,7 @@ def get_logger(
         handler = logging.StreamHandler()
         handler._dag_pipeline_handler = True  # type: ignore[attr-defined]
         handler.setLevel(log_level)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
         logger.addHandler(handler)
 
     return logger

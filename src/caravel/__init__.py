@@ -1,3 +1,5 @@
+from importlib.metadata import PackageNotFoundError, version
+
 from .branch import Branch
 from .cli import make_cli
 from .datasets import (
@@ -36,7 +38,13 @@ from .types import (
 )
 from .viz import to_mermaid
 
+try:
+    __version__ = version("caravel")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+
 __all__ = [
+    "__version__",
     "PartitionId",
     "Record",
     "Partitions",

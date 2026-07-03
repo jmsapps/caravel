@@ -100,9 +100,7 @@ def test_make_cli_forwards_custom_params_map(tmp_path: Path) -> None:
 
     cli = make_cli(_StubPipeline(), run_fn=_fake_run)
 
-    exit_code = cli(
-        ["--run-root", str(tmp_path), "--param", "refresh=hard", "--param", "lang=en"]
-    )
+    exit_code = cli(["--run-root", str(tmp_path), "--param", "refresh=hard", "--param", "lang=en"])
 
     assert exit_code == 0
     assert calls[0]["params"] == {"refresh": "hard", "lang": "en"}

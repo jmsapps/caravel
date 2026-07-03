@@ -41,7 +41,8 @@ def resolve_fs(
     path: StoragePath, storage_options: Mapping[str, Any] | None = None
 ) -> tuple[Any, str]:
     options = dict(storage_options or {})
-    return fsspec.core.url_to_fs(to_storage_string(path), **options)
+    fs, resolved_path = fsspec.core.url_to_fs(to_storage_string(path), **options)
+    return fs, str(resolved_path)
 
 
 def join_path(base: StoragePath, *parts: str) -> str:

@@ -19,7 +19,9 @@ from examples.persist_only_final.pipeline import (
 )
 
 
-def _step_dir(run_root: Path, stage_index: int, stage_name: str, step_index: int, step_name: str) -> Path:
+def _step_dir(
+    run_root: Path, stage_index: int, stage_name: str, step_index: int, step_name: str
+) -> Path:
     return (
         run_root
         / PIPELINE_NAME
@@ -28,7 +30,9 @@ def _step_dir(run_root: Path, stage_index: int, stage_name: str, step_index: int
     )
 
 
-def _step_file(run_root: Path, stage_index: int, stage_name: str, step_index: int, step_name: str) -> Path:
+def _step_file(
+    run_root: Path, stage_index: int, stage_name: str, step_index: int, step_name: str
+) -> Path:
     step_dir = _step_dir(run_root, stage_index, stage_name, step_index, step_name)
     return step_dir / f"_{step_index:03d}_{step_name}.json"
 
@@ -59,4 +63,3 @@ def test_persist_only_final_pipeline_final_payload_shape(tmp_path: Path) -> None
     assert final_payload["total_scaled"] == 60
     assert final_payload["ids"] == ["a", "b", "c"]
     assert set(final_payload["records"].keys()) == {"a", "b", "c"}
-

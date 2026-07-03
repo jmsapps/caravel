@@ -95,7 +95,7 @@ def test_branch_route_normalization_preserves_dataset_storage_options_and_persis
     normalized = _normalize_route_step(decorated)
 
     assert normalized.output is output
-    assert normalized.output.storage_options == storage_options
+    assert normalized.output.storage_options == storage_options # type: ignore
     assert normalized.persist is False
 
 
@@ -110,7 +110,9 @@ def test_run_executes_linear_pipeline_and_writes_canonical_stage_step_layout(
     assert run_root == tmp_path
 
     bronze_step_dir = _default_stage_base(tmp_path, pipeline.name, 1, "bronze") / "_001_bronze_map"
-    silver_step_dir = _default_stage_base(tmp_path, pipeline.name, 2, "silver") / "_001_silver_summary"
+    silver_step_dir = (
+        _default_stage_base(tmp_path, pipeline.name, 2, "silver") / "_001_silver_summary"
+    )
 
     assert (bronze_step_dir / "a.json").exists()
     assert (bronze_step_dir / "b.json").exists()
@@ -120,7 +122,9 @@ def test_run_executes_linear_pipeline_and_writes_canonical_stage_step_layout(
     assert silver_payload["count"] == 2
 
 
-def test_run_defaults_run_root_to_data_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_run_defaults_run_root_to_data_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
@@ -129,13 +133,7 @@ def test_run_defaults_run_root_to_data_output(monkeypatch: pytest.MonkeyPatch, t
     resolved = run(pipeline)
 
     assert resolved == Path("data/output")
-    bronze_file = (
-        Path("data/output")
-        / pipeline.name
-        / "_001_bronze"
-        / "_001_bronze_map"
-        / "a.json"
-    )
+    bronze_file = Path("data/output") / pipeline.name / "_001_bronze" / "_001_bronze_map" / "a.json"
     assert bronze_file.exists()
 
 
@@ -148,9 +146,7 @@ def test_run_respects_explicit_run_root_override(tmp_path: Path) -> None:
     resolved = run(pipeline, run_root=explicit_root)
 
     assert resolved == explicit_root
-    assert (
-        explicit_root / pipeline.name / "_001_bronze" / "_001_bronze_map" / "a.json"
-    ).exists()
+    assert (explicit_root / pipeline.name / "_001_bronze" / "_001_bronze_map" / "a.json").exists()
 
 
 def test_run_supports_remote_memory_run_root_and_writes_outputs() -> None:
@@ -213,7 +209,9 @@ def test_clean_dirs_true_clears_existing_stage_contents_before_stage_run(tmp_pat
     pipeline = Pipeline(
         name="clean_dirs_pipeline",
         loader=_StubLoader({"a": {"id": "a", "value": 1}}),
-        stages=[Stage(name="bronze", entries=[pass_through], stage_root=stage_root, clean_dirs=True)],
+        stages=[
+            Stage(name="bronze", entries=[pass_through], stage_root=stage_root, clean_dirs=True)
+        ],
     )
 
     run(pipeline, run_root=tmp_path / "fallback_root")
@@ -253,13 +251,7 @@ def test_clean_dirs_true_without_stage_root_clears_run_root_contents_before_stag
     assert run_root.exists()
     assert not stale_file.exists()
     assert not stale_dir_file.exists()
-    assert (
-        run_root
-        / pipeline.name
-        / "_001_bronze"
-        / "_001_pass_through"
-        / "a.json"
-    ).exists()
+    assert (run_root / pipeline.name / "_001_bronze" / "_001_pass_through" / "a.json").exists()
 
 
 def test_clean_dirs_true_fails_fast_for_selective_non_first_step_without_deleting(
@@ -320,13 +312,7 @@ def test_clean_dirs_on_later_default_stage_loads_seed_before_run_root_cleanup(
 
     run(pipeline, run_root=tmp_path)
 
-    bronze_file = (
-        tmp_path
-        / pipeline.name
-        / "_001_bronze"
-        / "_001_bronze_map"
-        / "a.json"
-    )
+    bronze_file = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map" / "a.json"
     silver_file = (
         tmp_path
         / pipeline.name
@@ -977,9 +963,7 @@ def test_full_run_supports_non_persistent_intermediate_steps(tmp_path: Path) -> 
         return {k: {**v, "b": 2} for k, v in partitions.items()}
 
     @step(output=JSONDataset(name="final"), persist=True)
-    def step_3(
-        partitions: dict[str, dict[str, object]], *, context: object
-    ) -> dict[str, object]:
+    def step_3(partitions: dict[str, dict[str, object]], *, context: object) -> dict[str, object]:
         _ = context
         return {"keys": sorted(partitions.keys()), "sample": partitions["a"]}
 
@@ -1011,9 +995,7 @@ def test_selective_step_fails_when_required_prior_is_non_persistent(tmp_path: Pa
         return partitions
 
     @step(output=JSONDataset(name="second"), persist=True)
-    def step_2(
-        partitions: dict[str, dict[str, object]], *, context: object
-    ) -> dict[str, object]:
+    def step_2(partitions: dict[str, dict[str, object]], *, context: object) -> dict[str, object]:
         _ = context
         return {"count": len(partitions)}
 
@@ -1040,9 +1022,7 @@ def test_selective_step_loads_empty_persisted_partitioned_output(tmp_path: Path)
         return {}
 
     @step(output=JSONDataset(name="summary"), persist=True)
-    def step_2(
-        partitions: dict[str, dict[str, object]], *, context: object
-    ) -> dict[str, object]:
+    def step_2(partitions: dict[str, dict[str, object]], *, context: object) -> dict[str, object]:
         _ = context
         calls["second"] += 1
         return {"count": len(partitions)}
@@ -1057,13 +1037,7 @@ def test_selective_step_loads_empty_persisted_partitioned_output(tmp_path: Path)
     run(pipeline, run_root=tmp_path, only_stage="bronze", only_step="step_2")
 
     assert calls["second"] == 2
-    output_file = (
-        tmp_path
-        / pipeline.name
-        / "_001_bronze"
-        / "_002_step_2"
-        / "_002_step_2.json"
-    )
+    output_file = tmp_path / pipeline.name / "_001_bronze" / "_002_step_2" / "_002_step_2.json"
     assert json.loads(output_file.read_text("utf-8")) == {"count": 0}
 
 

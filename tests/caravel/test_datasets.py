@@ -211,9 +211,7 @@ def test_nonempty_partitioned_save_does_not_write_internal_marker(
         PartitionedBytesDataset(name="empty_bytes"),
     ],
 )
-def test_partitioned_save_rejects_empty_output_by_default(
-    dataset: object, tmp_path: Path
-) -> None:
+def test_partitioned_save_rejects_empty_output_by_default(dataset: object, tmp_path: Path) -> None:
     out_dir = tmp_path / "_014_rejected_empty"
 
     with pytest.raises(EmptyOutputError, match="allow_empty=True"):

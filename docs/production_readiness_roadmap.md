@@ -20,6 +20,10 @@ ST-01 through ST-14 establish the core framework:
 This is enough for a working proof of concept. It is not yet enough to call the
 runner production-ready.
 
+C-6 Phase 0 establishes clean-checkout GitHub Actions across supported Python
+versions, with tests, ruff, format, strict mypy, package metadata, and a minimum
+fsspec compatibility job as required gates.
+
 ## ST-15 - Production Operations And Observability
 
 Goal: make every run inspectable, alertable, and diagnosable.
@@ -117,7 +121,7 @@ Implementation tasks:
 - Define configuration loading for paths, parameters, secrets references, and
   environment-specific settings.
 - Add runbook steps for deploy, run, inspect, rerun, rollback, and emergency stop.
-- Add CI that installs dependencies and runs the full test suite.
+- Maintain clean-checkout CI for the supported Python and dependency matrix.
 
 Validation tasks:
 
@@ -184,7 +188,6 @@ Exit criteria:
 These items should be treated as blockers before any production pipeline depends
 on this runner:
 
-- Tests must run in CI from a clean environment.
 - Branch route step output directories must include stable indexes to avoid
   collisions.
 - Run metadata must persist success and failure status.

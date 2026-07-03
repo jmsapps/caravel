@@ -1,2 +1,1 @@
 """Fsspec partitioned example package."""
-

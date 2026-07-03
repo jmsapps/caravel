@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping
 from .logger import get_logger
 from .branch import Branch
 from .paths import format_stage_dir, format_step_dir, resolve_run_root
-from .pipeline import Step
+from .pipeline import Pipeline, Step
 from .storage import is_dir, is_url_path, join_path, leaf_name, resolve_fs
 from .types import (
     SOURCE_FIELD,
@@ -240,14 +240,14 @@ def _clean_stage_base_if_needed(clean_root: RunPath, clean_dirs: bool) -> None:
 
 
 def run(
-    pipeline: Any,
+    pipeline: Pipeline,
     run_root: Path | str | None = None,
     *,
     only_stage: str | int | None = None,
     only_step: str | int | None = None,
     params: Mapping[str, str] | None = None,
     keep_source_tag: bool = False,
-    context_factory: Callable[[StepContext], Any] | None = None
+    context_factory: Callable[[StepContext], Any] | None = None,
 ) -> RunPath:
     """Execute a pipeline declaration and persist outputs per configured step."""
     if run_root is not None and _is_remote_path(run_root):
@@ -325,8 +325,7 @@ def run(
             return runtime_context
 
         raise TypeError(
-            "context_factory must return StepContext or an object exposing "
-            "a StepContext at '.base'"
+            "context_factory must return StepContext or an object exposing a StepContext at '.base'"
         )
 
     def _resolve_stage_base(stage_index: int) -> RunPath:
@@ -481,9 +480,7 @@ def run(
             entry = stage.entries[entry_index]
 
             if isinstance(entry, Branch):
-                branch_dir = _join_run_path(
-                    stage_dir, format_step_dir(entry_index + 1, entry.name)
-                )
+                branch_dir = _join_run_path(stage_dir, format_step_dir(entry_index + 1, entry.name))
                 grouped = entry.route_partitions(partitions)
                 route_outputs: dict[str, Partitions] = {}
 

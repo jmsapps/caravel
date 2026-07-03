@@ -38,5 +38,6 @@ reports/*
 
 index.html
 
+# Local agent instructions and task plans; intentionally untracked.
 AGENTS.md
 .skills/
