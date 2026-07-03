@@ -99,3 +99,19 @@ class MissingPriorOutputError(Exception):
 
 class EmptyOutputError(Exception):
     """Raised when a dataset rejects an empty output payload."""
+
+
+class CheckpointError(Exception):
+    """Base class for checkpoint registry errors."""
+
+
+class CheckpointIntegrityError(CheckpointError):
+    """Raised when a checkpoint record contradicts the declaration or output."""
+
+
+class UnsupportedCheckpointVersionError(CheckpointError):
+    """Raised when a checkpoint record was written by an unsupported schema."""
+
+
+class CheckpointCommitUncertainError(CheckpointError):
+    """Raised when final checkpoint record publication cannot be confirmed."""

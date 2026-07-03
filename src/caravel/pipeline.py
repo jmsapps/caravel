@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .branch import Branch
 from .datasets import JSONDataset
@@ -161,12 +161,21 @@ class Pipeline:
     name: str
     loader: Loader
     stages: list[Stage]
+    metadata_storage_options: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.loader, Loader):
             raise TypeError(
                 f"Pipeline loader must satisfy Loader protocol, got {type(self.loader).__name__}."
             )
+
+        if self.metadata_storage_options is not None:
+            if not isinstance(self.metadata_storage_options, Mapping):
+                raise TypeError(
+                    "Pipeline.metadata_storage_options must be a mapping or None, "
+                    f"got {type(self.metadata_storage_options).__name__}."
+                )
+            self.metadata_storage_options = dict(self.metadata_storage_options)
 
         seen_stage_names: set[str] = set()
         normalized_stages: list[Stage] = []

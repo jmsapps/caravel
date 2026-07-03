@@ -1,16 +1,33 @@
 from __future__ import annotations
 
 import copy
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .logger import get_logger
 from .branch import Branch
+from .datasets import CheckpointCapableDataset
 from .paths import format_stage_dir, format_step_dir, resolve_run_root
 from .pipeline import Pipeline, Step
-from .storage import is_dir, is_url_path, join_path, leaf_name, resolve_fs
+from .storage import (
+    CHECKPOINT_SCHEMA_VERSION,
+    fire_failpoint,
+    invalidate_checkpoint_record,
+    is_dir,
+    is_url_path,
+    join_path,
+    leaf_name,
+    publish_checkpoint_record,
+    read_checkpoint_record,
+    remove_and_recreate_dir,
+    resolve_fs,
+    to_storage_string,
+)
 from .types import (
     SOURCE_FIELD,
+    CheckpointIntegrityError,
     Dataset,
     KeyCollisionError,
     MissingPriorOutputError,
@@ -31,6 +48,25 @@ def _step_decl_name(step: Step) -> str:
     if step.name is None:
         raise TypeError("Step.name must be resolved before runner execution.")
     return step.name
+
+
+def _step_node_id(stage_index: int, entry_index: int) -> str:
+    """Return the checkpoint node ID for a 1-based stage/entry position."""
+    return f"stage-{stage_index:03d}-entry-{entry_index:03d}"
+
+
+def _route_step_node_id(
+    stage_index: int, entry_index: int, route_index: int, route_step_index: int
+) -> str:
+    """Return the checkpoint node ID for a 1-based branch route step position."""
+    return (
+        f"stage-{stage_index:03d}-entry-{entry_index:03d}"
+        f"-route-{route_index:03d}-step-{route_step_index:03d}"
+    )
+
+
+def _utc_created_at() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _normalize_route_step(step_like: Step | Callable[..., Any]) -> Step:
@@ -257,6 +293,9 @@ def run(
         resolved_run_root.mkdir(parents=True, exist_ok=True)
 
     logger = get_logger(f"caravel.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
+    run_id = uuid.uuid4().hex
+    pipeline_root = _join_run_path(resolved_run_root, pipeline.name)
+    metadata_options = pipeline.metadata_storage_options
     is_selective = only_stage is not None or only_step is not None
     run_params = dict(params) if params is not None else {}
 
@@ -342,7 +381,81 @@ def run(
         stage_decl = pipeline.stages[stage_index]
         if stage_decl.stage_root is not None:
             return _coerce_run_path(stage_decl.stage_root)
-        return resolved_run_root
+        return _resolve_stage_base(stage_index)
+
+    def _commit_step_output(
+        *,
+        dataset: Dataset,
+        payload: Any,
+        step_dir: RunPath,
+        node_id: str,
+        stage_index: int,
+        stage_name: str,
+        step_index: int,
+        step_name: str,
+    ) -> None:
+        """Persist one node's output under the central checkpoint protocol."""
+        if not isinstance(dataset, CheckpointCapableDataset):
+            dataset.save(payload, step_dir)
+            return
+
+        dataset.validate_payload(payload)
+        fire_failpoint("before_record_invalidation")
+        invalidate_checkpoint_record(pipeline_root, node_id, metadata_options)
+        fire_failpoint("after_record_invalidation")
+        remove_and_recreate_dir(step_dir, getattr(dataset, "storage_options", None))
+        fire_failpoint("after_output_cleanup")
+        dataset.save(payload, step_dir)
+        fire_failpoint("before_record_write")
+        partition_keys = dataset.record_partition_keys(payload)
+        record = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "run_id": run_id,
+            "node_id": node_id,
+            "pipeline": pipeline.name,
+            "stage": {"index": stage_index, "name": stage_name},
+            "step": {"index": step_index, "name": step_name},
+            "dataset": {"type": type(dataset).__name__, "name": dataset.name},
+            "output_path": to_storage_string(step_dir),
+            "partition_keys": partition_keys,
+            "count": 1 if partition_keys is None else len(partition_keys),
+            "created_at": _utc_created_at(),
+        }
+        publish_checkpoint_record(pipeline_root, node_id, record, metadata_options)
+        fire_failpoint("after_record_verified")
+
+    def _load_committed_output(
+        *,
+        dataset: Dataset,
+        step_dir: RunPath,
+        node_id: str,
+        stage_name: str,
+        step_name: str,
+    ) -> Any:
+        """Load a node's output only through its committed checkpoint record."""
+        record = read_checkpoint_record(pipeline_root, node_id, metadata_options)
+        if record is None:
+            raise _missing_prior_error(step_dir, stage_name, step_name)
+
+        dataset_block = record["dataset"]
+        if (
+            record["pipeline"] != pipeline.name
+            or dataset_block["type"] != type(dataset).__name__
+            or dataset_block["name"] != dataset.name
+            or record["output_path"] != to_storage_string(step_dir)
+        ):
+            raise CheckpointIntegrityError(
+                "Checkpoint record does not match the current declaration: "
+                f"stage='{stage_name}' step='{step_name}' node='{node_id}' "
+                f"path='{step_dir}'."
+            )
+
+        partition_keys = record["partition_keys"]
+        if isinstance(dataset, CheckpointCapableDataset):
+            dataset.verify_physical_output(step_dir, partition_keys)
+        if partition_keys == []:
+            return {}
+        return _load_from_step_output(dataset, step_dir)
 
     def _load_stage_seed(stage_index: int, target_stage_name: str) -> Partitions:
         if stage_index == 0:
@@ -386,16 +499,22 @@ def run(
             prev_stage_dir,
             format_step_dir(len(prev_stage.entries), prev_step_name),
         )
-        if not prev_last_entry.output.exists(prev_dir):
+        try:
+            loaded = _load_committed_output(
+                dataset=prev_last_entry.output,
+                step_dir=prev_dir,
+                node_id=_step_node_id(stage_index, len(prev_stage.entries)),
+                stage_name=prev_stage.name,
+                step_name=prev_step_name,
+            )
+        except MissingPriorOutputError:
             _log_selective_failure(
                 "missing-prior-output",
                 required_stage=prev_stage.name,
                 required_step=prev_step_name,
                 required_path=str(prev_dir),
             )
-            raise _missing_prior_error(prev_dir, prev_stage.name, prev_step_name)
-
-        loaded = _load_from_step_output(prev_last_entry.output, prev_dir)
+            raise
         if not isinstance(loaded, dict):
             _log_selective_failure(
                 "invalid-prior-output-shape",
@@ -465,7 +584,15 @@ def run(
             )
             previous_step_ref = (prior_entry.output, prior_step_dir, stage.name, prior_step_name)
             prev_dataset, prev_dir, prev_stage_name, prev_step_name = previous_step_ref
-            if not prev_dataset.exists(prev_dir):
+            try:
+                previous_step_payload = _load_committed_output(
+                    dataset=prev_dataset,
+                    step_dir=prev_dir,
+                    node_id=_step_node_id(stage_index + 1, prior_entry_index + 1),
+                    stage_name=prev_stage_name,
+                    step_name=prev_step_name,
+                )
+            except MissingPriorOutputError:
                 logger.error(
                     "Missing prior output pipeline=%s stage=%s step=%s path=%s",
                     pipeline.name,
@@ -473,8 +600,7 @@ def run(
                     prev_step_name,
                     prev_dir,
                 )
-                raise _missing_prior_error(prev_dir, prev_stage_name, prev_step_name)
-            previous_step_payload = _load_from_step_output(prev_dataset, prev_dir)
+                raise
 
         for entry_index in entry_indexes:
             entry = stage.entries[entry_index]
@@ -484,7 +610,7 @@ def run(
                 grouped = entry.route_partitions(partitions)
                 route_outputs: dict[str, Partitions] = {}
 
-                for route_key in entry.routes:
+                for route_index, route_key in enumerate(entry.routes, start=1):
                     route_steps = entry.routes[route_key]
                     route_partitions = grouped.get(route_key, {})
                     route_current: Any = route_partitions
@@ -498,7 +624,7 @@ def run(
                         step_ctx = StepContext(
                             run_root=resolved_run_root,
                             pipeline_name=pipeline.name,
-                            run_id=_run_path_name(resolved_run_root),
+                            run_id=run_id,
                             stage_index=stage_index + 1,
                             stage_name=stage.name,
                             step_index=route_step_index,
@@ -524,7 +650,21 @@ def run(
                         persisted = _strip_source_field(produced, keep_source_tag)
                         checkpoint_written = False
                         if route_step.persist:
-                            route_step.output.save(persisted, route_step_dir)
+                            _commit_step_output(
+                                dataset=route_step.output,
+                                payload=persisted,
+                                step_dir=route_step_dir,
+                                node_id=_route_step_node_id(
+                                    stage_index + 1,
+                                    entry_index + 1,
+                                    route_index,
+                                    route_step_index,
+                                ),
+                                stage_index=stage_index + 1,
+                                stage_name=stage.name,
+                                step_index=route_step_index,
+                                step_name=route_step_name,
+                            )
                             checkpoint_written = True
                         logger.info(
                             "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
@@ -583,7 +723,7 @@ def run(
             step_ctx = StepContext(
                 run_root=resolved_run_root,
                 pipeline_name=pipeline.name,
-                run_id=_run_path_name(resolved_run_root),
+                run_id=run_id,
                 stage_index=stage_index + 1,
                 stage_name=stage.name,
                 step_index=entry_index + 1,
@@ -610,7 +750,16 @@ def run(
             persisted = _strip_source_field(produced, keep_source_tag)
             checkpoint_written = False
             if entry.persist:
-                entry.output.save(persisted, step_dir)
+                _commit_step_output(
+                    dataset=entry.output,
+                    payload=persisted,
+                    step_dir=step_dir,
+                    node_id=_step_node_id(stage_index + 1, entry_index + 1),
+                    stage_index=stage_index + 1,
+                    stage_name=stage.name,
+                    step_index=entry_index + 1,
+                    step_name=entry_name,
+                )
                 checkpoint_written = True
             logger.info(
                 "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",

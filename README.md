@@ -167,10 +167,12 @@ when an empty result is valid and should be persisted as a reloadable checkpoint
 output = PartitionedJSONDataset(name="optional_records", allow_empty=True)
 ```
 
-Allowed empty outputs use an internal `.caravel_empty` sentinel because object
-stores do not have durable empty directories. Non-empty outputs do not contain
-the sentinel. With the default `allow_empty=False`, saving `{}` raises
-`EmptyOutputError` at the producing step.
+Runner-persisted outputs are committed through a central checkpoint registry
+under `<run_root>/<pipeline_name>/_000_metadata/checkpoints/`, so step output
+directories contain dataset files only. An allowed empty partitioned output is
+committed as a count-zero checkpoint record rather than a sentinel file. With
+the default `allow_empty=False`, saving `{}` raises `EmptyOutputError` at the
+producing step.
 
 Partition keys may use path-style nesting like `en/record_001`; partitioned
 datasets resolve those keys into nested output directories.
@@ -204,11 +206,16 @@ _<stage_index>_<stage_name>/_<step_index>_<step_name>/...
 Example:
 
 ```text
+_000_metadata/checkpoints/stage-001-entry-001.json
 _001_bronze/_001_branch_by_source/...
 _001_bronze/_002_bronze_converged_records/...
 _002_silver/_001_silver_unify_records/...
 _003_gold/_001_gold_partition_by_language/en/*.json
 ```
+
+`_000_metadata` is reserved for Caravel control state (checkpoint records). It
+is never a stage directory, and step output without a matching checkpoint
+record is ordinary data rather than a reusable selective-rerun boundary.
 
 ## CLI Usage
 

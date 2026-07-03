@@ -221,7 +221,7 @@ def test_clean_dirs_true_clears_existing_stage_contents_before_stage_run(tmp_pat
     assert (stage_root / "_001_pass_through" / "a.json").exists()
 
 
-def test_clean_dirs_true_without_stage_root_clears_run_root_contents_before_stage_run(
+def test_clean_dirs_true_without_stage_root_clears_only_the_stage_directory(
     tmp_path: Path,
 ) -> None:
     from caravel.runner import run
@@ -233,25 +233,30 @@ def test_clean_dirs_true_without_stage_root_clears_run_root_contents_before_stag
         _ = context
         return partitions
 
-    run_root = tmp_path / "run_root_clean_target"
-    stale_file = run_root / "stale.txt"
-    stale_dir_file = run_root / "obsolete" / "old.json"
-    stale_dir_file.parent.mkdir(parents=True, exist_ok=True)
-    stale_file.write_text("stale", encoding="utf-8")
-    stale_dir_file.write_text("stale", encoding="utf-8")
-
     pipeline = Pipeline(
         name="run_root_clean_dirs_pipeline",
         loader=_StubLoader({"a": {"id": "a", "value": 1}}),
         stages=[Stage(name="bronze", entries=[pass_through], clean_dirs=True)],
     )
 
+    run_root = tmp_path / "run_root_clean_target"
+    foreign_file = run_root / "stale.txt"
+    foreign_dir_file = run_root / "obsolete" / "old.json"
+    foreign_dir_file.parent.mkdir(parents=True, exist_ok=True)
+    foreign_file.write_text("preserve", encoding="utf-8")
+    foreign_dir_file.write_text("preserve", encoding="utf-8")
+
+    stage_dir = run_root / pipeline.name / "_001_bronze"
+    stale_step_file = stage_dir / "_009_renamed_step" / "left_over.json"
+    stale_step_file.parent.mkdir(parents=True, exist_ok=True)
+    stale_step_file.write_text("stale", encoding="utf-8")
+
     run(pipeline, run_root=run_root)
 
-    assert run_root.exists()
-    assert not stale_file.exists()
-    assert not stale_dir_file.exists()
-    assert (run_root / pipeline.name / "_001_bronze" / "_001_pass_through" / "a.json").exists()
+    assert foreign_file.exists()
+    assert foreign_dir_file.exists()
+    assert not stale_step_file.exists()
+    assert (stage_dir / "_001_pass_through" / "a.json").exists()
 
 
 def test_clean_dirs_true_fails_fast_for_selective_non_first_step_without_deleting(
@@ -302,7 +307,7 @@ def test_clean_dirs_true_fails_fast_for_selective_non_first_step_without_deletin
     assert sentinel.exists()
 
 
-def test_clean_dirs_on_later_default_stage_loads_seed_before_run_root_cleanup(
+def test_clean_dirs_on_later_default_stage_preserves_earlier_stage_outputs(
     tmp_path: Path,
 ) -> None:
     from caravel.runner import run
@@ -321,7 +326,7 @@ def test_clean_dirs_on_later_default_stage_loads_seed_before_run_root_cleanup(
         / "_001_silver_summary.json"
     )
 
-    assert not bronze_file.exists()
+    assert bronze_file.exists()
     assert silver_file.exists()
 
 
@@ -414,17 +419,11 @@ def test_only_step_by_name_executes_target_step_and_requires_prior_output(
 def test_only_step_by_index_executes_target_step(tmp_path: Path) -> None:
     from caravel.runner import run
 
-    pipeline = _make_linear_pipeline()
+    calls: dict[str, int] = {}
+    pipeline = _make_linear_pipeline(call_counter=calls)
 
-    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map"
-    bronze_dataset = PartitionedJSONDataset(name="seed", path=bronze_dir)
-    bronze_dataset.save(
-        {
-            "x": {"id": "x", "mapped": True},
-            "y": {"id": "y", "mapped": True},
-        },
-        bronze_dir,
-    )
+    run(pipeline, run_root=tmp_path)
+    bronze_runs_before = calls.get("bronze_map", 0)
 
     run(
         pipeline,
@@ -432,6 +431,8 @@ def test_only_step_by_index_executes_target_step(tmp_path: Path) -> None:
         only_stage="silver",
         only_step=1,
     )
+
+    assert calls.get("bronze_map", 0) == bronze_runs_before
 
     silver_file = (
         tmp_path
