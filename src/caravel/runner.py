@@ -40,6 +40,8 @@ from .plugins import (
     CheckpointCapability,
     CheckpointContext,
     NodeFacts,
+    OwnershipContext,
+    PlanOutput,
     PluginFailureError,
     PluginSet,
     RunEvent,
@@ -642,6 +644,23 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
                 )
         return value
 
+    def _ownership_context() -> OwnershipContext:
+        managed_root = str(_join_run_path(resolved_run_root, pipeline.name))
+        outputs: list[PlanOutput] = []
+        for node in execution_plan.nodes:
+            if node.step_dir is None:
+                continue
+            stage_decl = pipeline.stages[node.logical.stage_index - 1]
+            outputs.append(
+                PlanOutput(
+                    node_id=node.logical.node_id,
+                    step_dir=str(node.step_dir),
+                    persist=node.logical.persist,
+                    managed=stage_decl.stage_root is None,
+                )
+            )
+        return OwnershipContext(run=run_facts, managed_root=managed_root, outputs=tuple(outputs))
+
     def _load_capability_checkpoints() -> None:
         checkpoint = plugin_set.checkpoint
         if checkpoint is None:
@@ -793,6 +812,8 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
             entered_guards.append((plugin_id, guard))
 
         _emit("run_started")
+        if plugin_set.ownership is not None:
+            plugin_set.ownership.reconcile(_ownership_context())
         _run_nodes()
         _emit("run_completed")
     except BaseException as exc:

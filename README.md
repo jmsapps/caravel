@@ -261,6 +261,33 @@ record, so it stays reusable on storage without durable empty directories.
 Removing the plugin leaves records inert: bare core ignores them and rejects
 checkpoint-dependent selective requests at binding.
 
+### OwnershipPlugin
+
+`OwnershipPlugin` removes stale cross-run output — directories left behind by
+renamed or removed stages, steps, routes, and route steps — using durable
+recorded ownership, never filename conventions:
+
+```python
+from caravel.plugins import CheckpointPlugin, OwnershipPlugin
+
+plugins = [
+    CheckpointPlugin(metadata_root="data/metadata/checkpoints"),
+    OwnershipPlugin(metadata_root="data/metadata/ownership"),
+]
+run(pipeline, run_root="data/output", plugins=plugins)
+```
+
+Each full run records the bound plan's managed persisted output directories
+as a versioned inventory under the plugin's required `metadata_root`. A later
+full run deletes exactly the directories a prior valid inventory recorded but
+the current plan no longer declares; every candidate must stay inside the
+managed pipeline root. Without a prior valid inventory nothing is deleted.
+`stage_root` trees are user-owned and never pruned, selective runs neither
+prune nor replace the inventory, and interrupted reconciliation converges on
+rerun. In the reference production profile, compose it with
+`CheckpointPlugin` so evidence pointing at pruned output can never authorize
+reuse.
+
 ## CLI Usage
 
 Each example entry point wires `make_cli(pipeline)`, so supported options are

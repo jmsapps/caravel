@@ -97,6 +97,31 @@ class RunOutcome:
 
 
 @dataclass(frozen=True)
+class PlanOutput:
+    """One bound step or route-step output declared by the current plan.
+
+    ``managed`` is computed by core from stage configuration: it is True only
+    when the output directory lives beneath the Caravel-managed pipeline root
+    (no ``stage_root`` override). Ownership is a plan fact, never inferred
+    from a path's name.
+    """
+
+    node_id: str
+    step_dir: str
+    persist: bool
+    managed: bool
+
+
+@dataclass(frozen=True)
+class OwnershipContext:
+    """Immutable bound-plan facts supplied to the ownership capability."""
+
+    run: RunFacts
+    managed_root: str
+    outputs: tuple[PlanOutput, ...]
+
+
+@dataclass(frozen=True)
 class RunEvent:
     """One immutable lifecycle event.
 
@@ -125,6 +150,22 @@ class RunGuard(Protocol):
     def enter(self, run: RunFacts) -> None: ...
 
     def exit(self, run: RunFacts, outcome: RunOutcome) -> None: ...
+
+
+@runtime_checkable
+class OwnershipCapability(Protocol):
+    """Singleton ownership capability: cross-run inventory reconciliation.
+
+    The core executor invokes ``reconcile`` once per run, after run startup
+    and before any node executes, with the complete bound-plan output facts.
+    Deletion candidates may come only from a previously recorded valid
+    inventory and must stay inside the managed root; selective runs must
+    neither prune nor replace the recorded inventory. The capability never
+    invokes user code, never mutates the plan, and never creates or blesses
+    checkpoint evidence.
+    """
+
+    def reconcile(self, context: OwnershipContext) -> None: ...
 
 
 @runtime_checkable
@@ -168,6 +209,7 @@ class PluginSet:
     observers: tuple[tuple[str, RunObserver, ObserverCriticality], ...] = ()
     guards: tuple[tuple[str, RunGuard], ...] = ()
     checkpoint: CheckpointCapability | None = None
+    ownership: OwnershipCapability | None = None
 
 
 def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
@@ -176,6 +218,7 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
     observers: list[tuple[str, RunObserver, ObserverCriticality]] = []
     guards: list[tuple[str, RunGuard]] = []
     checkpoint: CheckpointCapability | None = None
+    ownership: OwnershipCapability | None = None
 
     for plugin in plugins:
         plugin_id = _validate_plugin_id(getattr(plugin, "plugin_id", None))
@@ -208,6 +251,15 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
             checkpoint = plugin
             has_capability = True
 
+        if isinstance(plugin, OwnershipCapability):
+            if ownership is not None:
+                raise ValueError(
+                    "Only one plugin may provide the ownership capability; "
+                    f"'{plugin_id}' conflicts with an earlier plugin."
+                )
+            ownership = plugin
+            has_capability = True
+
         if not has_capability:
             raise ValueError(f"Plugin '{plugin_id}' declares no supported capability.")
 
@@ -216,4 +268,5 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
         observers=tuple(observers),
         guards=tuple(guards),
         checkpoint=checkpoint,
+        ownership=ownership,
     )
