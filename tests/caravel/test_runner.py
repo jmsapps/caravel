@@ -941,7 +941,7 @@ def test_runner_logs_step_start_end_with_dataset_describe_payload(
     joined = "\n".join(record.getMessage() for record in caplog.records)
     assert "STEP START" in joined
     assert "STEP END" in joined
-    assert "checkpoint_written" in joined
+    assert "checkpoint_written" not in joined
     assert "dataset" in joined
 
 
@@ -1231,6 +1231,66 @@ def test_invalid_partition_key_preserves_prior_output(tmp_path: Path) -> None:
         run(pipeline, run_root=tmp_path)
 
     assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+
+def test_unencodable_single_json_payload_preserves_prior_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    state = {"invalid": False}
+
+    @step(output=JSONDataset(name="json_output"))
+    def emit_json(partitions: object, *, context: object) -> object:
+        _ = partitions, context
+        if state["invalid"]:
+            return {"value": {"not-json-serializable"}}
+        return {"value": ["valid"]}
+
+    pipeline = Pipeline(
+        name="single_json_safety",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[emit_json])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    output_file = (
+        tmp_path / pipeline.name / "_001_bronze" / "_001_emit_json" / "_001_emit_json.json"
+    )
+    prior_bytes = output_file.read_bytes()
+
+    state["invalid"] = True
+    with pytest.raises(TypeError):
+        run(pipeline, run_root=tmp_path)
+
+    assert output_file.read_bytes() == prior_bytes
+
+
+def test_unencodable_partitioned_json_payload_preserves_prior_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    state = {"invalid": False}
+
+    @step(output=PartitionedJSONDataset(name="json_partitions"))
+    def emit_json_partitions(partitions: object, *, context: object) -> dict[str, object]:
+        _ = partitions, context
+        if state["invalid"]:
+            return {"a": {"value": {"not-json-serializable"}}}
+        return {"a": {"value": ["valid"]}, "b": {"value": ["also-valid"]}}
+
+    pipeline = Pipeline(
+        name="partitioned_json_safety",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[emit_json_partitions])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    output_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_emit_json_partitions"
+    prior_files = {path.name: path.read_bytes() for path in output_dir.iterdir()}
+
+    state["invalid"] = True
+    with pytest.raises(TypeError):
+        run(pipeline, run_root=tmp_path)
+
+    assert {path.name: path.read_bytes() for path in output_dir.iterdir()} == prior_files
 
 
 def test_failed_save_leaves_partial_output_that_full_runs_replace(tmp_path: Path) -> None:

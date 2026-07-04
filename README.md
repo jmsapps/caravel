@@ -5,9 +5,8 @@
 Caravel is a small Python framework for declaring and running deterministic data
 pipelines. It supports ordered stages, ordered steps, source-aware loading,
 branch routing, dataset-owned persistence, and optional Mermaid graph output.
-Checkpoint-backed selective reruns are provided by an optional checkpoint
-plugin (in development); bare Caravel deliberately never treats existing output
-files as evidence of completed work.
+Applications can extend runner behavior through explicit plugins. Bare Caravel
+deliberately never treats existing output files as evidence of completed work.
 
 This project is currently a pipeline runner with branch fan-out/fan-in support,
 not a general-purpose DAG scheduler. It does not yet provide arbitrary dependency
@@ -22,8 +21,8 @@ Use this framework to declare and run deterministic data pipelines with:
 - dataset-owned I/O (`JSONDataset`, `Partitioned*Dataset`, etc.)
 - source-aware loading (`MultiSourceLoader`)
 - deterministic on-disk output layout
-- selective execution of slices that need no prior output (checkpoint-backed
-  selective reruns arrive with the checkpoint plugin)
+- selective execution of slices that need no prior output
+- explicit observer, run-guard, and checkpoint-policy plugin capabilities
 - optional Mermaid graph rendering
 
 ## Project Layout
@@ -216,6 +215,29 @@ _002_silver/_001_silver_unify_records/...
 _003_gold/_001_gold_partition_by_language/en/*.json
 ```
 
+## Plugins
+
+Plugins are runner capabilities, not CLI-only extensions. Applications can
+pass explicit ordered plugin instances directly to `run()`:
+
+```python
+from caravel.runner import run
+
+run(pipeline, run_root="data/output", plugins=[observer, checkpoint_policy])
+```
+
+An application CLI forwards the same instances:
+
+```python
+from caravel.cli import make_cli
+
+cli = make_cli(pipeline, plugins=[observer, checkpoint_policy])
+```
+
+Plugins may implement observer, run-guard, or checkpoint-policy capabilities.
+Any stateful plugin owns and requires its metadata store/root configuration;
+Caravel does not choose a metadata location or derive one from `run_root`.
+
 ## CLI Usage
 
 Each example entry point wires `make_cli(pipeline)`, so supported options are
@@ -236,8 +258,8 @@ Selective execution (`--stage`, `--step`) runs only slices that need no prior
 output: the first stage, or step 1 of the first stage. Any selection that
 would have to load output from a step it does not execute fails closed before
 running user code, because bare Caravel has no checkpoint evidence to trust
-existing files. Checkpoint-backed selective reruns return with the optional
-checkpoint plugin.
+existing files. Applications may provide a checkpoint capability when
+selective execution must load committed output from skipped nodes.
 
 Run an example from the repo root:
 
@@ -276,8 +298,8 @@ fixed pipeline declaration.
 
 ## Production Status And Support Statement
 
-Caravel is being restructured (C-6) into a small deterministic execution core
-plus explicit production plugins. Claims are profile-specific:
+Caravel is a small deterministic execution core with explicit plugin
+capabilities. Guarantees depend on the configured capabilities:
 
 **Bare core** (this package, no plugins) guarantees:
 
@@ -288,22 +310,18 @@ plus explicit production plugins. Claims are profile-specific:
   partition keys leaves no stale files;
 - in-memory payload flow through full runs, including across stage
   boundaries (stage terminals do not need `persist=True`);
-- data-only output directories and no control-plane metadata: bare core
-  never creates the reserved `_000_metadata` namespace, and user-configured
-  output or cleanup paths may not resolve into it;
+- data-only output directories and no plugin metadata written by bare core;
 - fail-closed selective execution: selections needing prior output are
   rejected at plan binding, before user code or mutation; and
 - framework logs and errors that name types and identifiers, never payload
   contents, parameter values, or storage-option values. Logging inside your
   own step functions is outside this guarantee.
 
-Bare core does **not** guarantee: reuse of existing output, checkpoint-backed
-resume, durable run history, cross-run pruning, lease/abandonment evidence,
-or a loadable artifact for an empty partitioned output on object stores.
-Those arrive as explicit first-party plugins (checkpoints, ownership, run
-evidence, lease) qualified as a named production profile. Interrupted runs
-may leave partial output; bare core never reuses it — a full rerun replaces
-it.
+Bare core does **not** guarantee reuse of existing output, checkpoint-backed
+resume, durable run history, cross-run pruning, lease/abandonment evidence, or
+a loadable artifact for an empty partitioned output on object stores. These
+behaviors require explicitly configured application plugins. Interrupted runs
+may leave partial output; bare core never reuses it—a full rerun replaces it.
 
 The framework is currently suitable for local development, examples, smoke
 tests, and non-critical internal runs.

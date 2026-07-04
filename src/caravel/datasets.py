@@ -121,8 +121,8 @@ class JSONDataset:
             return json.load(handle)
 
     def validate_payload(self, payload: Any) -> None:
-        """Any JSON-serializable payload is structurally acceptable."""
-        _ = payload
+        """Validate that the complete payload can be encoded before mutation."""
+        json.dumps(payload, ensure_ascii=False, indent=self.indent)
 
     def save(self, payload: Any, dest: Path | str) -> None:
         self.validate_payload(payload)
@@ -190,6 +190,8 @@ class PartitionedJSONDataset:
             record_type=None,
             record_type_label="JSON-serializable",
         )
+        for record in payload.values():
+            json.dumps(record, ensure_ascii=False, indent=self.indent)
 
     def save(self, payload: Any, dest: Path | str) -> None:
         self.validate_payload(payload)

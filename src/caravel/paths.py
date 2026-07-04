@@ -2,14 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-RESERVED_METADATA_DIRNAME = "_000_metadata"
-"""Reserved control-plane namespace under a managed pipeline root.
-
-Bare core never creates this directory; configured plugins own isolated
-namespaces beneath it. User Dataset destinations and cleanup targets may not
-resolve into it.
-"""
-
 
 def format_stage_dir(index: int, name: str) -> str:
     """Return canonical stage folder name like ``_001_bronze``."""

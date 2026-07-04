@@ -1,8 +1,4 @@
-"""Typed plugin capability foundation.
-
-EXPERIMENTAL: every protocol in this module is provisional until the
-first-party reference plugins and their conformance suites validate the seam.
-Third-party plugins should expect breaking changes before 1.0.
+"""Typed plugin capabilities for extending one runner invocation.
 
 Plugins are explicit instances passed to one runner invocation; there is no
 discovery, global registry, environment activation, or event bus. A plugin
@@ -22,12 +18,10 @@ declares one or more small typed capabilities:
   core-defined points; the capability cannot reorder, skip, or add boundary
   points, cannot invoke user code, and cannot save datasets. Skipped output
   loads only through the declared Dataset.
-- **Ownership policy** (`OwnershipCapability`, singleton): reserved for
-  cross-run freshness reconciliation; defined in a later step.
 
-Bare core (``plugins=[]``) creates no plugin metadata. Each configured plugin
-owns exactly one validated namespace under the reserved control-plane
-directory and may not write through another plugin's allocation.
+Stateful plugins own and require their storage configuration. The runner does
+not choose a metadata location or assume plugin state lives beside pipeline
+output.
 """
 
 from __future__ import annotations
@@ -35,8 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from .paths import RESERVED_METADATA_DIRNAME
-from .types import Dataset
+from ..types import Dataset
 
 ObserverCriticality = Literal["required", "best_effort"]
 
@@ -88,6 +81,14 @@ class NodeFacts:
 
 
 @dataclass(frozen=True)
+class CheckpointContext:
+    """Immutable run and node facts supplied to checkpoint callbacks."""
+
+    run: RunFacts
+    node: NodeFacts
+
+
+@dataclass(frozen=True)
 class RunOutcome:
     """Terminal outcome facts handed to run guards at exit."""
 
@@ -128,7 +129,7 @@ class RunGuard(Protocol):
 
 @runtime_checkable
 class CheckpointCapability(Protocol):
-    """Singleton checkpoint/reuse policy capability (EXPERIMENTAL).
+    """Singleton checkpoint/reuse policy capability.
 
     The core executor invokes exactly this sequence for a persisted node:
 
@@ -144,18 +145,11 @@ class CheckpointCapability(Protocol):
     user code, never saves datasets, and never mutates the plan.
     """
 
-    def reuse_verdict(self, node: NodeFacts, dataset: Dataset) -> bool: ...
+    def reuse_verdict(self, context: CheckpointContext, dataset: Dataset) -> bool: ...
 
-    def before_replacement(self, node: NodeFacts, dataset: Dataset) -> None: ...
+    def before_replacement(self, context: CheckpointContext, dataset: Dataset) -> None: ...
 
-    def after_save(self, node: NodeFacts, dataset: Dataset) -> None: ...
-
-
-@runtime_checkable
-class OwnershipCapability(Protocol):
-    """Singleton ownership/freshness policy capability (EXPERIMENTAL, reserved)."""
-
-    def reconcile_ownership(self, run: RunFacts) -> None: ...
+    def after_save(self, context: CheckpointContext, dataset: Dataset) -> None: ...
 
 
 def _validate_plugin_id(plugin_id: object) -> str:
@@ -163,20 +157,7 @@ def _validate_plugin_id(plugin_id: object) -> str:
         raise ValueError("Plugin id must be a non-empty string.")
     if "/" in plugin_id or "\\" in plugin_id or plugin_id in ("..", "."):
         raise ValueError(f"Plugin id '{plugin_id}' must be one safe path segment.")
-    if plugin_id == RESERVED_METADATA_DIRNAME:
-        raise ValueError(f"Plugin id may not be '{RESERVED_METADATA_DIRNAME}'.")
     return plugin_id
-
-
-def plugin_namespace(pipeline_root: str, plugin_id: str) -> str:
-    """Return a plugin's allocated namespace path without creating it.
-
-    Allocation is pure path math; only the plugin itself may create and write
-    its namespace, and only beneath the returned prefix.
-    """
-    validated = _validate_plugin_id(plugin_id)
-    root = str(pipeline_root).rstrip("/")
-    return f"{root}/{RESERVED_METADATA_DIRNAME}/plugins/{validated}"
 
 
 @dataclass(frozen=True)
@@ -187,7 +168,6 @@ class PluginSet:
     observers: tuple[tuple[str, RunObserver, ObserverCriticality], ...] = ()
     guards: tuple[tuple[str, RunGuard], ...] = ()
     checkpoint: CheckpointCapability | None = None
-    ownership: OwnershipCapability | None = None
 
 
 def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
@@ -196,7 +176,6 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
     observers: list[tuple[str, RunObserver, ObserverCriticality]] = []
     guards: list[tuple[str, RunGuard]] = []
     checkpoint: CheckpointCapability | None = None
-    ownership: OwnershipCapability | None = None
 
     for plugin in plugins:
         plugin_id = _validate_plugin_id(getattr(plugin, "plugin_id", None))
@@ -229,15 +208,6 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
             checkpoint = plugin
             has_capability = True
 
-        if isinstance(plugin, OwnershipCapability):
-            if ownership is not None:
-                raise ValueError(
-                    "Only one plugin may provide the ownership capability; "
-                    f"'{plugin_id}' conflicts with an earlier plugin."
-                )
-            ownership = plugin
-            has_capability = True
-
         if not has_capability:
             raise ValueError(f"Plugin '{plugin_id}' declares no supported capability.")
 
@@ -246,23 +216,4 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
         observers=tuple(observers),
         guards=tuple(guards),
         checkpoint=checkpoint,
-        ownership=ownership,
     )
-
-
-__all__ = [
-    "CheckpointCapability",
-    "EventKind",
-    "NodeFacts",
-    "ObserverCriticality",
-    "OwnershipCapability",
-    "PluginFailureError",
-    "PluginSet",
-    "RunEvent",
-    "RunFacts",
-    "RunGuard",
-    "RunObserver",
-    "RunOutcome",
-    "plugin_namespace",
-    "validate_plugins",
-]

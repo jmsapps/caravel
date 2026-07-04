@@ -1,9 +1,7 @@
-"""Bare-core security and namespace-reservation contracts (Step 1.4).
+"""Bare-core security contracts.
 
 Framework-generated logs and errors must not contain payload contents,
-parameter values, or storage-option values. The `_000_metadata` namespace is
-reserved: bare core never creates it, and user-configured output or cleanup
-paths may not resolve into it.
+parameter values, or storage-option values.
 """
 
 import logging
@@ -95,55 +93,6 @@ def test_cli_param_errors_do_not_echo_values() -> None:
         _parse_params([f"={PARAM_CANARY}"])
 
     assert PARAM_CANARY not in str(empty_exc.value)
-
-
-def test_bare_core_run_creates_no_metadata_namespace(tmp_path: Path) -> None:
-    from caravel.runner import run
-
-    run(_canary_pipeline(name="no_metadata"), run_root=tmp_path)
-
-    found = [path for path in tmp_path.rglob("_000_metadata")]
-    assert found == []
-
-
-def test_stage_root_inside_reserved_namespace_fails_before_mutation(tmp_path: Path) -> None:
-    from caravel.runner import run
-
-    pipeline = _canary_pipeline(name="reserved_target")
-    reserved_root = tmp_path / pipeline.name / "_000_metadata" / "plugins" / "rogue"
-    pipeline.stages[0].stage_root = reserved_root
-
-    with pytest.raises(ValueError, match="reserved '_000_metadata' namespace"):
-        run(pipeline, run_root=tmp_path)
-
-    assert not reserved_root.exists()
-
-
-def test_clean_dirs_cannot_target_reserved_namespace(tmp_path: Path) -> None:
-    from caravel.runner import run
-
-    pipeline = _canary_pipeline(name="reserved_clean")
-    reserved_root = tmp_path / pipeline.name / "_000_metadata"
-    reserved_root.mkdir(parents=True)
-    sentinel = reserved_root / "plugin_state.json"
-    sentinel.write_text("{}", encoding="utf-8")
-    pipeline.stages[0].stage_root = reserved_root
-    pipeline.stages[0].clean_dirs = True
-
-    with pytest.raises(ValueError, match="reserved '_000_metadata' namespace"):
-        run(pipeline, run_root=tmp_path)
-
-    assert sentinel.exists()
-
-
-def test_reserved_namespace_rejected_on_remote_roots() -> None:
-    from caravel.runner import run
-
-    pipeline = _canary_pipeline(name="reserved_remote")
-    pipeline.stages[0].stage_root = "memory://caravel/reserved/_000_metadata/plugins/rogue"
-
-    with pytest.raises(ValueError, match="reserved '_000_metadata' namespace"):
-        run(pipeline, run_root="memory://caravel/reserved")
 
 
 def test_step_output_dataset_writing_single_file_keeps_data_only_layout(tmp_path: Path) -> None:

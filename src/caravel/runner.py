@@ -24,7 +24,6 @@ from .logger import get_logger
 from .branch import Branch
 from .datasets import CheckpointLoadableDataset, ValidatedDataset
 from .paths import (
-    RESERVED_METADATA_DIRNAME,
     format_stage_dir,
     format_step_dir,
     resolve_run_root,
@@ -39,6 +38,7 @@ from .plan import (
 from .plan import _normalize_route_step as _plan_normalize_route_step
 from .plugins import (
     CheckpointCapability,
+    CheckpointContext,
     NodeFacts,
     PluginFailureError,
     PluginSet,
@@ -199,7 +199,7 @@ def _persist_step_output(
     step_dir: RunPath,
     *,
     checkpoint: CheckpointCapability | None = None,
-    node_facts: NodeFacts | None = None,
+    checkpoint_context: CheckpointContext | None = None,
 ) -> None:
     """Validate the complete payload, then replace the owned step directory.
 
@@ -213,12 +213,12 @@ def _persist_step_output(
         return
 
     dataset.validate_payload(payload)
-    if checkpoint is not None and node_facts is not None:
-        checkpoint.before_replacement(node_facts, dataset)
+    if checkpoint is not None and checkpoint_context is not None:
+        checkpoint.before_replacement(checkpoint_context, dataset)
     remove_and_recreate_dir(step_dir, getattr(dataset, "storage_options", None))
     dataset.save(payload, step_dir)
-    if checkpoint is not None and node_facts is not None:
-        checkpoint.after_save(node_facts, dataset)
+    if checkpoint is not None and checkpoint_context is not None:
+        checkpoint.after_save(checkpoint_context, dataset)
 
 
 @dataclass(frozen=True)
@@ -362,21 +362,10 @@ def bind_execution(
             format_stage_dir(stage_index + 1, stage_decl.name),
         )
 
-    def _assert_outside_reserved_namespace(path: RunPath, *, what: str) -> None:
-        segments = tuple(str(path).split("/")) if _is_remote_path(path) else Path(str(path)).parts
-        if RESERVED_METADATA_DIRNAME in segments:
-            raise ValueError(
-                f"{what} '{path}' targets the reserved '{RESERVED_METADATA_DIRNAME}' namespace."
-            )
-
     bound_stages: list[BoundStage] = []
     for stage_index, stage in enumerate(pipeline.stages):
         executes = selected_stage_idx is None or selected_stage_idx == stage_index
         clean_root = _resolve_stage_base(stage_index)
-        if stage.clean_dirs:
-            _assert_outside_reserved_namespace(
-                clean_root, what=f"Stage '{stage.name}' cleanup target"
-            )
         bound_stages.append(
             BoundStage(
                 index=stage_index + 1,
@@ -420,9 +409,6 @@ def bind_execution(
                     f"Bound step node '{node.node_id}' does not reference a Step entry."
                 )
             step_dir = _join_run_path(stage_base, format_step_dir(node.entry_index, node.name))
-            _assert_outside_reserved_namespace(
-                step_dir, what=f"Step '{node.name}' output directory"
-            )
             bound_nodes.append(
                 BoundNode(
                     logical=node,
@@ -448,9 +434,6 @@ def bind_execution(
             assert node.route_key is not None
             branch_dir = _join_run_path(stage_base, format_step_dir(node.entry_index, entry.name))
             step_dir = _join_run_path(branch_dir, node.route_key, node.name)
-            _assert_outside_reserved_namespace(
-                step_dir, what=f"Route step '{node.name}' output directory"
-            )
             route_chain = (node.stage_index, node.entry_index, node.route_index)
             route_step = _plan_normalize_route_step(
                 entry.routes[node.route_key][node.route_step_index - 1],
@@ -667,8 +650,9 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
             bound = nodes_by_id[node_id]
             assert bound.step is not None and bound.step_dir is not None
             facts = _node_facts(bound)
+            context = CheckpointContext(run=run_facts, node=facts)
             dataset = bound.step.output
-            if not checkpoint.reuse_verdict(facts, dataset):
+            if not checkpoint.reuse_verdict(context, dataset):
                 raise MissingPriorOutputError(
                     "Checkpoint capability found no committed evidence for "
                     f"stage='{facts.stage_name}' step='{facts.name}'; the "
@@ -682,6 +666,7 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
         assert node.step is not None and node.step_dir is not None
         logical = node.logical
         facts = _node_facts(node)
+        checkpoint_context = CheckpointContext(run=run_facts, node=facts)
         step_index = (
             logical.route_step_index if logical.kind == "route-step" else logical.entry_index
         )
@@ -730,7 +715,7 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
                     persisted,
                     node.step_dir,
                     checkpoint=plugin_set.checkpoint,
-                    node_facts=facts,
+                    checkpoint_context=checkpoint_context,
                 )
         except PluginFailureError:
             raise
@@ -739,11 +724,10 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
             raise
 
         logger.info(
-            "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
+            "STEP END pipeline=%s stage=%s step=%s persist=%s dataset=%s",
             pipeline.name,
             logical.stage_name,
             logical.name,
-            logical.persist,
             logical.persist,
             node.step.output.describe(),
         )

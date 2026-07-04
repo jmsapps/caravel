@@ -1,8 +1,8 @@
-"""Typed plugin capability foundation tests (Step 1.5).
+"""Typed plugin capability tests.
 
-Covers plugin validation, namespace allocation, deterministic ordering and
-reverse teardown, observer failure semantics, and the checkpoint capability
-seam driven end-to-end by a recording fake.
+Covers plugin validation, deterministic ordering and reverse teardown,
+observer failure semantics, and the checkpoint capability seam driven
+end-to-end by a recording fake.
 """
 
 from pathlib import Path
@@ -13,12 +13,11 @@ import pytest
 from caravel.datasets import JSONDataset, PartitionedJSONDataset
 from caravel.pipeline import Pipeline, Stage, step
 from caravel.plugins import (
-    NodeFacts,
+    CheckpointContext,
     PluginFailureError,
     RunEvent,
     RunFacts,
     RunOutcome,
-    plugin_namespace,
     validate_plugins,
 )
 from caravel.runner import ExecutionRequest, bind_execution, execute
@@ -82,19 +81,23 @@ class FakeCheckpointPlugin:
         self.grant = grant
         self.evidence: dict[str, str] = {}
         self.calls: list[str] = []
+        self.contexts: list[CheckpointContext] = []
 
-    def reuse_verdict(self, node: NodeFacts, dataset: Dataset) -> bool:
-        self.calls.append(f"verdict:{node.node_id}")
-        return self.grant and node.node_id in self.evidence
+    def reuse_verdict(self, context: CheckpointContext, dataset: Dataset) -> bool:
+        self.contexts.append(context)
+        self.calls.append(f"verdict:{context.node.node_id}")
+        return self.grant and context.node.node_id in self.evidence
 
-    def before_replacement(self, node: NodeFacts, dataset: Dataset) -> None:
-        self.calls.append(f"invalidate:{node.node_id}")
-        self.evidence.pop(node.node_id, None)
+    def before_replacement(self, context: CheckpointContext, dataset: Dataset) -> None:
+        self.contexts.append(context)
+        self.calls.append(f"invalidate:{context.node.node_id}")
+        self.evidence.pop(context.node.node_id, None)
 
-    def after_save(self, node: NodeFacts, dataset: Dataset) -> None:
-        self.calls.append(f"commit:{node.node_id}")
-        assert node.step_dir is not None
-        self.evidence[node.node_id] = node.step_dir
+    def after_save(self, context: CheckpointContext, dataset: Dataset) -> None:
+        self.contexts.append(context)
+        self.calls.append(f"commit:{context.node.node_id}")
+        assert context.node.step_dir is not None
+        self.evidence[context.node.node_id] = context.node.step_dir
 
 
 def _linear_pipeline(loader: _StubLoader, calls: dict[str, int]) -> Pipeline:
@@ -147,7 +150,7 @@ def test_duplicate_plugin_ids_are_rejected() -> None:
         validate_plugins((RecordingObserver("same", log), RecordingObserver("same", log)))
 
 
-@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "..", "_000_metadata", None])
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "..", None])
 def test_unsafe_plugin_ids_are_rejected(bad_id: object) -> None:
     log: list[str] = []
     observer = RecordingObserver("placeholder", log)
@@ -171,26 +174,6 @@ def test_only_one_checkpoint_capability_allowed() -> None:
     second.plugin_id = "fake-checkpoint-2"  # type: ignore[misc]
     with pytest.raises(ValueError, match="Only one plugin may provide the checkpoint"):
         validate_plugins((FakeCheckpointPlugin(), second))
-
-
-# ----------------------------------------------------------------- namespace
-
-
-def test_plugin_namespace_is_isolated_per_plugin_and_pure() -> None:
-    root = "/data/run/pipeline"
-    first = plugin_namespace(root, "event-history")
-    second = plugin_namespace(root, "lease")
-
-    assert first == "/data/run/pipeline/_000_metadata/plugins/event-history"
-    assert second == "/data/run/pipeline/_000_metadata/plugins/lease"
-    assert not first.startswith(second) and not second.startswith(first)
-    assert not Path(first).exists()
-
-
-@pytest.mark.parametrize("bad_id", ["../escape", "a/b", "", "_000_metadata"])
-def test_plugin_namespace_rejects_unsafe_ids(bad_id: str) -> None:
-    with pytest.raises(ValueError):
-        plugin_namespace("/data/run/pipeline", bad_id)
 
 
 # ------------------------------------------------------- ordering / teardown
@@ -339,6 +322,14 @@ def test_checkpoint_capability_enables_selective_execution(tmp_path: Path) -> No
 
     assert calls == {"bronze": 1, "silver": 2}
     assert "verdict:stage-001-entry-001" in plugin.calls
+    verdict_context = next(
+        context
+        for context in plugin.contexts
+        if context.node.node_id == "stage-001-entry-001" and context.run.is_selective
+    )
+    assert verdict_context.run.pipeline_name == pipeline.name
+    assert verdict_context.run.run_root == str(tmp_path)
+    assert len(verdict_context.run.run_id) == 32
 
     silver_file = (
         tmp_path
@@ -412,12 +403,10 @@ def test_skipped_node_emits_node_skipped_event(tmp_path: Path) -> None:
     assert skipped.node.node_id == "stage-001-entry-001"
 
 
-def test_plugins_empty_keeps_metadata_free_execution(tmp_path: Path) -> None:
+def test_plugins_empty_executes_without_plugin_callbacks(tmp_path: Path) -> None:
     from caravel.runner import run
 
     loader = _StubLoader({"a": {"id": "a"}})
     pipeline = _linear_pipeline(loader, {})
 
     run(pipeline, run_root=tmp_path, plugins=[])
-
-    assert list(tmp_path.rglob("_000_metadata")) == []
