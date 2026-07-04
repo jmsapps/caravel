@@ -36,6 +36,19 @@ class ValidatedDataset(Protocol):
     def validate_payload(self, payload: Any) -> None: ...
 
 
+@runtime_checkable
+class CheckpointLoadableDataset(Protocol):
+    """Structural contract for loading a saved output from its destination.
+
+    ``load_from(dest)`` mirrors ``save(payload, dest)``: it loads the payload
+    a prior save wrote under ``dest``. Only datasets with this contract can be
+    loaded through a checkpoint capability; custom datasets without it cannot
+    serve as checkpoint-backed selective boundaries.
+    """
+
+    def load_from(self, dest: Path | str) -> Any: ...
+
+
 def _validate_allow_empty(allow_empty: bool) -> None:
     if not isinstance(allow_empty, bool):
         raise TypeError(f"allow_empty must be bool, got {type(allow_empty).__name__}.")
@@ -99,6 +112,14 @@ class JSONDataset:
         with fs.open(source_path, mode="rt", encoding="utf-8") as handle:
             return json.load(handle)
 
+    def load_from(self, dest: Path | str) -> Any:
+        output_file = single_output_path(dest, ".json")
+        fs, output_path = resolve_fs(output_file, self.storage_options)
+        if not fs.exists(output_path) or not is_file(fs, output_path):
+            raise FileNotFoundError(f"Dataset '{self.name}' missing saved output: {output_file}")
+        with fs.open(output_path, mode="rt", encoding="utf-8") as handle:
+            return json.load(handle)
+
     def validate_payload(self, payload: Any) -> None:
         """Any JSON-serializable payload is structurally acceptable."""
         _ = payload
@@ -146,12 +167,14 @@ class PartitionedJSONDataset:
         self.allow_empty = allow_empty
 
     def load(self) -> dict[str, Any]:
-        source = ensure_storage_path_set(self.name, self.path)
-        fs, source_path = resolve_fs(source, self.storage_options)
+        return self.load_from(ensure_storage_path_set(self.name, self.path))
+
+    def load_from(self, dest: Path | str) -> dict[str, Any]:
+        fs, source_path = resolve_fs(dest, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
-            raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
+            raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {dest}")
         loaded: dict[str, Any] = {}
-        for file_path in iter_files_with_suffix(source, ".json", self.storage_options):
+        for file_path in iter_files_with_suffix(dest, ".json", self.storage_options):
             key = relative_key_from_file(source_path, file_path, ".json")
             with fs.open(file_path, mode="rt", encoding="utf-8") as handle:
                 loaded[key] = json.load(handle)
@@ -220,6 +243,14 @@ class TextDataset:
         with fs.open(source_path, mode="rt", encoding=self.encoding) as handle:
             return str(handle.read())
 
+    def load_from(self, dest: Path | str) -> str:
+        output_file = single_output_path(dest, self.suffix)
+        fs, output_path = resolve_fs(output_file, self.storage_options)
+        if not fs.exists(output_path) or not is_file(fs, output_path):
+            raise FileNotFoundError(f"Dataset '{self.name}' missing saved output: {output_file}")
+        with fs.open(output_path, mode="rt", encoding=self.encoding) as handle:
+            return str(handle.read())
+
     def validate_payload(self, payload: Any) -> None:
         if not isinstance(payload, str):
             raise TypeError(
@@ -273,12 +304,14 @@ class PartitionedTextDataset:
         self.allow_empty = allow_empty
 
     def load(self) -> dict[str, str]:
-        source = ensure_storage_path_set(self.name, self.path)
-        fs, source_path = resolve_fs(source, self.storage_options)
+        return self.load_from(ensure_storage_path_set(self.name, self.path))
+
+    def load_from(self, dest: Path | str) -> dict[str, str]:
+        fs, source_path = resolve_fs(dest, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
-            raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
+            raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {dest}")
         loaded: dict[str, str] = {}
-        for file_path in iter_files_with_suffix(source, self.suffix, self.storage_options):
+        for file_path in iter_files_with_suffix(dest, self.suffix, self.storage_options):
             key = relative_key_from_file(source_path, file_path, self.suffix)
             with fs.open(file_path, mode="rt", encoding=self.encoding) as handle:
                 loaded[key] = str(handle.read())
@@ -346,6 +379,14 @@ class BytesDataset:
         with fs.open(source_path, mode="rb") as handle:
             return bytes(handle.read())
 
+    def load_from(self, dest: Path | str) -> bytes:
+        output_file = single_output_path(dest, self.suffix)
+        fs, output_path = resolve_fs(output_file, self.storage_options)
+        if not fs.exists(output_path) or not is_file(fs, output_path):
+            raise FileNotFoundError(f"Dataset '{self.name}' missing saved output: {output_file}")
+        with fs.open(output_path, mode="rb") as handle:
+            return bytes(handle.read())
+
     def validate_payload(self, payload: Any) -> None:
         if not isinstance(payload, bytes):
             raise TypeError(
@@ -396,12 +437,14 @@ class PartitionedBytesDataset:
         self.allow_empty = allow_empty
 
     def load(self) -> dict[str, bytes]:
-        source = ensure_storage_path_set(self.name, self.path)
-        fs, source_path = resolve_fs(source, self.storage_options)
+        return self.load_from(ensure_storage_path_set(self.name, self.path))
+
+    def load_from(self, dest: Path | str) -> dict[str, bytes]:
+        fs, source_path = resolve_fs(dest, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
-            raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
+            raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {dest}")
         loaded: dict[str, bytes] = {}
-        for file_path in iter_files_with_suffix(source, self.suffix, self.storage_options):
+        for file_path in iter_files_with_suffix(dest, self.suffix, self.storage_options):
             key = relative_key_from_file(source_path, file_path, self.suffix)
             with fs.open(file_path, mode="rb") as handle:
                 loaded[key] = bytes(handle.read())

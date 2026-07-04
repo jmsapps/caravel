@@ -18,11 +18,11 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 from .logger import get_logger
 from .branch import Branch
-from .datasets import ValidatedDataset
+from .datasets import CheckpointLoadableDataset, ValidatedDataset
 from .paths import (
     RESERVED_METADATA_DIRNAME,
     format_stage_dir,
@@ -37,9 +37,21 @@ from .plan import (
     compile_pipeline,
 )
 from .plan import _normalize_route_step as _plan_normalize_route_step
+from .plugins import (
+    CheckpointCapability,
+    NodeFacts,
+    PluginFailureError,
+    PluginSet,
+    RunEvent,
+    RunFacts,
+    RunGuard,
+    RunOutcome,
+    validate_plugins,
+)
 from .storage import is_dir, is_url_path, join_path, remove_and_recreate_dir, resolve_fs
 from .types import (
     Dataset,
+    MissingPriorOutputError,
     Partitions,
     StepContext,
     UnsupportedCapabilityError,
@@ -181,19 +193,32 @@ def _clean_stage_base_if_needed(clean_root: RunPath, clean_dirs: bool) -> None:
     fs.makedirs(root, exist_ok=True)
 
 
-def _persist_step_output(dataset: Dataset, payload: Any, step_dir: RunPath) -> None:
+def _persist_step_output(
+    dataset: Dataset,
+    payload: Any,
+    step_dir: RunPath,
+    *,
+    checkpoint: CheckpointCapability | None = None,
+    node_facts: NodeFacts | None = None,
+) -> None:
     """Validate the complete payload, then replace the owned step directory.
 
-    Datasets without payload validation keep plain save behavior so custom
-    Dataset implementations are unaffected.
+    The core executor owns this sequence; a checkpoint capability is invoked
+    only at the two fixed evidence points and cannot reorder them. Datasets
+    without payload validation keep plain save behavior (and receive no
+    checkpoint evidence) so custom Dataset implementations are unaffected.
     """
     if not isinstance(dataset, ValidatedDataset):
         dataset.save(payload, step_dir)
         return
 
     dataset.validate_payload(payload)
+    if checkpoint is not None and node_facts is not None:
+        checkpoint.before_replacement(node_facts, dataset)
     remove_and_recreate_dir(step_dir, getattr(dataset, "storage_options", None))
     dataset.save(payload, step_dir)
+    if checkpoint is not None and node_facts is not None:
+        checkpoint.after_save(node_facts, dataset)
 
 
 @dataclass(frozen=True)
@@ -206,6 +231,7 @@ class ExecutionRequest:
     params: Mapping[str, str] | None = None
     keep_source_tag: bool = False
     context_factory: Callable[[StepContext], Any] | None = None
+    plugins: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -244,6 +270,8 @@ class ExecutionPlan:
     context_factory: Callable[[StepContext], Any] | None
     stages: tuple[BoundStage, ...]
     nodes: tuple[BoundNode, ...]
+    plugin_set: PluginSet = PluginSet()
+    capability_loads: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -252,6 +280,7 @@ class RunResult:
 
     run_root: RunPath
     run_id: str
+    best_effort_errors: tuple[str, ...] = ()
 
 
 def bind_execution(
@@ -466,6 +495,23 @@ def bind_execution(
             return ref
         return f"stage='{upstream.stage_name}' step='{upstream.name}'"
 
+    plugin_set = validate_plugins(request.plugins)
+    bound_by_id = {bound.logical.node_id: bound for bound in bound_nodes}
+    capability_loads: list[str] = []
+
+    def _reject_unsupported(bound_node: BoundNode, ref: str, reason: str) -> NoReturn:
+        _log_selective_failure(
+            "checkpoint-capability-required",
+            node=bound_node.logical.node_id,
+            required=ref,
+            cause=reason,
+        )
+        raise UnsupportedCapabilityError(
+            "Selective execution requires committed prior output from "
+            f"{_describe_missing(ref)}, but {reason}. Run the full pipeline "
+            "or configure a checkpoint-capable plugin."
+        )
+
     for bound in bound_nodes:
         if not bound.executes:
             continue
@@ -473,17 +519,35 @@ def bind_execution(
         for ref in needed:
             if ref in produced:
                 continue
-            _log_selective_failure(
-                "checkpoint-capability-required",
-                node=bound.logical.node_id,
-                required=ref,
+            if plugin_set.checkpoint is None:
+                _reject_unsupported(
+                    bound,
+                    ref,
+                    "bare Caravel has no checkpoint capability and never "
+                    "trusts existing output files",
+                )
+            upstream_bound = (
+                bound_by_id.get(ref.removeprefix("node:")) if ref.startswith("node:") else None
             )
-            raise UnsupportedCapabilityError(
-                "Selective execution requires committed prior output from "
-                f"{_describe_missing(ref)}, but bare Caravel has no checkpoint "
-                "capability and never trusts existing output files. Run the "
-                "full pipeline or configure a checkpoint-capable plugin."
-            )
+            if upstream_bound is None or upstream_bound.logical.kind != "step":
+                _reject_unsupported(
+                    bound,
+                    ref,
+                    "the required upstream output is not a persisted step checkpoint boundary",
+                )
+            if not upstream_bound.logical.persist:
+                _reject_unsupported(bound, ref, "the required upstream step is not persisted")
+            assert upstream_bound.step is not None
+            if not isinstance(upstream_bound.step.output, CheckpointLoadableDataset):
+                _reject_unsupported(
+                    bound,
+                    ref,
+                    "the required upstream Dataset does not support checkpoint loading",
+                )
+            node_id = upstream_bound.logical.node_id
+            if node_id not in capability_loads:
+                capability_loads.append(node_id)
+            produced.add(ref)
 
     return ExecutionPlan(
         pipeline=pipeline,
@@ -494,17 +558,67 @@ def bind_execution(
         context_factory=request.context_factory,
         stages=tuple(bound_stages),
         nodes=tuple(bound_nodes),
+        plugin_set=plugin_set,
+        capability_loads=tuple(capability_loads),
     )
 
 
 def execute(execution_plan: ExecutionPlan) -> RunResult:
-    """Execute every bound node through one executor dispatch."""
+    """Execute every bound node through one executor dispatch.
+
+    Plugin lifecycle: guards enter in plugin order before any user code,
+    observers receive events in plugin order at committed boundaries, and
+    guard teardown runs in reverse order and is attempted for every guard
+    whose startup completed, even when the run fails.
+    """
     pipeline = execution_plan.pipeline
     logger = get_logger(f"caravel.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
     run_id = uuid.uuid4().hex
     resolved_run_root = execution_plan.resolved_run_root
     if isinstance(resolved_run_root, Path):
         resolved_run_root.mkdir(parents=True, exist_ok=True)
+
+    plugin_set = execution_plan.plugin_set
+    run_facts = RunFacts(
+        pipeline_name=pipeline.name,
+        run_id=run_id,
+        run_root=str(resolved_run_root),
+        is_selective=execution_plan.is_selective,
+    )
+    best_effort_errors: list[str] = []
+    teardown_failures: list[str] = []
+
+    def _emit(kind: Any, node: NodeFacts | None = None, error_type: str | None = None) -> None:
+        event = RunEvent(kind=kind, run=run_facts, node=node, error_type=error_type)
+        for plugin_id, observer, criticality in plugin_set.observers:
+            try:
+                observer.on_event(event)
+            except Exception as exc:
+                if criticality == "required":
+                    raise PluginFailureError(
+                        f"Required observer '{plugin_id}' failed on '{kind}': {type(exc).__name__}"
+                    ) from exc
+                message = (
+                    f"Best-effort observer '{plugin_id}' failed on '{kind}': {type(exc).__name__}"
+                )
+                logger.error(message)
+                best_effort_errors.append(message)
+
+    def _node_facts(node: BoundNode) -> NodeFacts:
+        logical = node.logical
+        return NodeFacts(
+            node_id=logical.node_id,
+            kind=logical.kind,
+            stage_index=logical.stage_index,
+            stage_name=logical.stage_name,
+            entry_index=logical.entry_index,
+            name=logical.name,
+            persist=logical.persist,
+            dataset_type=logical.dataset_type,
+            dataset_name=logical.dataset_name,
+            step_dir=str(node.step_dir) if node.step_dir is not None else None,
+            route_key=logical.route_key,
+        )
 
     def _materialize_context(base_ctx: StepContext) -> Any:
         factory = execution_plan.context_factory
@@ -528,13 +642,6 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
     executing_nodes = [node for node in execution_plan.nodes if node.executes]
     payloads: dict[str, Any] = {}
 
-    needs_seed = any(
-        SEED_INPUT in (node.logical.input_ref, *node.logical.merge_input_refs)
-        for node in executing_nodes
-    )
-    if needs_seed:
-        payloads[SEED_INPUT] = pipeline.loader.load()
-
     nodes_by_id = {node.logical.node_id: node for node in execution_plan.nodes}
 
     def _resolve_input(node: BoundNode) -> Any:
@@ -552,9 +659,29 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
                 )
         return value
 
+    def _load_capability_checkpoints() -> None:
+        checkpoint = plugin_set.checkpoint
+        if checkpoint is None:
+            return
+        for node_id in execution_plan.capability_loads:
+            bound = nodes_by_id[node_id]
+            assert bound.step is not None and bound.step_dir is not None
+            facts = _node_facts(bound)
+            dataset = bound.step.output
+            if not checkpoint.reuse_verdict(facts, dataset):
+                raise MissingPriorOutputError(
+                    "Checkpoint capability found no committed evidence for "
+                    f"stage='{facts.stage_name}' step='{facts.name}'; the "
+                    "required prior output must be recomputed."
+                )
+            assert isinstance(dataset, CheckpointLoadableDataset)
+            payloads[f"node:{node_id}"] = dataset.load_from(bound.step_dir)
+            _emit("node_skipped", node=facts)
+
     def _execute_step_node(node: BoundNode, step_input: Any) -> Any:
         assert node.step is not None and node.step_dir is not None
         logical = node.logical
+        facts = _node_facts(node)
         step_index = (
             logical.route_step_index if logical.kind == "route-step" else logical.entry_index
         )
@@ -592,13 +719,24 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
             logical.persist,
             node.step.output.describe(),
         )
+        _emit("node_started", node=facts)
 
-        produced = node.step.fn(step_input, context=runtime_context)
-        persisted = _strip_source_field(produced, execution_plan.keep_source_tag)
-        checkpoint_written = False
-        if logical.persist:
-            _persist_step_output(node.step.output, persisted, node.step_dir)
-            checkpoint_written = True
+        try:
+            produced = node.step.fn(step_input, context=runtime_context)
+            persisted = _strip_source_field(produced, execution_plan.keep_source_tag)
+            if logical.persist:
+                _persist_step_output(
+                    node.step.output,
+                    persisted,
+                    node.step_dir,
+                    checkpoint=plugin_set.checkpoint,
+                    node_facts=facts,
+                )
+        except PluginFailureError:
+            raise
+        except Exception as exc:
+            _emit("node_failed", node=facts, error_type=type(exc).__name__)
+            raise
 
         logger.info(
             "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
@@ -606,47 +744,100 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
             logical.stage_name,
             logical.name,
             logical.persist,
-            checkpoint_written,
+            logical.persist,
             node.step.output.describe(),
         )
+        _emit("node_completed", node=facts)
         return persisted
 
-    current_stage_index = 0
-    for node in executing_nodes:
-        if node.logical.stage_index != current_stage_index:
-            current_stage_index = node.logical.stage_index
-            bound_stage = execution_plan.stages[current_stage_index - 1]
-            _clean_stage_base_if_needed(bound_stage.clean_root, bound_stage.clean_dirs)
+    def _run_nodes() -> None:
+        needs_seed = any(
+            SEED_INPUT in (node.logical.input_ref, *node.logical.merge_input_refs)
+            for node in executing_nodes
+        )
+        if needs_seed:
+            payloads[SEED_INPUT] = pipeline.loader.load()
 
-        logical = node.logical
+        _load_capability_checkpoints()
 
-        if logical.kind in ("step", "route-step"):
-            step_input = _resolve_input(node)
-            persisted = _execute_step_node(node, step_input)
-            payloads[f"node:{logical.node_id}"] = persisted
-            continue
+        current_stage_index = 0
+        for node in executing_nodes:
+            if node.logical.stage_index != current_stage_index:
+                current_stage_index = node.logical.stage_index
+                bound_stage = execution_plan.stages[current_stage_index - 1]
+                _clean_stage_base_if_needed(bound_stage.clean_root, bound_stage.clean_dirs)
 
-        if logical.kind == "fan-out":
+            logical = node.logical
+
+            if logical.kind in ("step", "route-step"):
+                step_input = _resolve_input(node)
+                persisted = _execute_step_node(node, step_input)
+                payloads[f"node:{logical.node_id}"] = persisted
+                continue
+
+            if logical.kind == "fan-out":
+                assert node.branch is not None
+                fan_input = _resolve_input(node)
+                grouped = node.branch.route_partitions(fan_input)
+                for route_key in node.branch.routes:
+                    payloads[f"route:{logical.node_id}:{route_key}"] = grouped.get(route_key, {})
+                continue
+
+            # merge
             assert node.branch is not None
-            fan_input = _resolve_input(node)
-            grouped = node.branch.route_partitions(fan_input)
-            for route_key in node.branch.routes:
-                payloads[f"route:{logical.node_id}:{route_key}"] = grouped.get(route_key, {})
-            continue
+            route_outputs: dict[str, Partitions] = {}
+            for route_key, ref in zip(node.branch.routes, logical.merge_input_refs):
+                route_payload = payloads[ref]
+                if not isinstance(route_payload, dict):
+                    raise TypeError(
+                        f"Branch route '{route_key}' final output must load as dict partitions."
+                    )
+                route_outputs[route_key] = route_payload
+            payloads[f"node:{logical.node_id}"] = node.branch.merge_route_outputs(route_outputs)
 
-        # merge
-        assert node.branch is not None
-        route_outputs: dict[str, Partitions] = {}
-        for route_key, ref in zip(node.branch.routes, logical.merge_input_refs):
-            route_payload = payloads[ref]
-            if not isinstance(route_payload, dict):
-                raise TypeError(
-                    f"Branch route '{route_key}' final output must load as dict partitions."
-                )
-            route_outputs[route_key] = route_payload
-        payloads[f"node:{logical.node_id}"] = node.branch.merge_route_outputs(route_outputs)
+    entered_guards: list[tuple[str, RunGuard]] = []
+    outcome_status: Any = "completed"
+    outcome_error: str | None = None
+    try:
+        for plugin_id, guard in plugin_set.guards:
+            try:
+                guard.enter(run_facts)
+            except Exception as exc:
+                raise PluginFailureError(
+                    f"Run guard '{plugin_id}' failed to start: {type(exc).__name__}"
+                ) from exc
+            entered_guards.append((plugin_id, guard))
 
-    return RunResult(run_root=resolved_run_root, run_id=run_id)
+        _emit("run_started")
+        _run_nodes()
+        _emit("run_completed")
+    except BaseException as exc:
+        outcome_status = "failed"
+        outcome_error = type(exc).__name__
+        if not isinstance(exc, PluginFailureError):
+            try:
+                _emit("run_failed", error_type=type(exc).__name__)
+            except PluginFailureError as observer_exc:
+                logger.error("Observer failure while reporting run failure: %s", observer_exc)
+        raise
+    finally:
+        outcome = RunOutcome(status=outcome_status, error_type=outcome_error)
+        for plugin_id, guard in reversed(entered_guards):
+            try:
+                guard.exit(run_facts, outcome)
+            except Exception as guard_exc:
+                message = f"Run guard '{plugin_id}' teardown failed: {type(guard_exc).__name__}"
+                logger.error(message)
+                teardown_failures.append(message)
+
+    if teardown_failures:
+        raise PluginFailureError("; ".join(teardown_failures))
+
+    return RunResult(
+        run_root=resolved_run_root,
+        run_id=run_id,
+        best_effort_errors=tuple(best_effort_errors),
+    )
 
 
 def run(
@@ -658,6 +849,7 @@ def run(
     params: Mapping[str, str] | None = None,
     keep_source_tag: bool = False,
     context_factory: Callable[[StepContext], Any] | None = None,
+    plugins: Sequence[Any] | None = None,
 ) -> RunPath:
     """Execute a pipeline declaration and persist outputs per configured step."""
     logical_plan = compile_pipeline(pipeline)
@@ -668,6 +860,7 @@ def run(
         params=params,
         keep_source_tag=keep_source_tag,
         context_factory=context_factory,
+        plugins=tuple(plugins) if plugins is not None else (),
     )
     execution_plan = bind_execution(pipeline, logical_plan, request)
     result = execute(execution_plan)
