@@ -1,5 +1,13 @@
 # Production Readiness Roadmap
 
+> **Superseded in part (2026-07-04).** The C-6 architecture decision replaced
+> the mandatory-core operational model below with a small metadata-free
+> execution core plus explicit plugins (checkpoints, ownership, run evidence,
+> lease). `.skills/tasks/C-6/SKILL.md` is the authoritative plan; ST-15+ items
+> below describing core-owned run metadata, leases, or retries are retained as
+> requirements material for the corresponding plugins. Production claims are
+> profile-specific — see the README "Production Status And Support Statement".
+
 This project is currently best described as a deterministic pipeline runner with
 branching support. Before it replaces Kedro or carries production workloads, the
 remaining work should prove that it can be operated safely, recovered reliably,

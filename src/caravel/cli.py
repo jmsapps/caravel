@@ -32,11 +32,11 @@ def _parse_params(values: Sequence[str]) -> dict[str, str]:
     parsed: dict[str, str] = {}
     for item in values:
         if "=" not in item:
-            raise ValueError(f"Invalid --param value '{item}'. Expected key=value.")
+            raise ValueError("Invalid --param value. Expected key=value.")
         key, value = item.split("=", 1)
         key = key.strip()
         if not key:
-            raise ValueError(f"Invalid --param value '{item}'. Key cannot be empty.")
+            raise ValueError("Invalid --param value. Key cannot be empty.")
         parsed[key] = value
     return parsed
 

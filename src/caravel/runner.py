@@ -23,7 +23,12 @@ from typing import Any, Callable, Mapping
 from .logger import get_logger
 from .branch import Branch
 from .datasets import ValidatedDataset
-from .paths import format_stage_dir, format_step_dir, resolve_run_root
+from .paths import (
+    RESERVED_METADATA_DIRNAME,
+    format_stage_dir,
+    format_step_dir,
+    resolve_run_root,
+)
 from .pipeline import Pipeline, Step
 from .plan import (
     SEED_INPUT,
@@ -328,16 +333,28 @@ def bind_execution(
             format_stage_dir(stage_index + 1, stage_decl.name),
         )
 
+    def _assert_outside_reserved_namespace(path: RunPath, *, what: str) -> None:
+        segments = tuple(str(path).split("/")) if _is_remote_path(path) else Path(str(path)).parts
+        if RESERVED_METADATA_DIRNAME in segments:
+            raise ValueError(
+                f"{what} '{path}' targets the reserved '{RESERVED_METADATA_DIRNAME}' namespace."
+            )
+
     bound_stages: list[BoundStage] = []
     for stage_index, stage in enumerate(pipeline.stages):
         executes = selected_stage_idx is None or selected_stage_idx == stage_index
+        clean_root = _resolve_stage_base(stage_index)
+        if stage.clean_dirs:
+            _assert_outside_reserved_namespace(
+                clean_root, what=f"Stage '{stage.name}' cleanup target"
+            )
         bound_stages.append(
             BoundStage(
                 index=stage_index + 1,
                 name=stage.name,
                 executes=executes,
                 clean_dirs=stage.clean_dirs,
-                clean_root=_resolve_stage_base(stage_index),
+                clean_root=clean_root,
             )
         )
 
@@ -374,6 +391,9 @@ def bind_execution(
                     f"Bound step node '{node.node_id}' does not reference a Step entry."
                 )
             step_dir = _join_run_path(stage_base, format_step_dir(node.entry_index, node.name))
+            _assert_outside_reserved_namespace(
+                step_dir, what=f"Step '{node.name}' output directory"
+            )
             bound_nodes.append(
                 BoundNode(
                     logical=node,
@@ -399,6 +419,9 @@ def bind_execution(
             assert node.route_key is not None
             branch_dir = _join_run_path(stage_base, format_step_dir(node.entry_index, entry.name))
             step_dir = _join_run_path(branch_dir, node.route_key, node.name)
+            _assert_outside_reserved_namespace(
+                step_dir, what=f"Route step '{node.name}' output directory"
+            )
             route_chain = (node.stage_index, node.entry_index, node.route_index)
             route_step = _plan_normalize_route_step(
                 entry.routes[node.route_key][node.route_step_index - 1],
