@@ -314,6 +314,37 @@ never affects recovery: nothing reads a summary to make an execution
 decision, and it can always be regenerated from events. Removing the plugin
 removes history, not execution behavior.
 
+### LeasePlugin
+
+`LeasePlugin` provides advisory writer-conflict evidence and abandoned-run
+diagnostics. It is **not a distributed lock**: generic fsspec storage has no
+portable atomic create-if-absent, so two racing writers can both acquire. The
+external scheduler or container owns the authoritative contract: one writer
+per pipeline run root, run-level retries, and hard timeout with process
+termination.
+
+```python
+from caravel.plugins import LeasePlugin
+
+plugin = LeasePlugin(
+    metadata_root="data/metadata/leases",
+    heartbeat_interval=10.0,
+    stale_threshold=60.0,
+)
+run(pipeline, run_root="data/output", plugins=[plugin])
+```
+
+At startup the plugin refuses an apparently live foreign lease before any
+user code runs; a lease whose heartbeat is older than `stale_threshold` is
+recovered, leaving a durable recovery record that names the abandoned run ID
+(diagnosable against `RunEvidencePlugin` history when that plugin is also
+configured). A plugin-owned daemon thread refreshes the heartbeat and never
+executes user code; a mid-run heartbeat failure surfaces at teardown as a
+distinct operational failure without changing run output. Normal shutdown
+releases the lease and leaves no worker thread behind. If the whole process
+is killed, the lease remains with an aging heartbeat, which the next
+invocation classifies as stale.
+
 ## CLI Usage
 
 Each example entry point wires `make_cli(pipeline)`, so supported options are

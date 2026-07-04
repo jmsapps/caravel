@@ -17,6 +17,15 @@ from .api import (
     validate_plugins,
 )
 from .checkpoint import CHECKPOINT_SCHEMA_VERSION, CheckpointPlugin, validate_checkpoint_record
+from .lease import (
+    LEASE_SCHEMA_VERSION,
+    LeaseError,
+    LeaseHeldError,
+    LeaseIntegrityError,
+    LeasePlugin,
+    UnsupportedLeaseVersionError,
+    validate_lease,
+)
 from .ownership import (
     INVENTORY_SCHEMA_VERSION,
     OwnershipIntegrityError,
@@ -37,10 +46,17 @@ __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "INVENTORY_SCHEMA_VERSION",
     "RUN_EVENT_SCHEMA_VERSION",
+    "LEASE_SCHEMA_VERSION",
     "CheckpointCapability",
     "CheckpointContext",
     "CheckpointPlugin",
     "EventKind",
+    "LeaseError",
+    "LeaseHeldError",
+    "LeaseIntegrityError",
+    "LeasePlugin",
+    "UnsupportedLeaseVersionError",
+    "validate_lease",
     "NodeFacts",
     "ObserverCriticality",
     "OwnershipCapability",
