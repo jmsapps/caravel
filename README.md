@@ -384,14 +384,14 @@ Fsspec-backed input example:
 
 ```bash
 CARAVEL_INPUT_URL=./examples/fsspec/data/input_partitions.json \
-python3 -m examples.fsspec --run-root data/fsspec_example/smoke_run
+python3 -m examples.fsspec_minimal --run-root data/fsspec_example/smoke_run
 ```
 
 Remote run-root example:
 
 ```bash
 CARAVEL_INPUT_URL=abfs://caravel/input/input_partitions.json \
-python3 -m examples.fsspec --run-root abfs://caravel/output/smoke_run
+python3 -m examples.fsspec_minimal --run-root abfs://caravel/output/smoke_run
 ```
 
 `--mermaid` is diagram-only mode and is mutually exclusive with execution flags:
