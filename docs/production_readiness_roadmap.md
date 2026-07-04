@@ -69,7 +69,9 @@ Implementation tasks:
 - Make output writes safer by writing to temporary paths and committing
   atomically where possible.
 - Add explicit resume/recompute behavior through a checkpoint plugin with its
-  own required metadata store/root.
+  own required metadata store/root. Shipped as `CheckpointPlugin`
+  (`metadata_root` required, schema-versioned records, verified reuse
+  verdicts, checkpoint-backed selective execution).
 - Fix branch route step output path collisions by including route step indexes in
   route output directories.
 - Validate declarations before execution, including duplicate stage names,

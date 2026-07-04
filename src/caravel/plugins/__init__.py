@@ -13,10 +13,13 @@ from .api import (
     RunOutcome,
     validate_plugins,
 )
+from .checkpoint import CHECKPOINT_SCHEMA_VERSION, CheckpointPlugin, validate_checkpoint_record
 
 __all__ = [
+    "CHECKPOINT_SCHEMA_VERSION",
     "CheckpointCapability",
     "CheckpointContext",
+    "CheckpointPlugin",
     "EventKind",
     "NodeFacts",
     "ObserverCriticality",
@@ -27,5 +30,6 @@ __all__ = [
     "RunGuard",
     "RunObserver",
     "RunOutcome",
+    "validate_checkpoint_record",
     "validate_plugins",
 ]

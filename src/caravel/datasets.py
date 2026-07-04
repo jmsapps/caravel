@@ -19,7 +19,7 @@ from .storage import (
     resolve_fs,
     single_output_path,
 )
-from .types import EmptyOutputError
+from .types import CheckpointIntegrityError, EmptyOutputError
 
 
 @runtime_checkable
@@ -47,6 +47,82 @@ class CheckpointLoadableDataset(Protocol):
     """
 
     def load_from(self, dest: Path | str) -> Any: ...
+
+
+@runtime_checkable
+class CheckpointInspectableDataset(Protocol):
+    """Structural contract for physical-output inspection by a checkpoint plugin.
+
+    ``physical_partition_keys(dest)`` reports the partition keys physically
+    present under a saved destination (``None`` for single-file datasets).
+    ``verify_physical_output(dest, partition_keys)`` checks the physical output
+    against committed evidence. Datasets without this contract can still save
+    on full runs but receive no checkpoint evidence and cannot serve as
+    checkpoint-backed selective boundaries.
+    """
+
+    def physical_partition_keys(self, dest: Path | str) -> list[str] | None: ...
+
+    def verify_physical_output(
+        self, dest: Path | str, partition_keys: list[str] | None
+    ) -> None: ...
+
+
+def _verify_single_physical_output(
+    *,
+    dataset_name: str,
+    dest: Path | str,
+    suffix: str,
+    storage_options: Mapping[str, Any] | None,
+    partition_keys: list[str] | None,
+) -> None:
+    if partition_keys is not None:
+        raise CheckpointIntegrityError(
+            f"Dataset '{dataset_name}' is single-file but its checkpoint record "
+            "carries partition keys."
+        )
+    output_file = single_output_path(dest, suffix)
+    fs, output_path = resolve_fs(output_file, storage_options)
+    if not fs.exists(output_path):
+        raise CheckpointIntegrityError(
+            f"Dataset '{dataset_name}' checkpoint output missing expected file: {output_file}"
+        )
+
+
+def _physical_partitioned_keys(
+    dest: Path | str,
+    suffix: str,
+    storage_options: Mapping[str, Any] | None,
+) -> list[str]:
+    _, dest_path = resolve_fs(dest, storage_options)
+    return sorted(
+        relative_key_from_file(dest_path, file_path, suffix)
+        for file_path in iter_files_with_suffix(dest, suffix, storage_options)
+    )
+
+
+def _verify_partitioned_physical_output(
+    *,
+    dataset_name: str,
+    dest: Path | str,
+    suffix: str,
+    storage_options: Mapping[str, Any] | None,
+    partition_keys: list[str] | None,
+) -> None:
+    if partition_keys is None:
+        raise CheckpointIntegrityError(
+            f"Dataset '{dataset_name}' is partitioned but its checkpoint record "
+            "carries no partition keys."
+        )
+    found = _physical_partitioned_keys(dest, suffix, storage_options)
+    expected = sorted(partition_keys)
+    if found != expected:
+        missing = sorted(set(expected) - set(found))
+        extra = sorted(set(found) - set(expected))
+        raise CheckpointIntegrityError(
+            f"Dataset '{dataset_name}' physical partitions do not match the checkpoint "
+            f"record at '{dest}': missing={missing} extra={extra}."
+        )
 
 
 def _validate_allow_empty(allow_empty: bool) -> None:
@@ -124,6 +200,19 @@ class JSONDataset:
         """Validate that the complete payload can be encoded before mutation."""
         json.dumps(payload, ensure_ascii=False, indent=self.indent)
 
+    def physical_partition_keys(self, dest: Path | str) -> list[str] | None:
+        _ = dest
+        return None
+
+    def verify_physical_output(self, dest: Path | str, partition_keys: list[str] | None) -> None:
+        _verify_single_physical_output(
+            dataset_name=self.name,
+            dest=dest,
+            suffix=".json",
+            storage_options=self.storage_options,
+            partition_keys=partition_keys,
+        )
+
     def save(self, payload: Any, dest: Path | str) -> None:
         self.validate_payload(payload)
         output_file = single_output_path(dest, ".json")
@@ -193,6 +282,18 @@ class PartitionedJSONDataset:
         for record in payload.values():
             json.dumps(record, ensure_ascii=False, indent=self.indent)
 
+    def physical_partition_keys(self, dest: Path | str) -> list[str] | None:
+        return _physical_partitioned_keys(dest, ".json", self.storage_options)
+
+    def verify_physical_output(self, dest: Path | str, partition_keys: list[str] | None) -> None:
+        _verify_partitioned_physical_output(
+            dataset_name=self.name,
+            dest=dest,
+            suffix=".json",
+            storage_options=self.storage_options,
+            partition_keys=partition_keys,
+        )
+
     def save(self, payload: Any, dest: Path | str) -> None:
         self.validate_payload(payload)
 
@@ -259,6 +360,19 @@ class TextDataset:
                 f"{self.__class__.__name__}.save expected str payload, "
                 f"got {type(payload).__name__}."
             )
+
+    def physical_partition_keys(self, dest: Path | str) -> list[str] | None:
+        _ = dest
+        return None
+
+    def verify_physical_output(self, dest: Path | str, partition_keys: list[str] | None) -> None:
+        _verify_single_physical_output(
+            dataset_name=self.name,
+            dest=dest,
+            suffix=self.suffix,
+            storage_options=self.storage_options,
+            partition_keys=partition_keys,
+        )
 
     def save(self, payload: Any, dest: Path | str) -> None:
         self.validate_payload(payload)
@@ -330,6 +444,18 @@ class PartitionedTextDataset:
             record_type_label="str",
         )
 
+    def physical_partition_keys(self, dest: Path | str) -> list[str] | None:
+        return _physical_partitioned_keys(dest, self.suffix, self.storage_options)
+
+    def verify_physical_output(self, dest: Path | str, partition_keys: list[str] | None) -> None:
+        _verify_partitioned_physical_output(
+            dataset_name=self.name,
+            dest=dest,
+            suffix=self.suffix,
+            storage_options=self.storage_options,
+            partition_keys=partition_keys,
+        )
+
     def save(self, payload: Any, dest: Path | str) -> None:
         self.validate_payload(payload)
 
@@ -396,6 +522,19 @@ class BytesDataset:
                 f"got {type(payload).__name__}."
             )
 
+    def physical_partition_keys(self, dest: Path | str) -> list[str] | None:
+        _ = dest
+        return None
+
+    def verify_physical_output(self, dest: Path | str, partition_keys: list[str] | None) -> None:
+        _verify_single_physical_output(
+            dataset_name=self.name,
+            dest=dest,
+            suffix=self.suffix,
+            storage_options=self.storage_options,
+            partition_keys=partition_keys,
+        )
+
     def save(self, payload: Any, dest: Path | str) -> None:
         self.validate_payload(payload)
 
@@ -461,6 +600,18 @@ class PartitionedBytesDataset:
             allow_empty=self.allow_empty,
             record_type=bytes,
             record_type_label="bytes",
+        )
+
+    def physical_partition_keys(self, dest: Path | str) -> list[str] | None:
+        return _physical_partitioned_keys(dest, self.suffix, self.storage_options)
+
+    def verify_physical_output(self, dest: Path | str, partition_keys: list[str] | None) -> None:
+        _verify_partitioned_physical_output(
+            dataset_name=self.name,
+            dest=dest,
+            suffix=self.suffix,
+            storage_options=self.storage_options,
+            partition_keys=partition_keys,
         )
 
     def save(self, payload: Any, dest: Path | str) -> None:

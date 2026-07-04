@@ -238,6 +238,29 @@ Plugins may implement observer, run-guard, or checkpoint-policy capabilities.
 Any stateful plugin owns and requires its metadata store/root configuration;
 Caravel does not choose a metadata location or derive one from `run_root`.
 
+### CheckpointPlugin
+
+`CheckpointPlugin` is the first-party checkpoint capability. It writes one
+schema-versioned record per persisted plan node after each successful save and
+verifies records against the declaration and the physical output before
+blessing a skipped node's output for reuse:
+
+```python
+from caravel.plugins import CheckpointPlugin
+
+plugin = CheckpointPlugin(metadata_root="data/metadata/checkpoints")
+run(pipeline, run_root="data/output", plugins=[plugin])
+run(pipeline, run_root="data/output", only_stage="silver", plugins=[plugin])
+```
+
+`metadata_root` is required and explicit; configure it outside any output tree
+that a run may replace or clean. Records contain identifiers, partition keys,
+and counts only — never credentials, storage options, payloads, or parameter
+values. A committed empty partitioned output is represented by a count-zero
+record, so it stays reusable on storage without durable empty directories.
+Removing the plugin leaves records inert: bare core ignores them and rejects
+checkpoint-dependent selective requests at binding.
+
 ## CLI Usage
 
 Each example entry point wires `make_cli(pipeline)`, so supported options are
