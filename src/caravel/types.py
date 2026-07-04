@@ -97,5 +97,15 @@ class MissingPriorOutputError(Exception):
     """Raised when selective execution requires prior output that is absent."""
 
 
+class UnsupportedCapabilityError(MissingPriorOutputError):
+    """Raised when a request needs an execution capability bare core lacks.
+
+    Bare Caravel never trusts existing output files as evidence of completed
+    work. A selective request that must load output from a node it does not
+    execute therefore fails closed at plan binding until a checkpoint-capable
+    plugin provides committed evidence.
+    """
+
+
 class EmptyOutputError(Exception):
     """Raised when a dataset rejects an empty output payload."""

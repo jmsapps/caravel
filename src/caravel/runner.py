@@ -1,7 +1,22 @@
+"""Plan-driven pipeline execution.
+
+``run`` compiles the pipeline declaration into a logical plan, binds it to one
+execution request, and executes every node through a single executor seam:
+
+    compile_pipeline(pipeline) -> LogicalPlan
+    bind_execution(pipeline, logical_plan, ExecutionRequest(...)) -> ExecutionPlan
+    execute(execution_plan) -> RunResult
+
+Binding is the only layer that knows run roots and selectors. Bare core never
+trusts existing output files: a selective request that must load output from a
+node it does not execute fails closed at binding with
+:class:`UnsupportedCapabilityError` until a checkpoint capability exists.
+"""
+
 from __future__ import annotations
 
-import copy
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -10,61 +25,27 @@ from .branch import Branch
 from .datasets import ValidatedDataset
 from .paths import format_stage_dir, format_step_dir, resolve_run_root
 from .pipeline import Pipeline, Step
-from .storage import (
-    is_dir,
-    is_url_path,
-    join_path,
-    leaf_name,
-    remove_and_recreate_dir,
-    resolve_fs,
+from .plan import (
+    SEED_INPUT,
+    LogicalNode,
+    LogicalPlan,
+    compile_pipeline,
 )
+from .plan import _normalize_route_step as _plan_normalize_route_step
+from .storage import is_dir, is_url_path, join_path, remove_and_recreate_dir, resolve_fs
 from .types import (
-    SOURCE_FIELD,
     Dataset,
-    KeyCollisionError,
-    MissingPriorOutputError,
     Partitions,
     StepContext,
+    UnsupportedCapabilityError,
 )
 
-_DECORATED_OUTPUT_ATTR = "__step_output_dataset__"
-_DECORATED_PERSIST_ATTR = "__step_persist__"
 RunPath = Path | str
 
 
-def _step_name(fn: Callable[..., Any]) -> str:
-    return getattr(fn, "__name__", fn.__class__.__name__)
-
-
-def _step_decl_name(step: Step) -> str:
-    if step.name is None:
-        raise TypeError("Step.name must be resolved before runner execution.")
-    return step.name
-
-
 def _normalize_route_step(step_like: Step | Callable[..., Any]) -> Step:
-    if isinstance(step_like, Step):
-        return step_like
-
-    if not callable(step_like):
-        raise TypeError(f"Route step must be Step or callable, got {type(step_like).__name__}.")
-
-    decorated_output = getattr(step_like, _DECORATED_OUTPUT_ATTR, None)
-    decorated_persist = getattr(step_like, _DECORATED_PERSIST_ATTR, None)
-    if not isinstance(decorated_output, Dataset):
-        raise TypeError(
-            f"Route callable '{_step_name(step_like)}' must be decorated with "
-            "@step(output=Dataset(...))."
-        )
-
-    if decorated_persist is not None and not isinstance(decorated_persist, bool):
-        raise TypeError(
-            f"Route callable '{_step_name(step_like)}' has invalid decorated persist "
-            f"type {type(decorated_persist).__name__}; expected bool."
-        )
-
-    persist = True if decorated_persist is None else decorated_persist
-    return Step(fn=step_like, output=decorated_output, persist=persist)
+    """Normalize one branch route entry; kept for compatibility with callers."""
+    return _plan_normalize_route_step(step_like, branch_name="route")
 
 
 def _is_remote_path(path: RunPath) -> bool:
@@ -81,58 +62,19 @@ def _coerce_run_path(path: Path | str) -> RunPath:
 
 def _join_run_path(base: RunPath, *parts: str) -> RunPath:
     if _is_remote_path(base):
-        return join_path(base, *parts)
+        joined = str(base)
+        for part in parts:
+            joined = join_path(joined, part)
+        return joined
     resolved = base if isinstance(base, Path) else Path(base)
-    return resolved.joinpath(*parts)
-
-
-def _run_path_name(path: RunPath) -> str:
-    if _is_remote_path(path):
-        name = leaf_name(path)
-        return name or "remote_run"
-    resolved = path if isinstance(path, Path) else Path(path)
-    return resolved.name
-
-
-def _dataset_at_path(dataset: Dataset, path: RunPath) -> Dataset:
-    bound = copy.copy(dataset)
-    if hasattr(bound, "path"):
-        dataset_name = type(dataset).__name__
-        if _is_remote_path(path):
-            target_path: Path | str = path
-            path_name = _run_path_name(path)
-            if dataset_name == "JSONDataset":
-                target_path = join_path(path, f"{path_name}.json")
-            elif dataset_name == "TextDataset":
-                suffix = str(getattr(dataset, "suffix", ".txt"))
-                target_path = join_path(path, f"{path_name}{suffix}")
-            elif dataset_name == "BytesDataset":
-                suffix = str(getattr(dataset, "suffix", ".bin"))
-                target_path = join_path(path, f"{path_name}{suffix}")
-        else:
-            target_path = Path(path)
-            if dataset_name == "JSONDataset":
-                target_path = target_path / f"{target_path.name}.json"
-            elif dataset_name == "TextDataset":
-                suffix = str(getattr(dataset, "suffix", ".txt"))
-                target_path = target_path / f"{target_path.name}{suffix}"
-            elif dataset_name == "BytesDataset":
-                suffix = str(getattr(dataset, "suffix", ".bin"))
-                target_path = target_path / f"{target_path.name}{suffix}"
-
-        setattr(bound, "path", target_path)
-        return bound
-    raise TypeError(
-        f"Dataset '{type(dataset).__name__}' does not expose assignable 'path' attribute."
-    )
-
-
-def _load_from_step_output(dataset: Dataset, step_dir: RunPath) -> Any:
-    reader = _dataset_at_path(dataset, step_dir)
-    return reader.load()
+    for part in parts:
+        resolved = resolved / part
+    return resolved
 
 
 def _strip_source_field(payload: Any, keep_source_tag: bool) -> Any:
+    from .types import SOURCE_FIELD
+
     if keep_source_tag:
         return payload
 
@@ -198,20 +140,6 @@ def _resolve_step_entry_index(stage: Any, selector: str | int | None) -> int | N
     raise ValueError(f"Invalid step selector type: {type(selector).__name__}.")
 
 
-def _missing_prior_error(path: RunPath, stage_name: str, step_name: str) -> MissingPriorOutputError:
-    return MissingPriorOutputError(
-        "Required prior output missing for selective execution: "
-        f"stage='{stage_name}' step='{step_name}' path='{path}'."
-    )
-
-
-def _non_persistent_prior_error(stage_name: str, step_name: str) -> MissingPriorOutputError:
-    return MissingPriorOutputError(
-        "Required prior output is non-persistent for selective execution: "
-        f"stage='{stage_name}' step='{step_name}'."
-    )
-
-
 def _validate_stage_clean_policy(
     *, clean_dirs: bool, only_step_index: int | None, stage_name: str
 ) -> None:
@@ -248,27 +176,90 @@ def _clean_stage_base_if_needed(clean_root: RunPath, clean_dirs: bool) -> None:
     fs.makedirs(root, exist_ok=True)
 
 
-def run(
-    pipeline: Pipeline,
-    run_root: Path | str | None = None,
-    *,
-    only_stage: str | int | None = None,
-    only_step: str | int | None = None,
-    params: Mapping[str, str] | None = None,
-    keep_source_tag: bool = False,
-    context_factory: Callable[[StepContext], Any] | None = None,
-) -> RunPath:
-    """Execute a pipeline declaration and persist outputs per configured step."""
-    if run_root is not None and _is_remote_path(run_root):
-        resolved_run_root: RunPath = run_root
-    else:
-        resolved_run_root = resolve_run_root(run_root)
-        resolved_run_root.mkdir(parents=True, exist_ok=True)
+def _persist_step_output(dataset: Dataset, payload: Any, step_dir: RunPath) -> None:
+    """Validate the complete payload, then replace the owned step directory.
 
+    Datasets without payload validation keep plain save behavior so custom
+    Dataset implementations are unaffected.
+    """
+    if not isinstance(dataset, ValidatedDataset):
+        dataset.save(payload, step_dir)
+        return
+
+    dataset.validate_payload(payload)
+    remove_and_recreate_dir(step_dir, getattr(dataset, "storage_options", None))
+    dataset.save(payload, step_dir)
+
+
+@dataclass(frozen=True)
+class ExecutionRequest:
+    """Per-run request facts: run root, selectors, params, and run options."""
+
+    run_root: Path | str | None = None
+    only_stage: str | int | None = None
+    only_step: str | int | None = None
+    params: Mapping[str, str] | None = None
+    keep_source_tag: bool = False
+    context_factory: Callable[[StepContext], Any] | None = None
+
+
+@dataclass(frozen=True)
+class BoundStage:
+    """One stage bound to its run-root facts."""
+
+    index: int
+    name: str
+    executes: bool
+    clean_dirs: bool
+    clean_root: RunPath
+
+
+@dataclass(frozen=True)
+class BoundNode:
+    """One logical node bound to its declaration objects and resolved paths."""
+
+    logical: LogicalNode
+    executes: bool
+    step: Step | None = None
+    branch: Branch | None = None
+    step_dir: RunPath | None = None
+    prev_step_dir: RunPath | None = None
+    explicit_target: bool = False
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """Immutable bound plan for one runner invocation."""
+
+    pipeline: Pipeline
+    resolved_run_root: RunPath
+    is_selective: bool
+    keep_source_tag: bool
+    params: Mapping[str, str]
+    context_factory: Callable[[StepContext], Any] | None
+    stages: tuple[BoundStage, ...]
+    nodes: tuple[BoundNode, ...]
+
+
+@dataclass(frozen=True)
+class RunResult:
+    """Execution outcome facts for one run."""
+
+    run_root: RunPath
+    run_id: str
+
+
+def bind_execution(
+    pipeline: Pipeline, logical_plan: LogicalPlan, request: ExecutionRequest
+) -> ExecutionPlan:
+    """Bind a logical plan to one execution request.
+
+    Binding validates request facts (selectors, clean policy, capability
+    requirements) and resolves every output directory. It performs no Dataset
+    I/O and never trusts existing output files.
+    """
     logger = get_logger(f"caravel.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
-    run_id = uuid.uuid4().hex
-    is_selective = only_stage is not None or only_step is not None
-    run_params = dict(params) if params is not None else {}
+    is_selective = request.only_stage is not None or request.only_step is not None
 
     def _log_selective_failure(reason: str, **context: object) -> None:
         if not is_selective:
@@ -281,22 +272,27 @@ def run(
             context_parts,
         )
 
+    if request.run_root is not None and _is_remote_path(request.run_root):
+        resolved_run_root: RunPath = request.run_root
+    else:
+        resolved_run_root = resolve_run_root(request.run_root)
+
     try:
-        selected_stage_idx = _resolve_stage_index(pipeline.stages, only_stage)
+        selected_stage_idx = _resolve_stage_index(pipeline.stages, request.only_stage)
     except ValueError as exc:
         _log_selective_failure(
             "invalid-stage-selector",
-            only_stage=only_stage,
-            only_step=only_step,
+            only_stage=request.only_stage,
+            only_step=request.only_step,
             error=str(exc),
         )
         raise
 
-    if only_step is not None and selected_stage_idx is None:
+    if request.only_step is not None and selected_stage_idx is None:
         _log_selective_failure(
             "only-step-without-stage",
-            only_stage=only_stage,
-            only_step=only_step,
+            only_stage=request.only_stage,
+            only_step=request.only_step,
         )
         raise ValueError("only_step requires only_stage to be set.")
 
@@ -304,27 +300,195 @@ def run(
     if selected_stage_idx is not None:
         try:
             selected_step_entry_idx = _resolve_step_entry_index(
-                pipeline.stages[selected_stage_idx], only_step
+                pipeline.stages[selected_stage_idx], request.only_step
             )
         except ValueError as exc:
             _log_selective_failure(
                 "invalid-step-selector",
-                only_stage=only_stage,
-                only_step=only_step,
+                only_stage=request.only_stage,
+                only_step=request.only_step,
                 error=str(exc),
             )
             raise
 
-    if selected_stage_idx is None:
-        stage_indexes = list(range(len(pipeline.stages)))
-    else:
-        stage_indexes = [selected_stage_idx]
+    if selected_stage_idx is not None and selected_step_entry_idx is not None:
+        _validate_stage_clean_policy(
+            clean_dirs=pipeline.stages[selected_stage_idx].clean_dirs,
+            only_step_index=selected_step_entry_idx + 1,
+            stage_name=pipeline.stages[selected_stage_idx].name,
+        )
+
+    def _resolve_stage_base(stage_index: int) -> RunPath:
+        stage_decl = pipeline.stages[stage_index]
+        if stage_decl.stage_root is not None:
+            return _coerce_run_path(stage_decl.stage_root)
+        return _join_run_path(
+            resolved_run_root,
+            pipeline.name,
+            format_stage_dir(stage_index + 1, stage_decl.name),
+        )
+
+    bound_stages: list[BoundStage] = []
+    for stage_index, stage in enumerate(pipeline.stages):
+        executes = selected_stage_idx is None or selected_stage_idx == stage_index
+        bound_stages.append(
+            BoundStage(
+                index=stage_index + 1,
+                name=stage.name,
+                executes=executes,
+                clean_dirs=stage.clean_dirs,
+                clean_root=_resolve_stage_base(stage_index),
+            )
+        )
+
+    bound_nodes: list[BoundNode] = []
+    prev_step_dir_by_stage: RunPath | None = None
+    prev_route_dirs: dict[tuple[int, int, int], RunPath] = {}
+    current_stage = 0
+
+    for node in logical_plan.nodes:
+        if node.stage_index != current_stage:
+            current_stage = node.stage_index
+            prev_step_dir_by_stage = None
+
+        stage_base = _resolve_stage_base(node.stage_index - 1)
+        entry = pipeline.stages[node.stage_index - 1].entries[node.entry_index - 1]
+
+        node_executes: bool
+        if selected_stage_idx is None:
+            node_executes = True
+        elif node.stage_index - 1 != selected_stage_idx:
+            node_executes = False
+        elif selected_step_entry_idx is None:
+            node_executes = True
+        else:
+            node_executes = node.kind == "step" and node.entry_index - 1 == selected_step_entry_idx
+
+        explicit_target = (
+            node_executes and selected_step_entry_idx is not None and node.kind == "step"
+        )
+
+        if node.kind == "step":
+            if not isinstance(entry, Step):
+                raise TypeError(
+                    f"Bound step node '{node.node_id}' does not reference a Step entry."
+                )
+            step_dir = _join_run_path(stage_base, format_step_dir(node.entry_index, node.name))
+            bound_nodes.append(
+                BoundNode(
+                    logical=node,
+                    executes=node_executes,
+                    step=entry,
+                    step_dir=step_dir,
+                    prev_step_dir=prev_step_dir_by_stage,
+                    explicit_target=explicit_target,
+                )
+            )
+            prev_step_dir_by_stage = step_dir
+            continue
+
+        if not isinstance(entry, Branch):
+            raise TypeError(f"Bound node '{node.node_id}' does not reference a Branch entry.")
+
+        if node.kind == "fan-out":
+            bound_nodes.append(BoundNode(logical=node, executes=node_executes, branch=entry))
+            continue
+
+        if node.kind == "route-step":
+            assert node.route_index is not None and node.route_step_index is not None
+            assert node.route_key is not None
+            branch_dir = _join_run_path(stage_base, format_step_dir(node.entry_index, entry.name))
+            step_dir = _join_run_path(branch_dir, node.route_key, node.name)
+            route_chain = (node.stage_index, node.entry_index, node.route_index)
+            route_step = _plan_normalize_route_step(
+                entry.routes[node.route_key][node.route_step_index - 1],
+                branch_name=entry.name,
+            )
+            bound_nodes.append(
+                BoundNode(
+                    logical=node,
+                    executes=node_executes,
+                    step=route_step,
+                    branch=entry,
+                    step_dir=step_dir,
+                    prev_step_dir=prev_route_dirs.get(route_chain),
+                )
+            )
+            prev_route_dirs[route_chain] = step_dir
+            continue
+
+        # merge
+        bound_nodes.append(BoundNode(logical=node, executes=node_executes, branch=entry))
+        prev_step_dir_by_stage = None
+
+    nodes_by_id = {node.node_id: node for node in logical_plan.nodes}
+    produced: set[str] = {SEED_INPUT}
+    for bound in bound_nodes:
+        if not bound.executes:
+            continue
+        produced.add(f"node:{bound.logical.node_id}")
+        if bound.logical.kind == "fan-out" and bound.branch is not None:
+            for route_key in bound.branch.routes:
+                produced.add(f"route:{bound.logical.node_id}:{route_key}")
+
+    def _describe_missing(ref: str) -> str:
+        if ref.startswith("node:"):
+            upstream = nodes_by_id.get(ref.removeprefix("node:"))
+        elif ref.startswith("route:"):
+            fan_out_id = ref.split(":", 2)[1]
+            upstream = nodes_by_id.get(fan_out_id)
+        else:
+            upstream = None
+        if upstream is None:
+            return ref
+        return f"stage='{upstream.stage_name}' step='{upstream.name}'"
+
+    for bound in bound_nodes:
+        if not bound.executes:
+            continue
+        needed = [bound.logical.input_ref, *bound.logical.merge_input_refs]
+        for ref in needed:
+            if ref in produced:
+                continue
+            _log_selective_failure(
+                "checkpoint-capability-required",
+                node=bound.logical.node_id,
+                required=ref,
+            )
+            raise UnsupportedCapabilityError(
+                "Selective execution requires committed prior output from "
+                f"{_describe_missing(ref)}, but bare Caravel has no checkpoint "
+                "capability and never trusts existing output files. Run the "
+                "full pipeline or configure a checkpoint-capable plugin."
+            )
+
+    return ExecutionPlan(
+        pipeline=pipeline,
+        resolved_run_root=resolved_run_root,
+        is_selective=is_selective,
+        keep_source_tag=request.keep_source_tag,
+        params=dict(request.params) if request.params is not None else {},
+        context_factory=request.context_factory,
+        stages=tuple(bound_stages),
+        nodes=tuple(bound_nodes),
+    )
+
+
+def execute(execution_plan: ExecutionPlan) -> RunResult:
+    """Execute every bound node through one executor dispatch."""
+    pipeline = execution_plan.pipeline
+    logger = get_logger(f"caravel.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
+    run_id = uuid.uuid4().hex
+    resolved_run_root = execution_plan.resolved_run_root
+    if isinstance(resolved_run_root, Path):
+        resolved_run_root.mkdir(parents=True, exist_ok=True)
 
     def _materialize_context(base_ctx: StepContext) -> Any:
-        if context_factory is None:
+        factory = execution_plan.context_factory
+        if factory is None:
             return base_ctx
 
-        runtime_context = context_factory(base_ctx)
+        runtime_context = factory(base_ctx)
 
         if isinstance(runtime_context, StepContext):
             return runtime_context
@@ -338,319 +502,153 @@ def run(
             "context_factory must return StepContext or an object exposing a StepContext at '.base'"
         )
 
-    def _resolve_stage_base(stage_index: int) -> RunPath:
-        stage_decl = pipeline.stages[stage_index]
-        if stage_decl.stage_root is not None:
-            return _coerce_run_path(stage_decl.stage_root)
-        return _join_run_path(
-            resolved_run_root,
-            pipeline.name,
-            format_stage_dir(stage_index + 1, stage_decl.name),
-        )
+    executing_nodes = [node for node in execution_plan.nodes if node.executes]
+    payloads: dict[str, Any] = {}
 
-    def _resolve_stage_clean_root(stage_index: int) -> RunPath:
-        stage_decl = pipeline.stages[stage_index]
-        if stage_decl.stage_root is not None:
-            return _coerce_run_path(stage_decl.stage_root)
-        return _resolve_stage_base(stage_index)
+    needs_seed = any(
+        SEED_INPUT in (node.logical.input_ref, *node.logical.merge_input_refs)
+        for node in executing_nodes
+    )
+    if needs_seed:
+        payloads[SEED_INPUT] = pipeline.loader.load()
 
-    def _persist_step_output(dataset: Dataset, payload: Any, step_dir: RunPath) -> None:
-        """Validate the complete payload, then replace the owned step directory.
+    nodes_by_id = {node.logical.node_id: node for node in execution_plan.nodes}
 
-        Datasets without payload validation keep plain save behavior so custom
-        Dataset implementations are unaffected.
-        """
-        if not isinstance(dataset, ValidatedDataset):
-            dataset.save(payload, step_dir)
-            return
-
-        dataset.validate_payload(payload)
-        remove_and_recreate_dir(step_dir, getattr(dataset, "storage_options", None))
-        dataset.save(payload, step_dir)
-
-    def _load_stage_seed(stage_index: int, target_stage_name: str) -> Partitions:
-        if stage_index == 0:
-            return pipeline.loader.load()
-
-        prev_stage = pipeline.stages[stage_index - 1]
-        if not prev_stage.entries:
-            _log_selective_failure(
-                "missing-prior-stage-entries",
-                target_stage=target_stage_name,
-                required_stage=prev_stage.name,
-            )
-            raise MissingPriorOutputError(
-                f"Stage '{prev_stage.name}' has no entries to provide prior output."
-            )
-
-        prev_last_entry = prev_stage.entries[-1]
-        if not isinstance(prev_last_entry, Step):
-            _log_selective_failure(
-                "prior-stage-terminal-entry-not-step",
-                target_stage=target_stage_name,
-                required_stage=prev_stage.name,
-                required_entry_type=type(prev_last_entry).__name__,
-            )
-            raise MissingPriorOutputError(
-                "Selective execution across a prior Branch stage is not supported without "
-                "re-running the prior stage."
-            )
-
-        prev_step_name = _step_decl_name(prev_last_entry)
-        if not prev_last_entry.persist:
-            _log_selective_failure(
-                "non-persistent-prior-output",
-                required_stage=prev_stage.name,
-                required_step=prev_step_name,
-            )
-            raise _non_persistent_prior_error(prev_stage.name, prev_step_name)
-
-        prev_stage_dir = _resolve_stage_base(stage_index - 1)
-        prev_dir = _join_run_path(
-            prev_stage_dir,
-            format_step_dir(len(prev_stage.entries), prev_step_name),
-        )
-        if not prev_last_entry.output.exists(prev_dir):
-            _log_selective_failure(
-                "missing-prior-output",
-                required_stage=prev_stage.name,
-                required_step=prev_step_name,
-                required_path=str(prev_dir),
-            )
-            raise _missing_prior_error(prev_dir, prev_stage.name, prev_step_name)
-
-        loaded = _load_from_step_output(prev_last_entry.output, prev_dir)
-        if not isinstance(loaded, dict):
-            _log_selective_failure(
-                "invalid-prior-output-shape",
-                required_stage=prev_stage.name,
-                required_step=prev_step_name,
-                loaded_type=type(loaded).__name__,
-            )
-            raise TypeError(
-                f"Prior output for stage '{prev_stage.name}' step '{prev_step_name}' "
-                "must load as dict partitions."
-            )
-        return loaded
-
-    for stage_index in stage_indexes:
-        stage = pipeline.stages[stage_index]
-        stage_dir = _resolve_stage_base(stage_index)
-
-        if selected_stage_idx == stage_index and selected_step_entry_idx is not None:
-            _validate_stage_clean_policy(
-                clean_dirs=stage.clean_dirs,
-                only_step_index=selected_step_entry_idx + 1,
-                stage_name=stage.name,
-            )
-
-        partitions: Partitions = _load_stage_seed(stage_index, stage.name)
-        clean_root = _resolve_stage_clean_root(stage_index)
-        _clean_stage_base_if_needed(clean_root, stage.clean_dirs)
-        previous_step_ref: tuple[Dataset, RunPath, str, str] | None = None
-        previous_step_payload: Any | None = None
-
-        entry_indexes: list[int]
-        if selected_stage_idx == stage_index and selected_step_entry_idx is not None:
-            entry_indexes = [selected_step_entry_idx]
-        else:
-            entry_indexes = list(range(len(stage.entries)))
-
-        if (
-            selected_stage_idx == stage_index
-            and selected_step_entry_idx is not None
-            and selected_step_entry_idx > 0
-        ):
-            prior_entry_index = selected_step_entry_idx - 1
-            prior_entry = stage.entries[prior_entry_index]
-            if not isinstance(prior_entry, Step):
-                _log_selective_failure(
-                    "prior-entry-not-step",
-                    stage=stage.name,
-                    required_entry_index=prior_entry_index + 1,
-                    required_entry_type=type(prior_entry).__name__,
-                )
-                raise MissingPriorOutputError(
-                    "Selective step execution requires a prior Step output in the same stage. "
-                    f"Found {type(prior_entry).__name__} at index {prior_entry_index + 1}."
-                )
-
-            prior_step_name = _step_decl_name(prior_entry)
-            if not prior_entry.persist:
-                _log_selective_failure(
-                    "non-persistent-prior-output",
-                    required_stage=stage.name,
-                    required_step=prior_step_name,
-                )
-                raise _non_persistent_prior_error(stage.name, prior_step_name)
-            prior_step_dir = _join_run_path(
-                stage_dir,
-                format_step_dir(prior_entry_index + 1, prior_step_name),
-            )
-            previous_step_ref = (prior_entry.output, prior_step_dir, stage.name, prior_step_name)
-            prev_dataset, prev_dir, prev_stage_name, prev_step_name = previous_step_ref
-            if not prev_dataset.exists(prev_dir):
-                logger.error(
-                    "Missing prior output pipeline=%s stage=%s step=%s path=%s",
-                    pipeline.name,
-                    prev_stage_name,
-                    prev_step_name,
-                    prev_dir,
-                )
-                raise _missing_prior_error(prev_dir, prev_stage_name, prev_step_name)
-            previous_step_payload = _load_from_step_output(prev_dataset, prev_dir)
-
-        for entry_index in entry_indexes:
-            entry = stage.entries[entry_index]
-
-            if isinstance(entry, Branch):
-                branch_dir = _join_run_path(stage_dir, format_step_dir(entry_index + 1, entry.name))
-                grouped = entry.route_partitions(partitions)
-                route_outputs: dict[str, Partitions] = {}
-
-                for route_key in entry.routes:
-                    route_steps = entry.routes[route_key]
-                    route_partitions = grouped.get(route_key, {})
-                    route_current: Any = route_partitions
-                    route_prev_step_dir: RunPath | None = None
-
-                    for route_step_index, route_step_like in enumerate(route_steps, start=1):
-                        route_step = _normalize_route_step(route_step_like)
-                        route_step_name = _step_decl_name(route_step)
-                        route_step_dir = _join_run_path(branch_dir, route_key, route_step_name)
-
-                        step_ctx = StepContext(
-                            run_root=resolved_run_root,
-                            pipeline_name=pipeline.name,
-                            run_id=run_id,
-                            stage_index=stage_index + 1,
-                            stage_name=stage.name,
-                            step_index=route_step_index,
-                            step_name=route_step_name,
-                            persist=route_step.persist,
-                            step_dir=route_step_dir,
-                            prev_step_dir=route_prev_step_dir,
-                            logger=logger,
-                            params=run_params,
-                        )
-
-                        runtime_context = _materialize_context(step_ctx)
-
-                        logger.info(
-                            "STEP START pipeline=%s stage=%s step=%s persist=%s dataset=%s",
-                            pipeline.name,
-                            stage.name,
-                            route_step_name,
-                            route_step.persist,
-                            route_step.output.describe(),
-                        )
-                        produced = route_step.fn(route_current, context=runtime_context)
-                        persisted = _strip_source_field(produced, keep_source_tag)
-                        checkpoint_written = False
-                        if route_step.persist:
-                            _persist_step_output(route_step.output, persisted, route_step_dir)
-                            checkpoint_written = True
-                        logger.info(
-                            "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
-                            pipeline.name,
-                            stage.name,
-                            route_step_name,
-                            route_step.persist,
-                            checkpoint_written,
-                            route_step.output.describe(),
-                        )
-                        route_current = persisted
-                        route_prev_step_dir = route_step_dir
-
-                    if not route_steps:
-                        route_outputs[route_key] = route_partitions
-                    else:
-                        if not isinstance(route_current, dict):
-                            raise TypeError(
-                                f"Branch route '{route_key}' final output must load as dict partitions."
-                            )
-                        route_outputs[route_key] = route_current
-
-                try:
-                    partitions = entry.merge_route_outputs(route_outputs)
-                except KeyCollisionError:
-                    raise
-
-                previous_step_ref = None
-                continue
-
-            if not isinstance(entry, Step):
+    def _resolve_input(node: BoundNode) -> Any:
+        ref = node.logical.input_ref
+        value = payloads[ref]
+        if ref.startswith("node:"):
+            upstream = nodes_by_id[ref.removeprefix("node:")]
+            if upstream.logical.stage_index != node.logical.stage_index and not isinstance(
+                value, dict
+            ):
                 raise TypeError(
-                    f"Unsupported stage entry type {type(entry).__name__} in stage '{stage.name}'."
+                    f"Prior output for stage '{upstream.logical.stage_name}' step "
+                    f"'{upstream.logical.name}' must be dict partitions to cross a "
+                    f"stage boundary, got {type(value).__name__}."
                 )
+        return value
 
-            entry_name = _step_decl_name(entry)
-            step_dir = _join_run_path(stage_dir, format_step_dir(entry_index + 1, entry_name))
+    def _execute_step_node(node: BoundNode, step_input: Any) -> Any:
+        assert node.step is not None and node.step_dir is not None
+        logical = node.logical
+        step_index = (
+            logical.route_step_index if logical.kind == "route-step" else logical.entry_index
+        )
 
-            explicit_target = (
-                selected_stage_idx == stage_index and selected_step_entry_idx == entry_index
+        if node.explicit_target:
+            logger.info(
+                "Targeted step recompute pipeline=%s stage=%s step=%s path=%s",
+                pipeline.name,
+                logical.stage_name,
+                logical.name,
+                node.step_dir,
             )
 
-            if explicit_target:
-                logger.info(
-                    "Targeted step recompute pipeline=%s stage=%s step=%s path=%s",
-                    pipeline.name,
-                    stage.name,
-                    entry_name,
-                    step_dir,
+        step_ctx = StepContext(
+            run_root=resolved_run_root,
+            pipeline_name=pipeline.name,
+            run_id=run_id,
+            stage_index=logical.stage_index,
+            stage_name=logical.stage_name,
+            step_index=step_index if step_index is not None else logical.entry_index,
+            step_name=logical.name,
+            persist=logical.persist,
+            step_dir=node.step_dir,
+            prev_step_dir=node.prev_step_dir,
+            logger=logger,
+            params=dict(execution_plan.params),
+        )
+        runtime_context = _materialize_context(step_ctx)
+
+        logger.info(
+            "STEP START pipeline=%s stage=%s step=%s persist=%s dataset=%s",
+            pipeline.name,
+            logical.stage_name,
+            logical.name,
+            logical.persist,
+            node.step.output.describe(),
+        )
+
+        produced = node.step.fn(step_input, context=runtime_context)
+        persisted = _strip_source_field(produced, execution_plan.keep_source_tag)
+        checkpoint_written = False
+        if logical.persist:
+            _persist_step_output(node.step.output, persisted, node.step_dir)
+            checkpoint_written = True
+
+        logger.info(
+            "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
+            pipeline.name,
+            logical.stage_name,
+            logical.name,
+            logical.persist,
+            checkpoint_written,
+            node.step.output.describe(),
+        )
+        return persisted
+
+    current_stage_index = 0
+    for node in executing_nodes:
+        if node.logical.stage_index != current_stage_index:
+            current_stage_index = node.logical.stage_index
+            bound_stage = execution_plan.stages[current_stage_index - 1]
+            _clean_stage_base_if_needed(bound_stage.clean_root, bound_stage.clean_dirs)
+
+        logical = node.logical
+
+        if logical.kind in ("step", "route-step"):
+            step_input = _resolve_input(node)
+            persisted = _execute_step_node(node, step_input)
+            payloads[f"node:{logical.node_id}"] = persisted
+            continue
+
+        if logical.kind == "fan-out":
+            assert node.branch is not None
+            fan_input = _resolve_input(node)
+            grouped = node.branch.route_partitions(fan_input)
+            for route_key in node.branch.routes:
+                payloads[f"route:{logical.node_id}:{route_key}"] = grouped.get(route_key, {})
+            continue
+
+        # merge
+        assert node.branch is not None
+        route_outputs: dict[str, Partitions] = {}
+        for route_key, ref in zip(node.branch.routes, logical.merge_input_refs):
+            route_payload = payloads[ref]
+            if not isinstance(route_payload, dict):
+                raise TypeError(
+                    f"Branch route '{route_key}' final output must load as dict partitions."
                 )
+            route_outputs[route_key] = route_payload
+        payloads[f"node:{logical.node_id}"] = node.branch.merge_route_outputs(route_outputs)
 
-            step_input = partitions
-            if previous_step_payload is not None:
-                step_input = previous_step_payload
+    return RunResult(run_root=resolved_run_root, run_id=run_id)
 
-            step_ctx = StepContext(
-                run_root=resolved_run_root,
-                pipeline_name=pipeline.name,
-                run_id=run_id,
-                stage_index=stage_index + 1,
-                stage_name=stage.name,
-                step_index=entry_index + 1,
-                step_name=entry_name,
-                persist=entry.persist,
-                step_dir=step_dir,
-                prev_step_dir=previous_step_ref[1] if previous_step_ref else None,
-                logger=logger,
-                params=run_params,
-            )
 
-            runtime_context = _materialize_context(step_ctx)
-
-            logger.info(
-                "STEP START pipeline=%s stage=%s step=%s persist=%s dataset=%s",
-                pipeline.name,
-                stage.name,
-                entry_name,
-                entry.persist,
-                entry.output.describe(),
-            )
-
-            produced = entry.fn(step_input, context=runtime_context)
-            persisted = _strip_source_field(produced, keep_source_tag)
-            checkpoint_written = False
-            if entry.persist:
-                _persist_step_output(entry.output, persisted, step_dir)
-                checkpoint_written = True
-            logger.info(
-                "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
-                pipeline.name,
-                stage.name,
-                entry_name,
-                entry.persist,
-                checkpoint_written,
-                entry.output.describe(),
-            )
-
-            partitions = persisted if isinstance(persisted, dict) else partitions
-            previous_step_payload = persisted
-            previous_step_ref = (entry.output, step_dir, stage.name, entry_name)
-
-    return resolved_run_root
+def run(
+    pipeline: Pipeline,
+    run_root: Path | str | None = None,
+    *,
+    only_stage: str | int | None = None,
+    only_step: str | int | None = None,
+    params: Mapping[str, str] | None = None,
+    keep_source_tag: bool = False,
+    context_factory: Callable[[StepContext], Any] | None = None,
+) -> RunPath:
+    """Execute a pipeline declaration and persist outputs per configured step."""
+    logical_plan = compile_pipeline(pipeline)
+    request = ExecutionRequest(
+        run_root=run_root,
+        only_stage=only_stage,
+        only_step=only_step,
+        params=params,
+        keep_source_tag=keep_source_tag,
+        context_factory=context_factory,
+    )
+    execution_plan = bind_execution(pipeline, logical_plan, request)
+    result = execute(execution_plan)
+    return result.run_root
 
 
 __all__ = ["run"]

@@ -13,9 +13,7 @@ from .storage import (
     is_file,
     iter_files_with_suffix,
     join_path,
-    mark_partitioned_output_empty,
     partitioned_output_exists,
-    partitioned_output_is_marked_empty,
     prepare_partitioned_save,
     relative_key_from_file,
     resolve_fs,
@@ -152,9 +150,6 @@ class PartitionedJSONDataset:
         fs, source_path = resolve_fs(source, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
             raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
-        if partitioned_output_is_marked_empty(source, self.storage_options):
-            return {}
-
         loaded: dict[str, Any] = {}
         for file_path in iter_files_with_suffix(source, ".json", self.storage_options):
             key = relative_key_from_file(source_path, file_path, ".json")
@@ -185,9 +180,6 @@ class PartitionedJSONDataset:
             ensure_parent_dir(fs, output_file)
             with fs.open(output_file, mode="wt", encoding="utf-8") as handle:
                 json.dump(record, handle, ensure_ascii=False, indent=self.indent)
-
-        if not payload:
-            mark_partitioned_output_empty(fs, destination)
 
     def exists(self, dest: Path | str) -> bool:
         return partitioned_output_exists(dest, ".json", self.storage_options)
@@ -285,9 +277,6 @@ class PartitionedTextDataset:
         fs, source_path = resolve_fs(source, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
             raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
-        if partitioned_output_is_marked_empty(source, self.storage_options):
-            return {}
-
         loaded: dict[str, str] = {}
         for file_path in iter_files_with_suffix(source, self.suffix, self.storage_options):
             key = relative_key_from_file(source_path, file_path, self.suffix)
@@ -318,9 +307,6 @@ class PartitionedTextDataset:
             ensure_parent_dir(fs, output_file)
             with fs.open(output_file, mode="wt", encoding=self.encoding) as handle:
                 handle.write(record)
-
-        if not payload:
-            mark_partitioned_output_empty(fs, destination)
 
     def exists(self, dest: Path | str) -> bool:
         return partitioned_output_exists(dest, self.suffix, self.storage_options)
@@ -414,9 +400,6 @@ class PartitionedBytesDataset:
         fs, source_path = resolve_fs(source, self.storage_options)
         if not fs.exists(source_path) or not is_dir(fs, source_path):
             raise FileNotFoundError(f"Dataset '{self.name}' missing directory path: {source}")
-        if partitioned_output_is_marked_empty(source, self.storage_options):
-            return {}
-
         loaded: dict[str, bytes] = {}
         for file_path in iter_files_with_suffix(source, self.suffix, self.storage_options):
             key = relative_key_from_file(source_path, file_path, self.suffix)
@@ -447,9 +430,6 @@ class PartitionedBytesDataset:
             ensure_parent_dir(fs, output_file)
             with fs.open(output_file, mode="wb") as handle:
                 handle.write(record)
-
-        if not payload:
-            mark_partitioned_output_empty(fs, destination)
 
     def exists(self, dest: Path | str) -> bool:
         return partitioned_output_exists(dest, self.suffix, self.storage_options)
