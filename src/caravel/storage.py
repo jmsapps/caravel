@@ -143,6 +143,16 @@ def partitioned_output_is_marked_empty(
     return bool(fs.exists(marker))
 
 
+def remove_and_recreate_dir(
+    path: StoragePath, storage_options: Mapping[str, Any] | None = None
+) -> None:
+    """Replace a Caravel-managed output directory with an empty one."""
+    fs, resolved = resolve_fs(path, storage_options)
+    if fs.exists(resolved):
+        fs.rm(resolved, recursive=True)
+    fs.makedirs(resolved, exist_ok=True)
+
+
 def partitioned_output_exists(
     root: StoragePath,
     suffix: str,

@@ -382,3 +382,28 @@ def test_partitioned_bytes_dataset_round_trip_memory_filesystem() -> None:
     )
     assert loader.load() == payload
     assert dataset.exists(out_dir) is True
+
+
+def test_partitioned_save_validates_complete_payload_before_any_write(tmp_path: Path) -> None:
+    dataset = PartitionedJSONDataset(name="prevalidated")
+    dest = tmp_path / "prevalidated"
+    dataset.save({"a": {"id": "a"}, "b": {"id": "b"}}, dest)
+
+    with pytest.raises(TypeError, match="Partition key must be str"):
+        dataset.save({"c": {"id": "c"}, 7: {"id": "bad"}}, dest)
+
+    assert not (dest / "c.json").exists()
+    assert (dest / "a.json").exists()
+    assert (dest / "b.json").exists()
+
+
+def test_partitioned_text_save_validates_record_types_before_any_write(tmp_path: Path) -> None:
+    dataset = PartitionedTextDataset(name="typed_text")
+    dest = tmp_path / "typed_text"
+    dataset.save({"a": "alpha"}, dest)
+
+    with pytest.raises(TypeError, match="expected str records"):
+        dataset.save({"b": "beta", "c": 3}, dest)
+
+    assert not (dest / "b.txt").exists()
+    assert (dest / "a.txt").exists()

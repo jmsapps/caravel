@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from .paths import partition_key_to_relpath, validate_partition_key
 from .storage import (
@@ -24,6 +24,20 @@ from .storage import (
 from .types import EmptyOutputError
 
 
+@runtime_checkable
+class ValidatedDataset(Protocol):
+    """Internal structural contract for datasets that pre-validate payloads.
+
+    A dataset satisfying this contract can validate a complete payload before
+    any output mutation. The executor replaces such a dataset's owned step
+    directory before saving, so a rerun with fewer partition keys leaves no
+    stale files. Custom datasets without this contract keep plain save
+    behavior.
+    """
+
+    def validate_payload(self, payload: Any) -> None: ...
+
+
 def _validate_allow_empty(allow_empty: bool) -> None:
     if not isinstance(allow_empty, bool):
         raise TypeError(f"allow_empty must be bool, got {type(allow_empty).__name__}.")
@@ -37,6 +51,30 @@ def _reject_disallowed_empty_output(
             f"Dataset '{dataset_name}' rejected empty partitioned output; "
             "set allow_empty=True to persist it."
         )
+
+
+def _validate_partitioned_payload(
+    payload: Any,
+    *,
+    dataset_name: str,
+    class_name: str,
+    allow_empty: bool,
+    record_type: type | None,
+    record_type_label: str,
+) -> None:
+    """Validate a complete partitioned payload before any output is touched."""
+    if not isinstance(payload, dict):
+        raise TypeError(f"{class_name}.save expected dict payload, got {type(payload).__name__}.")
+    _reject_disallowed_empty_output(payload, allow_empty=allow_empty, dataset_name=dataset_name)
+    for key, record in payload.items():
+        if not isinstance(key, str):
+            raise TypeError(f"Partition key must be str, got {type(key).__name__}.")
+        validate_partition_key(key)
+        if record_type is not None and not isinstance(record, record_type):
+            raise TypeError(
+                f"{class_name}.save expected {record_type_label} records, "
+                f"got {type(record).__name__}."
+            )
 
 
 class JSONDataset:
@@ -63,7 +101,12 @@ class JSONDataset:
         with fs.open(source_path, mode="rt", encoding="utf-8") as handle:
             return json.load(handle)
 
+    def validate_payload(self, payload: Any) -> None:
+        """Any JSON-serializable payload is structurally acceptable."""
+        _ = payload
+
     def save(self, payload: Any, dest: Path | str) -> None:
+        self.validate_payload(payload)
         output_file = single_output_path(dest, ".json")
         fs, output_path = resolve_fs(output_file, self.storage_options)
         ensure_parent_dir(fs, output_path)
@@ -120,22 +163,23 @@ class PartitionedJSONDataset:
 
         return loaded
 
-    def save(self, payload: Any, dest: Path | str) -> None:
-        if not isinstance(payload, dict):
-            raise TypeError(
-                f"{self.__class__.__name__}.save expected dict payload, got {type(payload).__name__}."
-            )
-        _reject_disallowed_empty_output(
-            payload, allow_empty=self.allow_empty, dataset_name=self.name
+    def validate_payload(self, payload: Any) -> None:
+        _validate_partitioned_payload(
+            payload,
+            dataset_name=self.name,
+            class_name=self.__class__.__name__,
+            allow_empty=self.allow_empty,
+            record_type=None,
+            record_type_label="JSON-serializable",
         )
+
+    def save(self, payload: Any, dest: Path | str) -> None:
+        self.validate_payload(payload)
 
         fs, destination = resolve_fs(dest, self.storage_options)
         prepare_partitioned_save(fs, destination)
 
         for key, record in payload.items():
-            if not isinstance(key, str):
-                raise TypeError(f"Partition key must be str, got {type(key).__name__}.")
-            validate_partition_key(key)
             relpath = partition_key_to_relpath(key, ".json").as_posix()
             output_file = join_path(destination, relpath)
             ensure_parent_dir(fs, output_file)
@@ -184,11 +228,15 @@ class TextDataset:
         with fs.open(source_path, mode="rt", encoding=self.encoding) as handle:
             return str(handle.read())
 
-    def save(self, payload: Any, dest: Path | str) -> None:
+    def validate_payload(self, payload: Any) -> None:
         if not isinstance(payload, str):
             raise TypeError(
-                f"{self.__class__.__name__}.save expected str payload, got {type(payload).__name__}."
+                f"{self.__class__.__name__}.save expected str payload, "
+                f"got {type(payload).__name__}."
             )
+
+    def save(self, payload: Any, dest: Path | str) -> None:
+        self.validate_payload(payload)
 
         output_file = single_output_path(dest, self.suffix)
         fs, output_path = resolve_fs(output_file, self.storage_options)
@@ -248,26 +296,23 @@ class PartitionedTextDataset:
 
         return loaded
 
-    def save(self, payload: Any, dest: Path | str) -> None:
-        if not isinstance(payload, dict):
-            raise TypeError(
-                f"{self.__class__.__name__}.save expected dict payload, got {type(payload).__name__}."
-            )
-        _reject_disallowed_empty_output(
-            payload, allow_empty=self.allow_empty, dataset_name=self.name
+    def validate_payload(self, payload: Any) -> None:
+        _validate_partitioned_payload(
+            payload,
+            dataset_name=self.name,
+            class_name=self.__class__.__name__,
+            allow_empty=self.allow_empty,
+            record_type=str,
+            record_type_label="str",
         )
+
+    def save(self, payload: Any, dest: Path | str) -> None:
+        self.validate_payload(payload)
 
         fs, destination = resolve_fs(dest, self.storage_options)
         prepare_partitioned_save(fs, destination)
 
         for key, record in payload.items():
-            if not isinstance(key, str):
-                raise TypeError(f"Partition key must be str, got {type(key).__name__}.")
-            if not isinstance(record, str):
-                raise TypeError(
-                    f"{self.__class__.__name__}.save expected str records, got {type(record).__name__}."
-                )
-            validate_partition_key(key)
             relpath = partition_key_to_relpath(key, self.suffix).as_posix()
             output_file = join_path(destination, relpath)
             ensure_parent_dir(fs, output_file)
@@ -315,11 +360,15 @@ class BytesDataset:
         with fs.open(source_path, mode="rb") as handle:
             return bytes(handle.read())
 
-    def save(self, payload: Any, dest: Path | str) -> None:
+    def validate_payload(self, payload: Any) -> None:
         if not isinstance(payload, bytes):
             raise TypeError(
-                f"{self.__class__.__name__}.save expected bytes payload, got {type(payload).__name__}."
+                f"{self.__class__.__name__}.save expected bytes payload, "
+                f"got {type(payload).__name__}."
             )
+
+    def save(self, payload: Any, dest: Path | str) -> None:
+        self.validate_payload(payload)
 
         output_file = single_output_path(dest, self.suffix)
         fs, output_path = resolve_fs(output_file, self.storage_options)
@@ -376,26 +425,23 @@ class PartitionedBytesDataset:
 
         return loaded
 
-    def save(self, payload: Any, dest: Path | str) -> None:
-        if not isinstance(payload, dict):
-            raise TypeError(
-                f"{self.__class__.__name__}.save expected dict payload, got {type(payload).__name__}."
-            )
-        _reject_disallowed_empty_output(
-            payload, allow_empty=self.allow_empty, dataset_name=self.name
+    def validate_payload(self, payload: Any) -> None:
+        _validate_partitioned_payload(
+            payload,
+            dataset_name=self.name,
+            class_name=self.__class__.__name__,
+            allow_empty=self.allow_empty,
+            record_type=bytes,
+            record_type_label="bytes",
         )
+
+    def save(self, payload: Any, dest: Path | str) -> None:
+        self.validate_payload(payload)
 
         fs, destination = resolve_fs(dest, self.storage_options)
         prepare_partitioned_save(fs, destination)
 
         for key, record in payload.items():
-            if not isinstance(key, str):
-                raise TypeError(f"Partition key must be str, got {type(key).__name__}.")
-            if not isinstance(record, bytes):
-                raise TypeError(
-                    f"{self.__class__.__name__}.save expected bytes records, got {type(record).__name__}."
-                )
-            validate_partition_key(key)
             relpath = partition_key_to_relpath(key, self.suffix).as_posix()
             output_file = join_path(destination, relpath)
             ensure_parent_dir(fs, output_file)

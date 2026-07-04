@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import copy
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .logger import get_logger
 from .branch import Branch
+from .datasets import ValidatedDataset
 from .paths import format_stage_dir, format_step_dir, resolve_run_root
 from .pipeline import Pipeline, Step
-from .storage import is_dir, is_url_path, join_path, leaf_name, resolve_fs
+from .storage import (
+    is_dir,
+    is_url_path,
+    join_path,
+    leaf_name,
+    remove_and_recreate_dir,
+    resolve_fs,
+)
 from .types import (
     SOURCE_FIELD,
     Dataset,
@@ -257,6 +266,7 @@ def run(
         resolved_run_root.mkdir(parents=True, exist_ok=True)
 
     logger = get_logger(f"caravel.runner.{pipeline.name}", log_name=f"{pipeline.name}_runner")
+    run_id = uuid.uuid4().hex
     is_selective = only_stage is not None or only_step is not None
     run_params = dict(params) if params is not None else {}
 
@@ -342,7 +352,21 @@ def run(
         stage_decl = pipeline.stages[stage_index]
         if stage_decl.stage_root is not None:
             return _coerce_run_path(stage_decl.stage_root)
-        return resolved_run_root
+        return _resolve_stage_base(stage_index)
+
+    def _persist_step_output(dataset: Dataset, payload: Any, step_dir: RunPath) -> None:
+        """Validate the complete payload, then replace the owned step directory.
+
+        Datasets without payload validation keep plain save behavior so custom
+        Dataset implementations are unaffected.
+        """
+        if not isinstance(dataset, ValidatedDataset):
+            dataset.save(payload, step_dir)
+            return
+
+        dataset.validate_payload(payload)
+        remove_and_recreate_dir(step_dir, getattr(dataset, "storage_options", None))
+        dataset.save(payload, step_dir)
 
     def _load_stage_seed(stage_index: int, target_stage_name: str) -> Partitions:
         if stage_index == 0:
@@ -498,7 +522,7 @@ def run(
                         step_ctx = StepContext(
                             run_root=resolved_run_root,
                             pipeline_name=pipeline.name,
-                            run_id=_run_path_name(resolved_run_root),
+                            run_id=run_id,
                             stage_index=stage_index + 1,
                             stage_name=stage.name,
                             step_index=route_step_index,
@@ -524,7 +548,7 @@ def run(
                         persisted = _strip_source_field(produced, keep_source_tag)
                         checkpoint_written = False
                         if route_step.persist:
-                            route_step.output.save(persisted, route_step_dir)
+                            _persist_step_output(route_step.output, persisted, route_step_dir)
                             checkpoint_written = True
                         logger.info(
                             "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",
@@ -583,7 +607,7 @@ def run(
             step_ctx = StepContext(
                 run_root=resolved_run_root,
                 pipeline_name=pipeline.name,
-                run_id=_run_path_name(resolved_run_root),
+                run_id=run_id,
                 stage_index=stage_index + 1,
                 stage_name=stage.name,
                 step_index=entry_index + 1,
@@ -610,7 +634,7 @@ def run(
             persisted = _strip_source_field(produced, keep_source_tag)
             checkpoint_written = False
             if entry.persist:
-                entry.output.save(persisted, step_dir)
+                _persist_step_output(entry.output, persisted, step_dir)
                 checkpoint_written = True
             logger.info(
                 "STEP END pipeline=%s stage=%s step=%s persist=%s checkpoint_written=%s dataset=%s",

@@ -221,7 +221,7 @@ def test_clean_dirs_true_clears_existing_stage_contents_before_stage_run(tmp_pat
     assert (stage_root / "_001_pass_through" / "a.json").exists()
 
 
-def test_clean_dirs_true_without_stage_root_clears_run_root_contents_before_stage_run(
+def test_clean_dirs_true_without_stage_root_clears_only_the_stage_directory(
     tmp_path: Path,
 ) -> None:
     from caravel.runner import run
@@ -233,25 +233,30 @@ def test_clean_dirs_true_without_stage_root_clears_run_root_contents_before_stag
         _ = context
         return partitions
 
-    run_root = tmp_path / "run_root_clean_target"
-    stale_file = run_root / "stale.txt"
-    stale_dir_file = run_root / "obsolete" / "old.json"
-    stale_dir_file.parent.mkdir(parents=True, exist_ok=True)
-    stale_file.write_text("stale", encoding="utf-8")
-    stale_dir_file.write_text("stale", encoding="utf-8")
-
     pipeline = Pipeline(
         name="run_root_clean_dirs_pipeline",
         loader=_StubLoader({"a": {"id": "a", "value": 1}}),
         stages=[Stage(name="bronze", entries=[pass_through], clean_dirs=True)],
     )
 
+    run_root = tmp_path / "run_root_clean_target"
+    foreign_file = run_root / "stale.txt"
+    foreign_dir_file = run_root / "obsolete" / "old.json"
+    foreign_dir_file.parent.mkdir(parents=True, exist_ok=True)
+    foreign_file.write_text("preserve", encoding="utf-8")
+    foreign_dir_file.write_text("preserve", encoding="utf-8")
+
+    stage_dir = run_root / pipeline.name / "_001_bronze"
+    stale_step_file = stage_dir / "_009_renamed_step" / "left_over.json"
+    stale_step_file.parent.mkdir(parents=True, exist_ok=True)
+    stale_step_file.write_text("stale", encoding="utf-8")
+
     run(pipeline, run_root=run_root)
 
-    assert run_root.exists()
-    assert not stale_file.exists()
-    assert not stale_dir_file.exists()
-    assert (run_root / pipeline.name / "_001_bronze" / "_001_pass_through" / "a.json").exists()
+    assert foreign_file.exists()
+    assert foreign_dir_file.exists()
+    assert not stale_step_file.exists()
+    assert (stage_dir / "_001_pass_through" / "a.json").exists()
 
 
 def test_clean_dirs_true_fails_fast_for_selective_non_first_step_without_deleting(
@@ -302,7 +307,7 @@ def test_clean_dirs_true_fails_fast_for_selective_non_first_step_without_deletin
     assert sentinel.exists()
 
 
-def test_clean_dirs_on_later_default_stage_loads_seed_before_run_root_cleanup(
+def test_clean_dirs_on_later_default_stage_preserves_earlier_stage_outputs(
     tmp_path: Path,
 ) -> None:
     from caravel.runner import run
@@ -321,7 +326,7 @@ def test_clean_dirs_on_later_default_stage_loads_seed_before_run_root_cleanup(
         / "_001_silver_summary.json"
     )
 
-    assert not bronze_file.exists()
+    assert bronze_file.exists()
     assert silver_file.exists()
 
 
@@ -1110,3 +1115,206 @@ def test_branch_route_steps_support_mixed_persistence(tmp_path: Path) -> None:
     assert not (branch_root / "html" / "normalize_html").exists()
     assert (tmp_path / pipeline.name / "_001_bronze" / "_002_converge" / "j1.json").exists()
     assert (tmp_path / pipeline.name / "_001_bronze" / "_002_converge" / "h1.json").exists()
+
+
+class _MutableLoader:
+    name = "mutable_loader"
+
+    def __init__(self, partitions: dict[str, dict[str, object]]) -> None:
+        self.partitions = partitions
+
+    def load(self) -> dict[str, dict[str, object]]:
+        return self.partitions
+
+
+def _make_mutable_pipeline(loader: _MutableLoader, name: str = "data_safety") -> Pipeline:
+    @step(output=PartitionedJSONDataset(name="bronze_partitions"))
+    def bronze_map(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return {key: {**record, "mapped": True} for key, record in partitions.items()}
+
+    return Pipeline(
+        name=name,
+        loader=loader,
+        stages=[Stage(name="bronze", entries=[bronze_map])],
+    )
+
+
+def test_fewer_key_rerun_replaces_owned_step_directory(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    loader = _MutableLoader({"a": {"id": "a"}, "b": {"id": "b"}})
+    pipeline = _make_mutable_pipeline(loader)
+
+    run(pipeline, run_root=tmp_path)
+    loader.partitions = {"a": {"id": "a"}}
+    run(pipeline, run_root=tmp_path)
+
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json"]
+
+
+def test_fewer_key_rerun_replaces_owned_step_directory_on_memory_backend() -> None:
+    from caravel.runner import run
+
+    loader = _MutableLoader({"a": {"id": "a"}, "b": {"id": "b"}})
+    pipeline = _make_mutable_pipeline(loader, name="data_safety_memory")
+    run_root = _memory_run_root("fewer_key_replacement")
+
+    run(pipeline, run_root=run_root)
+    loader.partitions = {"a": {"id": "a"}}
+    run(pipeline, run_root=run_root)
+
+    fs, root = fsspec.core.url_to_fs(run_root)
+    bronze_dir = f"{root}/{pipeline.name}/_001_bronze/_001_bronze_map"
+    listed = sorted(str(path).rsplit("/", 1)[-1] for path in fs.ls(bronze_dir, detail=False))
+    assert listed == ["a.json"]
+
+
+def test_invalid_record_type_preserves_prior_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    loader = _MutableLoader({"a": {"id": "a"}, "b": {"id": "b"}})
+
+    @step(output=PartitionedJSONDataset(name="typed_output"))
+    def emit_typed(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = context
+        if len(partitions) == 1:
+            return {"a": {"id": "a"}, 2: {"id": "bad"}}
+        return dict(partitions)
+
+    pipeline = Pipeline(
+        name="prior_output_safety",
+        loader=loader,
+        stages=[Stage(name="bronze", entries=[emit_typed])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_emit_typed"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+    loader.partitions = {"a": {"id": "a"}}
+    with pytest.raises(TypeError, match="Partition key must be str"):
+        run(pipeline, run_root=tmp_path)
+
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+
+def test_invalid_partition_key_preserves_prior_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    loader = _MutableLoader({"a": {"id": "a"}, "b": {"id": "b"}})
+
+    @step(output=PartitionedJSONDataset(name="keyed_output"))
+    def emit_keyed(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = context
+        if len(partitions) == 1:
+            return {"a": {"id": "a"}, "../escape": {"id": "bad"}}
+        return dict(partitions)
+
+    pipeline = Pipeline(
+        name="partition_key_safety",
+        loader=loader,
+        stages=[Stage(name="bronze", entries=[emit_keyed])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_emit_keyed"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+    loader.partitions = {"a": {"id": "a"}}
+    with pytest.raises(ValueError):
+        run(pipeline, run_root=tmp_path)
+
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+
+def test_failed_save_leaves_partial_output_that_full_runs_replace(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    class _InterruptibleDataset(PartitionedJSONDataset):
+        fail_after_first_write = False
+
+        def save(self, payload: object, dest: Path | str) -> None:
+            if not self.fail_after_first_write:
+                super().save(payload, dest)
+                return
+            self.validate_payload(payload)
+            first_key = next(iter(payload))  # type: ignore[arg-type]
+            super().save({first_key: payload[first_key]}, dest)  # type: ignore[index]
+            raise RuntimeError("injected save interruption")
+
+    dataset = _InterruptibleDataset(name="interruptible")
+
+    @step(output=dataset)
+    def pass_through(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return dict(partitions)
+
+    pipeline = Pipeline(
+        name="interrupted_save",
+        loader=_StubLoader({"a": {"id": "a"}, "b": {"id": "b"}}),
+        stages=[Stage(name="bronze", entries=[pass_through])],
+    )
+
+    dataset.fail_after_first_write = True
+    with pytest.raises(RuntimeError, match="injected save interruption"):
+        run(pipeline, run_root=tmp_path)
+
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_pass_through"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json"]
+
+    dataset.fail_after_first_write = False
+    run(pipeline, run_root=tmp_path)
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+
+def test_step_output_directories_contain_only_dataset_files(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    pipeline = _make_linear_pipeline()
+
+    run(pipeline, run_root=tmp_path)
+
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map"
+    silver_dir = tmp_path / pipeline.name / "_002_silver" / "_001_silver_summary"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+    assert sorted(p.name for p in silver_dir.iterdir()) == ["_001_silver_summary.json"]
+
+
+def test_run_id_is_uuid4_hex_and_unique_per_run(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    captured: list[str] = []
+
+    @step(output=PartitionedJSONDataset(name="ctx_probe"))
+    def probe(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        captured.append(context.run_id)  # type: ignore[attr-defined]
+        return dict(partitions)
+
+    pipeline = Pipeline(
+        name="run_id_probe",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[probe])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    run(pipeline, run_root=tmp_path)
+
+    assert len(captured) == 2
+    first, second = captured
+    assert first != second
+    for value in captured:
+        assert len(value) == 32
+        assert value != tmp_path.name
+        int(value, 16)
