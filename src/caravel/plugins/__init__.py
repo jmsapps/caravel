@@ -25,10 +25,18 @@ from .ownership import (
     UnsupportedInventoryVersionError,
     validate_inventory,
 )
+from .run_evidence import (
+    RUN_EVENT_SCHEMA_VERSION,
+    RunEvidenceIntegrityError,
+    RunEvidencePlugin,
+    UnsupportedRunEventVersionError,
+    validate_run_event,
+)
 
 __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "INVENTORY_SCHEMA_VERSION",
+    "RUN_EVENT_SCHEMA_VERSION",
     "CheckpointCapability",
     "CheckpointContext",
     "CheckpointPlugin",
@@ -44,11 +52,15 @@ __all__ = [
     "PluginSet",
     "ReconciliationFacts",
     "RunEvent",
+    "RunEvidenceIntegrityError",
+    "RunEvidencePlugin",
     "RunFacts",
     "RunGuard",
     "RunObserver",
     "RunOutcome",
     "UnsupportedInventoryVersionError",
+    "UnsupportedRunEventVersionError",
+    "validate_run_event",
     "validate_checkpoint_record",
     "validate_inventory",
     "validate_plugins",

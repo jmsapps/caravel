@@ -32,7 +32,9 @@ Implementation tasks:
 
 - Add a run-evidence plugin with a required, explicitly configured metadata
   store/root. Core provides no metadata location and derives no default from the
-  pipeline run root.
+  pipeline run root. Shipped as `RunEvidencePlugin` (immutable versioned run
+  and node events, deterministic in-process sequence, structured logs from the
+  same vocabulary, and a summary regenerated only from events).
 - Record pipeline name, run id, start/end timestamps, status, selected
   stage/step, and code/version identifier when available. Parameter values are
   excluded unless explicitly allowlisted as non-sensitive.

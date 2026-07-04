@@ -288,6 +288,32 @@ rerun. In the reference production profile, compose it with
 `CheckpointPlugin` so evidence pointing at pruned output can never authorize
 reuse.
 
+### RunEvidencePlugin
+
+`RunEvidencePlugin` makes runs diagnosable from durable artifacts. It records
+one immutable event object per committed lifecycle transition (run/node
+start, success, failure, skip) under its required `metadata_root`, emits
+structured logs from the same vocabulary, and derives a regenerable summary
+exclusively from the recorded events:
+
+```python
+from caravel.plugins import RunEvidencePlugin
+
+plugin = RunEvidencePlugin(metadata_root="data/metadata/evidence")
+run(pipeline, run_root="data/output", plugins=[plugin])
+summary = plugin.regenerate_summary(run_id)
+```
+
+Events carry identifiers, node facts, and exception class names only — never
+payloads, credentials, storage options, environment values, or parameter
+values. With the default `criticality="required"`, an evidence write failure
+fails the run as a distinct operational failure without invalidating already
+committed checkpoints; `criticality="best_effort"` surfaces failures in
+`RunResult.best_effort_errors` without changing execution. Summary corruption
+never affects recovery: nothing reads a summary to make an execution
+decision, and it can always be regenerated from events. Removing the plugin
+removes history, not execution behavior.
+
 ## CLI Usage
 
 Each example entry point wires `make_cli(pipeline)`, so supported options are
