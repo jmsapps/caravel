@@ -96,6 +96,14 @@ def _write_json(path: str, payload: object, options: Mapping[str, Any]) -> None:
         json.dump(payload, handle)
 
 
+def _read_json(path: str, options: Mapping[str, Any]) -> dict[str, Any]:
+    fs, resolved = resolve_fs(path, options)
+    with fs.open(resolved, mode="rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    assert isinstance(payload, dict)
+    return payload
+
+
 def _pipeline(
     name: str,
     loader: _SeedLoader,
@@ -328,7 +336,11 @@ def test_live_and_stale_lease_classification(
     )
     second.enter(replacement_facts)
     try:
-        assert _exists(second.recovery_path(pipeline_name, abandoned_run_id), azure_options)
+        recovery_path = second.recovery_path(pipeline_name, replacement_facts.run_id)
+        assert _exists(recovery_path, azure_options)
+        recovery = _read_json(recovery_path, azure_options)
+        assert recovery["recovered_by_run_id"] == replacement_facts.run_id
+        assert recovery["abandoned_lease"]["run_id"] == abandoned_run_id
     finally:
         second.exit(replacement_facts, RunOutcome(status="completed"))
 
