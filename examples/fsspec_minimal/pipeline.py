@@ -132,7 +132,9 @@ def build_fsspec_pipeline(
     silver_stage_root: Path | str | None = None,
 ) -> Pipeline:
     env_path = os.getenv("CARAVEL_INPUT_URL")
-    seed_path = _as_path_or_url(input_path if input_path is not None else (env_path or _DEFAULT_INPUT_PATH))
+    seed_path = _as_path_or_url(
+        input_path if input_path is not None else (env_path or _DEFAULT_INPUT_PATH)
+    )
     storage_options = _storage_options_for_url(seed_path)
 
     resolved_bronze_stage_root = _as_path_or_url(

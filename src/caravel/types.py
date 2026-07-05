@@ -97,5 +97,31 @@ class MissingPriorOutputError(Exception):
     """Raised when selective execution requires prior output that is absent."""
 
 
+class UnsupportedCapabilityError(MissingPriorOutputError):
+    """Raised when a request needs an execution capability bare core lacks.
+
+    Bare Caravel never trusts existing output files as evidence of completed
+    work. A selective request that must load output from a node it does not
+    execute therefore fails closed at plan binding until a checkpoint-capable
+    plugin provides committed evidence.
+    """
+
+
 class EmptyOutputError(Exception):
     """Raised when a dataset rejects an empty output payload."""
+
+
+class CheckpointError(Exception):
+    """Base class for checkpoint-evidence failures raised by a checkpoint plugin."""
+
+
+class CheckpointIntegrityError(CheckpointError):
+    """Raised when checkpoint evidence contradicts the declaration or physical output."""
+
+
+class UnsupportedCheckpointVersionError(CheckpointError):
+    """Raised when a checkpoint record was written by an unsupported schema version."""
+
+
+class CheckpointCommitUncertainError(CheckpointError):
+    """Raised when checkpoint record publication cannot be confirmed or denied."""

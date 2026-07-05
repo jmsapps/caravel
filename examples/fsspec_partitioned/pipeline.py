@@ -168,7 +168,9 @@ def build_fsspec_partitioned_pipeline(
     env_input_dir = os.getenv("CARAVEL_INPUT_DIR_URL")
     env_run_root = os.getenv("CARAVEL_RUN_ROOT")
 
-    resolved_input_dir = _as_path_or_url(input_dir if input_dir is not None else (env_input_dir or _DEFAULT_INPUT_DIR))
+    resolved_input_dir = _as_path_or_url(
+        input_dir if input_dir is not None else (env_input_dir or _DEFAULT_INPUT_DIR)
+    )
     resolved_run_root = _as_path_or_url(run_root if run_root is not None else env_run_root)
 
     resolved_bronze_stage_root = _as_path_or_url(
@@ -281,7 +283,9 @@ def run_fsspec_partitioned_pipeline(
     silver_clean_dirs: bool | None = None,
     gold_clean_dirs: bool | None = None,
 ) -> Path | str:
-    resolved_run_root = _as_path_or_url(run_root if run_root is not None else os.getenv("CARAVEL_RUN_ROOT"))
+    resolved_run_root = _as_path_or_url(
+        run_root if run_root is not None else os.getenv("CARAVEL_RUN_ROOT")
+    )
     pipeline = build_fsspec_partitioned_pipeline(
         input_dir=input_dir,
         run_root=resolved_run_root,

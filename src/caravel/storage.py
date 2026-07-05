@@ -41,7 +41,8 @@ def resolve_fs(
     path: StoragePath, storage_options: Mapping[str, Any] | None = None
 ) -> tuple[Any, str]:
     options = dict(storage_options or {})
-    return fsspec.core.url_to_fs(to_storage_string(path), **options)
+    fs, resolved_path = fsspec.core.url_to_fs(to_storage_string(path), **options)
+    return fs, str(resolved_path)
 
 
 def join_path(base: StoragePath, *parts: str) -> str:
@@ -118,28 +119,18 @@ def iter_files_with_suffix(
 
 
 def prepare_partitioned_save(fs: Any, destination: str) -> None:
-    """Create a partition destination and remove any prior empty-output marker."""
+    """Create a partition destination directory."""
     fs.makedirs(destination, exist_ok=True)
-    marker = join_path(destination, PARTITIONED_EMPTY_MARKER)
-    if fs.exists(marker):
-        fs.rm(marker)
 
 
-def mark_partitioned_output_empty(fs: Any, destination: str) -> None:
-    """Persist an otherwise object-less empty partitioned output."""
-    marker = join_path(destination, PARTITIONED_EMPTY_MARKER)
-    with fs.open(marker, mode="wb") as handle:
-        handle.write(b"")
-
-
-def partitioned_output_is_marked_empty(
-    root: StoragePath,
-    storage_options: Mapping[str, Any] | None = None,
-) -> bool:
-    """Return whether a partitioned output has an explicit empty marker."""
-    fs, root_path = resolve_fs(root, storage_options)
-    marker = join_path(root_path, PARTITIONED_EMPTY_MARKER)
-    return bool(fs.exists(marker))
+def remove_and_recreate_dir(
+    path: StoragePath, storage_options: Mapping[str, Any] | None = None
+) -> None:
+    """Replace a Caravel-managed output directory with an empty one."""
+    fs, resolved = resolve_fs(path, storage_options)
+    if fs.exists(resolved):
+        fs.rm(resolved, recursive=True)
+    fs.makedirs(resolved, exist_ok=True)
 
 
 def partitioned_output_exists(
@@ -147,9 +138,12 @@ def partitioned_output_exists(
     suffix: str,
     storage_options: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Return whether an empty marker or at least one partition exists."""
-    if partitioned_output_is_marked_empty(root, storage_options):
-        return True
+    """Return whether at least one partition file exists.
+
+    A committed-empty partitioned output is indistinguishable from absent
+    output at the bare storage layer; durable empty-output evidence is a
+    checkpoint-plugin concern.
+    """
     return bool(iter_files_with_suffix(root, suffix, storage_options))
 
 

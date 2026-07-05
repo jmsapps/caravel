@@ -1,3 +1,5 @@
+from importlib.metadata import PackageNotFoundError, version
+
 from .branch import Branch
 from .cli import make_cli
 from .datasets import (
@@ -22,6 +24,9 @@ from .runner import run
 from .types import (
     SOURCE_FIELD,
     BranchPredicate,
+    CheckpointCommitUncertainError,
+    CheckpointError,
+    CheckpointIntegrityError,
     Dataset,
     EmptyOutputError,
     KeyCollisionError,
@@ -33,10 +38,18 @@ from .types import (
     Record,
     StepContext,
     StepFn,
+    UnsupportedCapabilityError,
+    UnsupportedCheckpointVersionError,
 )
 from .viz import to_mermaid
 
+try:
+    __version__ = version("caravel")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+
 __all__ = [
+    "__version__",
     "PartitionId",
     "Record",
     "Partitions",
@@ -52,6 +65,11 @@ __all__ = [
     "KeyCollisionError",
     "MissingSourceTagError",
     "MissingPriorOutputError",
+    "UnsupportedCapabilityError",
+    "CheckpointError",
+    "CheckpointIntegrityError",
+    "UnsupportedCheckpointVersionError",
+    "CheckpointCommitUncertainError",
     "JSONDataset",
     "PartitionedJSONDataset",
     "TextDataset",

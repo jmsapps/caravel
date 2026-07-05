@@ -41,9 +41,7 @@ def enrich_with_job_context(
 
 
 @step(output=JSONDataset())
-def summarize(
-    partitions: dict[str, dict[str, Any]], *, context: JobContext
-) -> dict[str, Any]:
+def summarize(partitions: dict[str, dict[str, Any]], *, context: JobContext) -> dict[str, Any]:
     return {
         "tenant": context.tenant,
         "job_id": context.job_id,
