@@ -3,6 +3,7 @@ name: Azure qualification
 on:
   pull_request:
     branches: [master]
+  push:
   workflow_dispatch:
 
 permissions:
