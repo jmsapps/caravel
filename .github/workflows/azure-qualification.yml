@@ -15,6 +15,9 @@ concurrency:
 jobs:
   production-profile:
     name: Production profile on Azure
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -34,12 +37,18 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install Azure qualification dependencies
-        run: python -m pip install ".[azure,examples]"
+        run: python -m pip install ".[azure,examples,test]"
       - name: Validate required configuration
         run: |
           test -n "$AZURE_STORAGE_ACCOUNT_NAME"
           test -n "$CARAVEL_INPUT_URL"
           test -n "$CARAVEL_AZURE_QUALIFICATION_PREFIX"
+          if test -z "$AZURE_STORAGE_ACCOUNT_KEY" && \
+             test -z "$AZURE_STORAGE_SAS_TOKEN" && \
+             { test -z "$AZURE_TENANT_ID" || test -z "$AZURE_CLIENT_ID" || test -z "$AZURE_CLIENT_SECRET"; }; then
+            echo "Configure an account key, SAS token, or complete service-principal credentials." >&2
+            exit 1
+          fi
       - name: Run full and selective qualification
         env:
           QUALIFICATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -48,3 +57,19 @@ jobs:
           RUN_ROOT="${CARAVEL_AZURE_QUALIFICATION_PREFIX%/}/${QUALIFICATION_ID}/output"
           python -m examples.production_profile --run-root "$RUN_ROOT"
           python -m examples.production_profile --run-root "$RUN_ROOT" --stage silver
+      - name: Run Azure backend contracts
+        env:
+          QUALIFICATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          export CARAVEL_AZURE_TEST_ROOT="${CARAVEL_AZURE_QUALIFICATION_PREFIX%/}/${QUALIFICATION_ID}/contracts"
+          mkdir -p qualification-results
+          python -m pytest -q tests/qualification/test_azure_profile.py \
+            --junitxml=qualification-results/azure-contracts.xml
+          python -m pip freeze > qualification-results/dependencies.txt
+      - name: Publish sanitized qualification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: azure-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: qualification-results/
+          if-no-files-found: warn

@@ -36,3 +36,33 @@ python3 -m examples.production_profile \
 
 Do not reuse the example's fixed `smoke_run` path as release evidence. A unique
 prefix prevents a previous run from making a failed qualification look valid.
+
+## Release-gated Azure contracts
+
+`.github/workflows/azure-qualification.yml` is the reference qualification
+scheduler. GitHub Actions serializes runs through one concurrency group and
+terminates the whole job after 15 minutes. The workflow accepts an account key,
+SAS token, or complete service-principal credential set from repository secrets;
+credentials are never written to qualification artifacts.
+
+In addition to the full and selective example runs, the credential-gated suite
+at `tests/qualification/test_azure_profile.py` verifies these behaviors on a
+unique Azure prefix:
+
+- checkpoint-backed selective execution and sanitized run events;
+- interruption after checkpoint invalidation followed by safe recovery;
+- malformed checkpoint evidence failing closed;
+- ownership pruning of a removed output;
+- live-lease refusal, stale-lease recovery, and normal lease cleanup;
+- stale-partition removal during output replacement; and
+- partition-key traversal rejection before an escaped object is written.
+
+The workflow publishes JUnit timings and installed dependency versions as a
+sanitized GitHub artifact. Azure objects are intentionally retained beneath the
+unique qualification prefix for inspection and must be covered by an explicit
+storage lifecycle/retention policy.
+
+This suite qualifies the tested Azure Blob configuration only. It does not
+qualify every fsspec backend, establish production workload scale thresholds,
+compare business outputs with a current system, or replace independent runbook
+and owner approval.
