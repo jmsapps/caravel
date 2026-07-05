@@ -20,6 +20,12 @@ ST-01 through ST-14 establish the core framework:
 This is enough for a working proof of concept. It is not yet enough to call the
 runner production-ready.
 
+C-6 delivers the hardened core, explicit first-party plugin profile, and local,
+`memory://`, and Azure technical qualification. C-7 owns the workload-specific
+ST-17 through ST-20 evidence: scale, target-runtime operations, security and
+retention approval, shadow parity, cutover, and rollback. Merging C-6 does not
+authorize a production workload before C-7 completes.
+
 Clean-checkout GitHub Actions cover supported Python versions with tests, ruff,
 formatting, strict mypy, package metadata, and a minimum-fsspec compatibility
 job as required gates.
@@ -32,7 +38,9 @@ Implementation tasks:
 
 - Add a run-evidence plugin with a required, explicitly configured metadata
   store/root. Core provides no metadata location and derives no default from the
-  pipeline run root.
+  pipeline run root. Shipped as `RunEvidencePlugin` (immutable versioned run
+  and node events, deterministic in-process sequence, structured logs from the
+  same vocabulary, and a summary regenerated only from events).
 - Record pipeline name, run id, start/end timestamps, status, selected
   stage/step, and code/version identifier when available. Parameter values are
   excluded unless explicitly allowlisted as non-sensitive.
@@ -69,7 +77,9 @@ Implementation tasks:
 - Make output writes safer by writing to temporary paths and committing
   atomically where possible.
 - Add explicit resume/recompute behavior through a checkpoint plugin with its
-  own required metadata store/root.
+  own required metadata store/root. Shipped as `CheckpointPlugin`
+  (`metadata_root` required, schema-versioned records, verified reuse
+  verdicts, checkpoint-backed selective execution).
 - Fix branch route step output path collisions by including route step indexes in
   route output directories.
 - Validate declarations before execution, including duplicate stage names,

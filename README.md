@@ -238,6 +238,113 @@ Plugins may implement observer, run-guard, or checkpoint-policy capabilities.
 Any stateful plugin owns and requires its metadata store/root configuration;
 Caravel does not choose a metadata location or derive one from `run_root`.
 
+### CheckpointPlugin
+
+`CheckpointPlugin` is the first-party checkpoint capability. It writes one
+schema-versioned record per persisted plan node after each successful save and
+verifies records against the declaration and the physical output before
+blessing a skipped node's output for reuse:
+
+```python
+from caravel.plugins import CheckpointPlugin
+
+plugin = CheckpointPlugin(metadata_root="data/metadata/checkpoints")
+run(pipeline, run_root="data/output", plugins=[plugin])
+run(pipeline, run_root="data/output", only_stage="silver", plugins=[plugin])
+```
+
+`metadata_root` is required and explicit; configure it outside any output tree
+that a run may replace or clean. Records contain identifiers, partition keys,
+and counts only — never credentials, storage options, payloads, or parameter
+values. A committed empty partitioned output is represented by a count-zero
+record, so it stays reusable on storage without durable empty directories.
+Removing the plugin leaves records inert: bare core ignores them and rejects
+checkpoint-dependent selective requests at binding.
+
+### OwnershipPlugin
+
+`OwnershipPlugin` removes stale cross-run output — directories left behind by
+renamed or removed stages, steps, routes, and route steps — using durable
+recorded ownership, never filename conventions:
+
+```python
+from caravel.plugins import CheckpointPlugin, OwnershipPlugin
+
+plugins = [
+    CheckpointPlugin(metadata_root="data/metadata/checkpoints"),
+    OwnershipPlugin(metadata_root="data/metadata/ownership"),
+]
+run(pipeline, run_root="data/output", plugins=plugins)
+```
+
+Each full run records the bound plan's managed persisted output directories
+as a versioned inventory under the plugin's required `metadata_root`. A later
+full run deletes exactly the directories a prior valid inventory recorded but
+the current plan no longer declares; every candidate must stay inside the
+managed pipeline root. Without a prior valid inventory nothing is deleted.
+`stage_root` trees are user-owned and never pruned, selective runs neither
+prune nor replace the inventory, and interrupted reconciliation converges on
+rerun. In the reference production profile, compose it with
+`CheckpointPlugin` so evidence pointing at pruned output can never authorize
+reuse.
+
+### RunEvidencePlugin
+
+`RunEvidencePlugin` makes runs diagnosable from durable artifacts. It records
+one immutable event object per committed lifecycle transition (run/node
+start, success, failure, skip) under its required `metadata_root`, emits
+structured logs from the same vocabulary, and derives a regenerable summary
+exclusively from the recorded events:
+
+```python
+from caravel.plugins import RunEvidencePlugin
+
+plugin = RunEvidencePlugin(metadata_root="data/metadata/evidence")
+run(pipeline, run_root="data/output", plugins=[plugin])
+summary = plugin.regenerate_summary(run_id)
+```
+
+Events carry identifiers, node facts, and exception class names only — never
+payloads, credentials, storage options, environment values, or parameter
+values. With the default `criticality="required"`, an evidence write failure
+fails the run as a distinct operational failure without invalidating already
+committed checkpoints; `criticality="best_effort"` surfaces failures in
+`RunResult.best_effort_errors` without changing execution. Summary corruption
+never affects recovery: nothing reads a summary to make an execution
+decision, and it can always be regenerated from events. Removing the plugin
+removes history, not execution behavior.
+
+### LeasePlugin
+
+`LeasePlugin` provides advisory writer-conflict evidence and abandoned-run
+diagnostics. It is **not a distributed lock**: generic fsspec storage has no
+portable atomic create-if-absent, so two racing writers can both acquire. The
+external scheduler or container owns the authoritative contract: one writer
+per pipeline run root, run-level retries, and hard timeout with process
+termination.
+
+```python
+from caravel.plugins import LeasePlugin
+
+plugin = LeasePlugin(
+    metadata_root="data/metadata/leases",
+    heartbeat_interval=10.0,
+    stale_threshold=60.0,
+)
+run(pipeline, run_root="data/output", plugins=[plugin])
+```
+
+At startup the plugin refuses an apparently live foreign lease before any
+user code runs; a lease whose heartbeat is older than `stale_threshold` is
+recovered, leaving a durable recovery record that names the abandoned run ID
+(diagnosable against `RunEvidencePlugin` history when that plugin is also
+configured). A plugin-owned daemon thread refreshes the heartbeat and never
+executes user code; a mid-run heartbeat failure surfaces at teardown as a
+distinct operational failure without changing run output. Normal shutdown
+releases the lease and leaves no worker thread behind. If the whole process
+is killed, the lease remains with an aging heartbeat, which the next
+invocation classifies as stale.
+
 ## CLI Usage
 
 Each example entry point wires `make_cli(pipeline)`, so supported options are
@@ -277,14 +384,14 @@ Fsspec-backed input example:
 
 ```bash
 CARAVEL_INPUT_URL=./examples/fsspec/data/input_partitions.json \
-python3 -m examples.fsspec --run-root data/fsspec_example/smoke_run
+python3 -m examples.fsspec_minimal --run-root data/fsspec_example/smoke_run
 ```
 
 Remote run-root example:
 
 ```bash
 CARAVEL_INPUT_URL=abfs://caravel/input/input_partitions.json \
-python3 -m examples.fsspec --run-root abfs://caravel/output/smoke_run
+python3 -m examples.fsspec_minimal --run-root abfs://caravel/output/smoke_run
 ```
 
 `--mermaid` is diagram-only mode and is mutually exclusive with execution flags:
