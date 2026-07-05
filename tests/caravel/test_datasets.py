@@ -171,15 +171,20 @@ def test_exists_partitioned_false_when_no_matching_files(tmp_path: Path) -> None
         PartitionedBytesDataset(name="empty_bytes", allow_empty=True),
     ],
 )
-def test_empty_partitioned_save_is_a_valid_loadable_checkpoint(
-    dataset: object, tmp_path: Path
-) -> None:
+def test_empty_partitioned_save_writes_data_only_directory(dataset: object, tmp_path: Path) -> None:
+    """Bare core writes no sentinel; a committed-empty output is an empty dir.
+
+    Without durable checkpoint evidence, `exists()` cannot distinguish an
+    empty output from absent output. That is an accepted bare-core
+    limitation; durable empty-output evidence is a checkpoint-plugin concern.
+    """
     out_dir = tmp_path / "_012_empty"
 
     dataset.save({}, out_dir)  # type: ignore[attr-defined]
 
-    assert dataset.exists(out_dir) is True  # type: ignore[attr-defined]
-    assert (out_dir / ".caravel_empty").exists()
+    assert out_dir.exists()
+    assert list(out_dir.iterdir()) == []
+    assert dataset.exists(out_dir) is False  # type: ignore[attr-defined]
 
     dataset.path = out_dir  # type: ignore[attr-defined]
     assert dataset.load() == {}  # type: ignore[attr-defined]
@@ -200,7 +205,7 @@ def test_nonempty_partitioned_save_does_not_write_internal_marker(
 
     dataset.save(payload, out_dir)  # type: ignore[attr-defined]
 
-    assert not (out_dir / ".caravel_empty").exists()
+    assert sorted(p.name for p in out_dir.iterdir()) == [f"a{getattr(dataset, 'suffix', '.json')}"]
 
 
 @pytest.mark.parametrize(
@@ -229,14 +234,16 @@ def test_partitioned_dataset_rejects_non_bool_allow_empty(dataset_type: type[obj
         dataset_type(allow_empty="yes")  # type: ignore[call-arg]
 
 
-def test_empty_marker_takes_precedence_over_stale_partition_files(tmp_path: Path) -> None:
+def test_direct_empty_save_does_not_remove_prior_files(tmp_path: Path) -> None:
+    """Direct Dataset.save never deletes prior output; replacement is
+    executor-owned. A bare empty save therefore leaves earlier files."""
     out_dir = tmp_path / "_015_empty_overwrite"
     dataset = PartitionedJSONDataset(name="json", allow_empty=True)
     dataset.save({"stale": {"id": "stale"}}, out_dir)
     dataset.save({}, out_dir)
 
     loader = PartitionedJSONDataset(name="json", path=out_dir)
-    assert loader.load() == {}
+    assert loader.load() == {"stale": {"id": "stale"}}
 
 
 def test_nonempty_save_removes_prior_empty_marker(tmp_path: Path) -> None:
@@ -246,12 +253,11 @@ def test_nonempty_save_removes_prior_empty_marker(tmp_path: Path) -> None:
 
     dataset.save({"current": {"id": "current"}}, out_dir)
 
-    assert not (out_dir / ".caravel_empty").exists()
     loader = PartitionedJSONDataset(name="json", path=out_dir)
     assert loader.load() == {"current": {"id": "current"}}
 
 
-def test_rejected_empty_save_preserves_existing_checkpoint(tmp_path: Path) -> None:
+def test_rejected_empty_save_leaves_destination_unchanged(tmp_path: Path) -> None:
     out_dir = tmp_path / "_017_preserved"
     allowed = PartitionedJSONDataset(name="json", allow_empty=True)
     allowed.save({}, out_dir)
@@ -260,7 +266,7 @@ def test_rejected_empty_save_preserves_existing_checkpoint(tmp_path: Path) -> No
     with pytest.raises(EmptyOutputError):
         strict.save({}, out_dir)
 
-    assert (out_dir / ".caravel_empty").exists()
+    assert list(out_dir.iterdir()) == []
     allowed.path = out_dir
     assert allowed.load() == {}
 
@@ -309,15 +315,16 @@ def test_partitioned_json_dataset_round_trip_memory_filesystem() -> None:
     assert dataset.exists(out_dir) is True
 
 
-def test_empty_partitioned_dataset_round_trip_memory_filesystem() -> None:
+def test_empty_partitioned_save_on_memory_backend_leaves_no_loadable_artifact() -> None:
+    """On backends without durable empty directories, bare core cannot
+    represent a committed-empty output. Accepted limitation: the checkpoint
+    plugin supplies portable empty-output evidence."""
     dataset = PartitionedJSONDataset(name="empty_json_mem", allow_empty=True)
     out_dir = "memory://caravel/datasets/empty_parts_json/_001_step"
 
     dataset.save({}, out_dir)
 
-    loader = PartitionedJSONDataset(name="empty_json_mem", path=out_dir)
-    assert dataset.exists(out_dir) is True
-    assert loader.load() == {}
+    assert dataset.exists(out_dir) is False
 
 
 def test_text_dataset_round_trip_memory_filesystem() -> None:
@@ -382,3 +389,28 @@ def test_partitioned_bytes_dataset_round_trip_memory_filesystem() -> None:
     )
     assert loader.load() == payload
     assert dataset.exists(out_dir) is True
+
+
+def test_partitioned_save_validates_complete_payload_before_any_write(tmp_path: Path) -> None:
+    dataset = PartitionedJSONDataset(name="prevalidated")
+    dest = tmp_path / "prevalidated"
+    dataset.save({"a": {"id": "a"}, "b": {"id": "b"}}, dest)
+
+    with pytest.raises(TypeError, match="Partition key must be str"):
+        dataset.save({"c": {"id": "c"}, 7: {"id": "bad"}}, dest)
+
+    assert not (dest / "c.json").exists()
+    assert (dest / "a.json").exists()
+    assert (dest / "b.json").exists()
+
+
+def test_partitioned_text_save_validates_record_types_before_any_write(tmp_path: Path) -> None:
+    dataset = PartitionedTextDataset(name="typed_text")
+    dest = tmp_path / "typed_text"
+    dataset.save({"a": "alpha"}, dest)
+
+    with pytest.raises(TypeError, match="expected str records"):
+        dataset.save({"b": "beta", "c": 3}, dest)
+
+    assert not (dest / "b.txt").exists()
+    assert (dest / "a.txt").exists()

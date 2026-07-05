@@ -24,6 +24,9 @@ from .runner import run
 from .types import (
     SOURCE_FIELD,
     BranchPredicate,
+    CheckpointCommitUncertainError,
+    CheckpointError,
+    CheckpointIntegrityError,
     Dataset,
     EmptyOutputError,
     KeyCollisionError,
@@ -35,6 +38,8 @@ from .types import (
     Record,
     StepContext,
     StepFn,
+    UnsupportedCapabilityError,
+    UnsupportedCheckpointVersionError,
 )
 from .viz import to_mermaid
 
@@ -60,6 +65,11 @@ __all__ = [
     "KeyCollisionError",
     "MissingSourceTagError",
     "MissingPriorOutputError",
+    "UnsupportedCapabilityError",
+    "CheckpointError",
+    "CheckpointIntegrityError",
+    "UnsupportedCheckpointVersionError",
+    "CheckpointCommitUncertainError",
     "JSONDataset",
     "PartitionedJSONDataset",
     "TextDataset",

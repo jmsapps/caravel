@@ -32,11 +32,11 @@ def _parse_params(values: Sequence[str]) -> dict[str, str]:
     parsed: dict[str, str] = {}
     for item in values:
         if "=" not in item:
-            raise ValueError(f"Invalid --param value '{item}'. Expected key=value.")
+            raise ValueError("Invalid --param value. Expected key=value.")
         key, value = item.split("=", 1)
         key = key.strip()
         if not key:
-            raise ValueError(f"Invalid --param value '{item}'. Key cannot be empty.")
+            raise ValueError("Invalid --param value. Key cannot be empty.")
         parsed[key] = value
     return parsed
 
@@ -46,8 +46,15 @@ def make_cli(
     *,
     run_fn: RunFn = run,
     mermaid_fn: MermaidFn | None = to_mermaid,
+    plugins: Sequence[Any] | None = None,
 ) -> CliEntrypoint:
-    """Create a CLI entrypoint callable for a pipeline declaration."""
+    """Create a CLI entrypoint callable for a pipeline declaration.
+
+    Plugins are application-owned composition: the entry point that builds the
+    CLI passes explicit plugin instances, which are forwarded to every run.
+    A selective request (``--stage``/``--step``) that needs prior output fails
+    closed unless a checkpoint-capable plugin is configured here.
+    """
 
     parser = argparse.ArgumentParser(
         prog=pipeline.name,
@@ -125,6 +132,7 @@ def make_cli(
                 only_step=only_step,
                 params=params,
                 keep_source_tag=bool(args.keep_source_tag),
+                plugins=list(plugins) if plugins is not None else None,
             )
         except (ValueError, MissingPriorOutputError) as exc:
             parser.error(str(exc))

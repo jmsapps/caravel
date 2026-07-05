@@ -20,9 +20,15 @@ ST-01 through ST-14 establish the core framework:
 This is enough for a working proof of concept. It is not yet enough to call the
 runner production-ready.
 
-C-6 Phase 0 establishes clean-checkout GitHub Actions across supported Python
-versions, with tests, ruff, format, strict mypy, package metadata, and a minimum
-fsspec compatibility job as required gates.
+C-6 delivers the hardened core, explicit first-party plugin profile, and local,
+`memory://`, and Azure technical qualification. C-7 owns the workload-specific
+ST-17 through ST-20 evidence: scale, target-runtime operations, security and
+retention approval, shadow parity, cutover, and rollback. Merging C-6 does not
+authorize a production workload before C-7 completes.
+
+Clean-checkout GitHub Actions cover supported Python versions with tests, ruff,
+formatting, strict mypy, package metadata, and a minimum-fsspec compatibility
+job as required gates.
 
 ## ST-15 - Production Operations And Observability
 
@@ -30,20 +36,26 @@ Goal: make every run inspectable, alertable, and diagnosable.
 
 Implementation tasks:
 
-- Add run metadata files under each run root, including pipeline name, run id,
-  start/end timestamps, status, parameters, selected stage/step, and code/version
-  identifier when available.
+- Add a run-evidence plugin with a required, explicitly configured metadata
+  store/root. Core provides no metadata location and derives no default from the
+  pipeline run root. Shipped as `RunEvidencePlugin` (immutable versioned run
+  and node events, deterministic in-process sequence, structured logs from the
+  same vocabulary, and a summary regenerated only from events).
+- Record pipeline name, run id, start/end timestamps, status, selected
+  stage/step, and code/version identifier when available. Parameter values are
+  excluded unless explicitly allowlisted as non-sensitive.
 - Record per-stage and per-step status, duration, input dataset description,
   output dataset description, output paths, and exception details.
 - Emit structured logs with stable fields for pipeline, run id, stage, step,
   event type, status, duration, and error class.
 - Define alertable failure signals for failed run, failed step, missing prior
   output, invalid selector, dataset save/load failure, and branch collision.
-- Add operator-facing documentation for where outputs, logs, and metadata live.
+- Add operator-facing documentation for independently configured output, log,
+  and plugin metadata locations.
 
 Validation tasks:
 
-- Unit tests for metadata creation on success and failure.
+- Plugin tests for metadata creation on success and failure.
 - Tests proving failed steps produce durable failure metadata.
 - A sample failed run that is easy to inspect without reading raw stack traces.
 
@@ -58,14 +70,16 @@ Goal: make retries, timeouts, idempotency, and recovery explicit.
 
 Implementation tasks:
 
-- Add configurable retry policy for steps, including max attempts, backoff, and
-  retryable exception classes.
-- Add timeout policy for steps or document why timeout enforcement is delegated
-  to the external scheduler.
+- Keep run-level retries, backoff, hard timeout, and process termination in the
+  external scheduler/container contract.
+- Defer step-level retries until a separate idempotency design is approved.
 - Define idempotency rules for step functions and dataset writes.
 - Make output writes safer by writing to temporary paths and committing
   atomically where possible.
-- Add explicit resume/recompute behavior for partial runs.
+- Add explicit resume/recompute behavior through a checkpoint plugin with its
+  own required metadata store/root. Shipped as `CheckpointPlugin`
+  (`metadata_root` required, schema-versioned records, verified reuse
+  verdicts, checkpoint-backed selective execution).
 - Fix branch route step output path collisions by including route step indexes in
   route output directories.
 - Validate declarations before execution, including duplicate stage names,
@@ -74,7 +88,7 @@ Implementation tasks:
 
 Validation tasks:
 
-- Tests for retry success, retry exhaustion, and non-retryable failures.
+- Integration tests for externally retried runs and checkpoint-backed resume.
 - Tests for partial output cleanup or atomic commit behavior.
 - Tests for duplicate branch route step names and route path stability.
 - Tests for selective rerun behavior after partial failure.
@@ -190,21 +204,19 @@ on this runner:
 
 - Branch route step output directories must include stable indexes to avoid
   collisions.
-- Run metadata must persist success and failure status.
+- The configured run-evidence plugin must persist success and failure status.
 - Selective rerun semantics must be documented and covered by tests.
 - Declaration validation must reject ambiguous or unsupported pipeline shapes.
 - A shadow-run parity window against Kedro or the current implementation must
   pass before cutover.
 
-## Recommended Scope Decision
+## Scope Boundary
 
-For production use, decide explicitly between these two paths:
+Caravel remains a small deterministic pipeline runner. Operational state is
+provided by explicitly configured plugins, while scheduling, run-level retries,
+hard timeout, process termination, and authoritative writer serialization stay
+with the external runtime.
 
-- Keep this as a small deterministic pipeline runner and harden ST-15 through
-  ST-20.
-- Keep the declaration API but compile or delegate execution to a proven
-  orchestrator such as Kedro, Dagster, Prefect, or Airflow.
-
-Avoid positioning this as a general DAG scheduler unless the project adds an
-explicit graph model, dependency edges, topological sorting, cycle detection,
-parallel scheduling, durable state, and a broader operational surface.
+Caravel is not a general DAG scheduler. That claim would require an explicit
+graph model, dependency edges, topological sorting, cycle detection, parallel
+scheduling, durable coordination, and a broader operational surface.

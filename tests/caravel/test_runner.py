@@ -9,7 +9,12 @@ import pytest
 from caravel import Branch
 from caravel.datasets import JSONDataset, PartitionedJSONDataset
 from caravel.pipeline import Pipeline, Stage, step
-from caravel.types import EmptyOutputError, KeyCollisionError, MissingPriorOutputError
+from caravel.types import (
+    EmptyOutputError,
+    KeyCollisionError,
+    MissingPriorOutputError,
+    UnsupportedCapabilityError,
+)
 
 
 class _StubLoader:
@@ -221,7 +226,7 @@ def test_clean_dirs_true_clears_existing_stage_contents_before_stage_run(tmp_pat
     assert (stage_root / "_001_pass_through" / "a.json").exists()
 
 
-def test_clean_dirs_true_without_stage_root_clears_run_root_contents_before_stage_run(
+def test_clean_dirs_true_without_stage_root_clears_only_the_stage_directory(
     tmp_path: Path,
 ) -> None:
     from caravel.runner import run
@@ -233,25 +238,30 @@ def test_clean_dirs_true_without_stage_root_clears_run_root_contents_before_stag
         _ = context
         return partitions
 
-    run_root = tmp_path / "run_root_clean_target"
-    stale_file = run_root / "stale.txt"
-    stale_dir_file = run_root / "obsolete" / "old.json"
-    stale_dir_file.parent.mkdir(parents=True, exist_ok=True)
-    stale_file.write_text("stale", encoding="utf-8")
-    stale_dir_file.write_text("stale", encoding="utf-8")
-
     pipeline = Pipeline(
         name="run_root_clean_dirs_pipeline",
         loader=_StubLoader({"a": {"id": "a", "value": 1}}),
         stages=[Stage(name="bronze", entries=[pass_through], clean_dirs=True)],
     )
 
+    run_root = tmp_path / "run_root_clean_target"
+    foreign_file = run_root / "stale.txt"
+    foreign_dir_file = run_root / "obsolete" / "old.json"
+    foreign_dir_file.parent.mkdir(parents=True, exist_ok=True)
+    foreign_file.write_text("preserve", encoding="utf-8")
+    foreign_dir_file.write_text("preserve", encoding="utf-8")
+
+    stage_dir = run_root / pipeline.name / "_001_bronze"
+    stale_step_file = stage_dir / "_009_renamed_step" / "left_over.json"
+    stale_step_file.parent.mkdir(parents=True, exist_ok=True)
+    stale_step_file.write_text("stale", encoding="utf-8")
+
     run(pipeline, run_root=run_root)
 
-    assert run_root.exists()
-    assert not stale_file.exists()
-    assert not stale_dir_file.exists()
-    assert (run_root / pipeline.name / "_001_bronze" / "_001_pass_through" / "a.json").exists()
+    assert foreign_file.exists()
+    assert foreign_dir_file.exists()
+    assert not stale_step_file.exists()
+    assert (stage_dir / "_001_pass_through" / "a.json").exists()
 
 
 def test_clean_dirs_true_fails_fast_for_selective_non_first_step_without_deleting(
@@ -302,7 +312,7 @@ def test_clean_dirs_true_fails_fast_for_selective_non_first_step_without_deletin
     assert sentinel.exists()
 
 
-def test_clean_dirs_on_later_default_stage_loads_seed_before_run_root_cleanup(
+def test_clean_dirs_on_later_default_stage_preserves_earlier_stage_outputs(
     tmp_path: Path,
 ) -> None:
     from caravel.runner import run
@@ -321,11 +331,11 @@ def test_clean_dirs_on_later_default_stage_loads_seed_before_run_root_cleanup(
         / "_001_silver_summary.json"
     )
 
-    assert not bronze_file.exists()
+    assert bronze_file.exists()
     assert silver_file.exists()
 
 
-def test_default_collision_behavior_overwrites_existing_step_output(tmp_path: Path) -> None:
+def test_full_rerun_overwrites_existing_step_output(tmp_path: Path) -> None:
     from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
@@ -340,13 +350,15 @@ def test_default_collision_behavior_overwrites_existing_step_output(tmp_path: Pa
     )
     silver_file.write_text('{"count": 999}', encoding="utf-8")
 
-    run(pipeline, run_root=tmp_path, only_stage="silver")
+    run(pipeline, run_root=tmp_path)
 
     payload = json.loads(silver_file.read_text("utf-8"))
     assert payload["count"] == 2
 
 
-def test_only_stage_by_name_executes_target_stage_with_prior_load_from_disk(tmp_path: Path) -> None:
+def test_only_stage_on_later_stage_fails_closed_without_checkpoint_capability(
+    tmp_path: Path,
+) -> None:
     from caravel.runner import run
 
     calls: dict[str, int] = {}
@@ -356,29 +368,28 @@ def test_only_stage_by_name_executes_target_stage_with_prior_load_from_disk(tmp_
     before_bronze = calls.get("bronze_map", 0)
     before_silver = calls.get("silver_summary", 0)
 
-    run(pipeline, run_root=tmp_path, only_stage="silver")
+    with pytest.raises(UnsupportedCapabilityError, match="checkpoint"):
+        run(pipeline, run_root=tmp_path, only_stage="silver")
 
     assert calls.get("bronze_map", 0) == before_bronze
-    assert calls.get("silver_summary", 0) == before_silver + 1
+    assert calls.get("silver_summary", 0) == before_silver
 
 
-def test_only_stage_by_index_executes_target_stage(tmp_path: Path) -> None:
+def test_only_stage_on_first_stage_executes_from_loader_seed(tmp_path: Path) -> None:
     from caravel.runner import run
 
     calls: dict[str, int] = {}
     pipeline = _make_linear_pipeline(call_counter=calls)
 
-    run(pipeline, run_root=tmp_path)
-    before_bronze = calls.get("bronze_map", 0)
-    before_silver = calls.get("silver_summary", 0)
+    run(pipeline, run_root=tmp_path, only_stage=1)
 
-    run(pipeline, run_root=tmp_path, only_stage=2)
-
-    assert calls.get("bronze_map", 0) == before_bronze
-    assert calls.get("silver_summary", 0) == before_silver + 1
+    assert calls.get("bronze_map", 0) == 1
+    assert calls.get("silver_summary", 0) == 0
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
 
 
-def test_only_stage_by_name_executes_target_stage_with_remote_prior_load() -> None:
+def test_only_stage_on_later_stage_fails_closed_on_remote_backend() -> None:
     from caravel.runner import run
 
     calls: dict[str, int] = {}
@@ -386,23 +397,22 @@ def test_only_stage_by_name_executes_target_stage_with_remote_prior_load() -> No
     run_root = _memory_run_root("remote_only_stage")
 
     run(pipeline, run_root=run_root)
-    before_bronze = calls.get("bronze_map", 0)
     before_silver = calls.get("silver_summary", 0)
 
-    run(pipeline, run_root=run_root, only_stage="silver")
+    with pytest.raises(UnsupportedCapabilityError, match="checkpoint"):
+        run(pipeline, run_root=run_root, only_stage="silver")
 
-    assert calls.get("bronze_map", 0) == before_bronze
-    assert calls.get("silver_summary", 0) == before_silver + 1
+    assert calls.get("silver_summary", 0) == before_silver
 
 
-def test_only_step_by_name_executes_target_step_and_requires_prior_output(
+def test_only_step_on_later_stage_fails_closed_and_names_required_upstream(
     tmp_path: Path,
 ) -> None:
     from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
 
-    with pytest.raises(MissingPriorOutputError, match="_001_bronze"):
+    with pytest.raises(UnsupportedCapabilityError) as exc:
         run(
             pipeline,
             run_root=tmp_path,
@@ -410,48 +420,38 @@ def test_only_step_by_name_executes_target_step_and_requires_prior_output(
             only_step="silver_summary",
         )
 
+    assert "stage='bronze'" in str(exc.value)
+    assert "step='bronze_map'" in str(exc.value)
+    assert "checkpoint" in str(exc.value)
 
-def test_only_step_by_index_executes_target_step(tmp_path: Path) -> None:
+
+def test_only_step_first_of_first_stage_executes_from_loader_seed(tmp_path: Path) -> None:
     from caravel.runner import run
 
-    pipeline = _make_linear_pipeline()
+    calls: dict[str, int] = {}
+    pipeline = _make_linear_pipeline(call_counter=calls)
 
+    run(pipeline, run_root=tmp_path, only_stage="bronze", only_step=1)
+
+    assert calls.get("bronze_map", 0) == 1
+    assert calls.get("silver_summary", 0) == 0
     bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map"
-    bronze_dataset = PartitionedJSONDataset(name="seed", path=bronze_dir)
-    bronze_dataset.save(
-        {
-            "x": {"id": "x", "mapped": True},
-            "y": {"id": "y", "mapped": True},
-        },
-        bronze_dir,
-    )
-
-    run(
-        pipeline,
-        run_root=tmp_path,
-        only_stage="silver",
-        only_step=1,
-    )
-
-    silver_file = (
-        tmp_path
-        / pipeline.name
-        / "_002_silver"
-        / "_001_silver_summary"
-        / "_001_silver_summary.json"
-    )
-    payload = json.loads(silver_file.read_text("utf-8"))
-    assert payload["count"] == 2
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
 
 
-def test_only_step_by_index_requires_prior_step_output_from_same_stage(tmp_path: Path) -> None:
+def test_only_step_needing_same_stage_prior_fails_closed_before_user_code(
+    tmp_path: Path,
+) -> None:
     from caravel.runner import run
+
+    calls = {"first": 0, "second": 0}
 
     @step(output=PartitionedJSONDataset(name="bronze_partitions"))
     def first_step(
         partitions: dict[str, dict[str, object]], *, context: object
     ) -> dict[str, dict[str, object]]:
         _ = context
+        calls["first"] += 1
         return {key: {**record, "first": True} for key, record in partitions.items()}
 
     @step(output=PartitionedJSONDataset(name="bronze_partitions_2"))
@@ -459,10 +459,8 @@ def test_only_step_by_index_requires_prior_step_output_from_same_stage(tmp_path:
         partitions: dict[str, dict[str, object]], *, context: object
     ) -> dict[str, dict[str, object]]:
         _ = context
-        return {
-            key: {**record, "second": record.get("first", False)}
-            for key, record in partitions.items()
-        }
+        calls["second"] += 1
+        return dict(partitions)
 
     pipeline = Pipeline(
         name="two_step_stage",
@@ -470,7 +468,7 @@ def test_only_step_by_index_requires_prior_step_output_from_same_stage(tmp_path:
         stages=[Stage(name="bronze", entries=[first_step, second_step])],
     )
 
-    with pytest.raises(MissingPriorOutputError, match="_001_first_step"):
+    with pytest.raises(UnsupportedCapabilityError, match="stage='bronze' step='first_step'"):
         run(
             pipeline,
             run_root=tmp_path,
@@ -478,8 +476,11 @@ def test_only_step_by_index_requires_prior_step_output_from_same_stage(tmp_path:
             only_step="second_step",
         )
 
+    assert calls == {"first": 0, "second": 0}
+    assert not (tmp_path / pipeline.name).exists()
 
-def test_only_step_by_name_executes_target_step_with_remote_prior_output() -> None:
+
+def test_only_step_on_later_stage_fails_closed_on_remote_backend() -> None:
     from caravel.runner import run
 
     calls: dict[str, int] = {}
@@ -487,21 +488,20 @@ def test_only_step_by_name_executes_target_step_with_remote_prior_output() -> No
     run_root = _memory_run_root("remote_only_step")
 
     run(pipeline, run_root=run_root)
-    before_bronze = calls.get("bronze_map", 0)
     before_silver = calls.get("silver_summary", 0)
 
-    run(
-        pipeline,
-        run_root=run_root,
-        only_stage="silver",
-        only_step="silver_summary",
-    )
+    with pytest.raises(UnsupportedCapabilityError, match="checkpoint"):
+        run(
+            pipeline,
+            run_root=run_root,
+            only_stage="silver",
+            only_step="silver_summary",
+        )
 
-    assert calls.get("bronze_map", 0) == before_bronze
-    assert calls.get("silver_summary", 0) == before_silver + 1
+    assert calls.get("silver_summary", 0) == before_silver
 
 
-def test_missing_prior_output_under_selective_execution_raises_meaningful_error(
+def test_fail_closed_selective_error_is_meaningful_and_logged(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -510,26 +510,25 @@ def test_missing_prior_output_under_selective_execution_raises_meaningful_error(
     pipeline = _make_linear_pipeline()
 
     with caplog.at_level(logging.ERROR):
-        with pytest.raises(MissingPriorOutputError, match="Required prior output missing") as exc:
+        with pytest.raises(MissingPriorOutputError) as exc:
             run(pipeline, run_root=tmp_path, only_stage="silver")
 
+    assert isinstance(exc.value, UnsupportedCapabilityError)
     assert "stage='bronze'" in str(exc.value)
-    assert "path='" in str(exc.value)
+    assert "checkpoint" in str(exc.value)
     joined = "\n".join(record.getMessage() for record in caplog.records)
     assert "SELECTIVE FAILURE" in joined
-    assert "missing-prior-output" in joined
+    assert "checkpoint-capability-required" in joined
 
 
-def test_missing_prior_output_under_remote_selective_execution_raises_meaningful_error() -> None:
+def test_fail_closed_selective_error_on_remote_backend() -> None:
     from caravel.runner import run
 
     pipeline = _make_linear_pipeline()
     run_root = _memory_run_root("remote_missing_prior")
 
-    with pytest.raises(MissingPriorOutputError, match="Required prior output missing") as exc:
+    with pytest.raises(UnsupportedCapabilityError, match="stage='bronze'"):
         run(pipeline, run_root=run_root, only_stage="silver")
-
-    assert "memory://caravel/test_runner/remote_missing_prior" in str(exc.value)
 
 
 def test_invalid_selective_selector_logs_context_before_raise(
@@ -549,7 +548,7 @@ def test_invalid_selective_selector_logs_context_before_raise(
     assert "invalid-stage-selector" in joined
 
 
-def test_only_step_target_recomputes_when_output_already_exists(tmp_path: Path) -> None:
+def test_only_step_target_with_existing_output_still_fails_closed(tmp_path: Path) -> None:
     from caravel.runner import run
 
     calls: dict[str, int] = {}
@@ -558,14 +557,15 @@ def test_only_step_target_recomputes_when_output_already_exists(tmp_path: Path) 
     run(pipeline, run_root=tmp_path)
     before = calls.get("silver_summary", 0)
 
-    run(
-        pipeline,
-        run_root=tmp_path,
-        only_stage="silver",
-        only_step="silver_summary",
-    )
+    with pytest.raises(UnsupportedCapabilityError, match="checkpoint"):
+        run(
+            pipeline,
+            run_root=tmp_path,
+            only_stage="silver",
+            only_step="silver_summary",
+        )
 
-    assert calls.get("silver_summary", 0) == before + 1
+    assert calls.get("silver_summary", 0) == before
 
 
 def test_run_passes_custom_params_to_step_context(tmp_path: Path) -> None:
@@ -941,7 +941,7 @@ def test_runner_logs_step_start_end_with_dataset_describe_payload(
     joined = "\n".join(record.getMessage() for record in caplog.records)
     assert "STEP START" in joined
     assert "STEP END" in joined
-    assert "checkpoint_written" in joined
+    assert "checkpoint_written" not in joined
     assert "dataset" in joined
 
 
@@ -1005,11 +1005,11 @@ def test_selective_step_fails_when_required_prior_is_non_persistent(tmp_path: Pa
         stages=[Stage(name="bronze", entries=[step_1, step_2])],
     )
 
-    with pytest.raises(MissingPriorOutputError, match="non-persistent"):
+    with pytest.raises(UnsupportedCapabilityError, match="checkpoint"):
         run(pipeline, run_root=tmp_path, only_stage="bronze", only_step="step_2")
 
 
-def test_selective_step_loads_empty_persisted_partitioned_output(tmp_path: Path) -> None:
+def test_empty_partitioned_output_flows_in_memory_through_full_runs(tmp_path: Path) -> None:
     from caravel.runner import run
 
     calls = {"second": 0}
@@ -1028,15 +1028,18 @@ def test_selective_step_loads_empty_persisted_partitioned_output(tmp_path: Path)
         return {"count": len(partitions)}
 
     pipeline = Pipeline(
-        name="empty_partition_checkpoint",
+        name="empty_partition_flow",
         loader=_StubLoader({"a": {"id": "a"}}),
         stages=[Stage(name="bronze", entries=[step_1, step_2])],
     )
 
     run(pipeline, run_root=tmp_path)
-    run(pipeline, run_root=tmp_path, only_stage="bronze", only_step="step_2")
+    run(pipeline, run_root=tmp_path)
 
     assert calls["second"] == 2
+    empty_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_step_1"
+    assert empty_dir.exists()
+    assert list(empty_dir.iterdir()) == []
     output_file = tmp_path / pipeline.name / "_001_bronze" / "_002_step_2" / "_002_step_2.json"
     assert json.loads(output_file.read_text("utf-8")) == {"count": 0}
 
@@ -1110,3 +1113,365 @@ def test_branch_route_steps_support_mixed_persistence(tmp_path: Path) -> None:
     assert not (branch_root / "html" / "normalize_html").exists()
     assert (tmp_path / pipeline.name / "_001_bronze" / "_002_converge" / "j1.json").exists()
     assert (tmp_path / pipeline.name / "_001_bronze" / "_002_converge" / "h1.json").exists()
+
+
+class _MutableLoader:
+    name = "mutable_loader"
+
+    def __init__(self, partitions: dict[str, dict[str, object]]) -> None:
+        self.partitions = partitions
+
+    def load(self) -> dict[str, dict[str, object]]:
+        return self.partitions
+
+
+def _make_mutable_pipeline(loader: _MutableLoader, name: str = "data_safety") -> Pipeline:
+    @step(output=PartitionedJSONDataset(name="bronze_partitions"))
+    def bronze_map(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return {key: {**record, "mapped": True} for key, record in partitions.items()}
+
+    return Pipeline(
+        name=name,
+        loader=loader,
+        stages=[Stage(name="bronze", entries=[bronze_map])],
+    )
+
+
+def test_fewer_key_rerun_replaces_owned_step_directory(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    loader = _MutableLoader({"a": {"id": "a"}, "b": {"id": "b"}})
+    pipeline = _make_mutable_pipeline(loader)
+
+    run(pipeline, run_root=tmp_path)
+    loader.partitions = {"a": {"id": "a"}}
+    run(pipeline, run_root=tmp_path)
+
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json"]
+
+
+def test_fewer_key_rerun_replaces_owned_step_directory_on_memory_backend() -> None:
+    from caravel.runner import run
+
+    loader = _MutableLoader({"a": {"id": "a"}, "b": {"id": "b"}})
+    pipeline = _make_mutable_pipeline(loader, name="data_safety_memory")
+    run_root = _memory_run_root("fewer_key_replacement")
+
+    run(pipeline, run_root=run_root)
+    loader.partitions = {"a": {"id": "a"}}
+    run(pipeline, run_root=run_root)
+
+    fs, root = fsspec.core.url_to_fs(run_root)
+    bronze_dir = f"{root}/{pipeline.name}/_001_bronze/_001_bronze_map"
+    listed = sorted(str(path).rsplit("/", 1)[-1] for path in fs.ls(bronze_dir, detail=False))
+    assert listed == ["a.json"]
+
+
+def test_invalid_record_type_preserves_prior_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    loader = _MutableLoader({"a": {"id": "a"}, "b": {"id": "b"}})
+
+    @step(output=PartitionedJSONDataset(name="typed_output"))
+    def emit_typed(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = context
+        if len(partitions) == 1:
+            return {"a": {"id": "a"}, 2: {"id": "bad"}}
+        return dict(partitions)
+
+    pipeline = Pipeline(
+        name="prior_output_safety",
+        loader=loader,
+        stages=[Stage(name="bronze", entries=[emit_typed])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_emit_typed"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+    loader.partitions = {"a": {"id": "a"}}
+    with pytest.raises(TypeError, match="Partition key must be str"):
+        run(pipeline, run_root=tmp_path)
+
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+
+def test_invalid_partition_key_preserves_prior_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    loader = _MutableLoader({"a": {"id": "a"}, "b": {"id": "b"}})
+
+    @step(output=PartitionedJSONDataset(name="keyed_output"))
+    def emit_keyed(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, object]:
+        _ = context
+        if len(partitions) == 1:
+            return {"a": {"id": "a"}, "../escape": {"id": "bad"}}
+        return dict(partitions)
+
+    pipeline = Pipeline(
+        name="partition_key_safety",
+        loader=loader,
+        stages=[Stage(name="bronze", entries=[emit_keyed])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_emit_keyed"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+    loader.partitions = {"a": {"id": "a"}}
+    with pytest.raises(ValueError):
+        run(pipeline, run_root=tmp_path)
+
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+
+def test_unencodable_single_json_payload_preserves_prior_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    state = {"invalid": False}
+
+    @step(output=JSONDataset(name="json_output"))
+    def emit_json(partitions: object, *, context: object) -> object:
+        _ = partitions, context
+        if state["invalid"]:
+            return {"value": {"not-json-serializable"}}
+        return {"value": ["valid"]}
+
+    pipeline = Pipeline(
+        name="single_json_safety",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[emit_json])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    output_file = (
+        tmp_path / pipeline.name / "_001_bronze" / "_001_emit_json" / "_001_emit_json.json"
+    )
+    prior_bytes = output_file.read_bytes()
+
+    state["invalid"] = True
+    with pytest.raises(TypeError):
+        run(pipeline, run_root=tmp_path)
+
+    assert output_file.read_bytes() == prior_bytes
+
+
+def test_unencodable_partitioned_json_payload_preserves_prior_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    state = {"invalid": False}
+
+    @step(output=PartitionedJSONDataset(name="json_partitions"))
+    def emit_json_partitions(partitions: object, *, context: object) -> dict[str, object]:
+        _ = partitions, context
+        if state["invalid"]:
+            return {"a": {"value": {"not-json-serializable"}}}
+        return {"a": {"value": ["valid"]}, "b": {"value": ["also-valid"]}}
+
+    pipeline = Pipeline(
+        name="partitioned_json_safety",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[emit_json_partitions])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    output_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_emit_json_partitions"
+    prior_files = {path.name: path.read_bytes() for path in output_dir.iterdir()}
+
+    state["invalid"] = True
+    with pytest.raises(TypeError):
+        run(pipeline, run_root=tmp_path)
+
+    assert {path.name: path.read_bytes() for path in output_dir.iterdir()} == prior_files
+
+
+def test_failed_save_leaves_partial_output_that_full_runs_replace(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    class _InterruptibleDataset(PartitionedJSONDataset):
+        fail_after_first_write = False
+
+        def save(self, payload: object, dest: Path | str) -> None:
+            if not self.fail_after_first_write:
+                super().save(payload, dest)
+                return
+            self.validate_payload(payload)
+            first_key = next(iter(payload))  # type: ignore[arg-type]
+            super().save({first_key: payload[first_key]}, dest)  # type: ignore[index]
+            raise RuntimeError("injected save interruption")
+
+    dataset = _InterruptibleDataset(name="interruptible")
+
+    @step(output=dataset)
+    def pass_through(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return dict(partitions)
+
+    pipeline = Pipeline(
+        name="interrupted_save",
+        loader=_StubLoader({"a": {"id": "a"}, "b": {"id": "b"}}),
+        stages=[Stage(name="bronze", entries=[pass_through])],
+    )
+
+    dataset.fail_after_first_write = True
+    with pytest.raises(RuntimeError, match="injected save interruption"):
+        run(pipeline, run_root=tmp_path)
+
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_pass_through"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json"]
+
+    dataset.fail_after_first_write = False
+    run(pipeline, run_root=tmp_path)
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+
+
+def test_step_output_directories_contain_only_dataset_files(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    pipeline = _make_linear_pipeline()
+
+    run(pipeline, run_root=tmp_path)
+
+    bronze_dir = tmp_path / pipeline.name / "_001_bronze" / "_001_bronze_map"
+    silver_dir = tmp_path / pipeline.name / "_002_silver" / "_001_silver_summary"
+    assert sorted(p.name for p in bronze_dir.iterdir()) == ["a.json", "b.json"]
+    assert sorted(p.name for p in silver_dir.iterdir()) == ["_001_silver_summary.json"]
+
+
+def test_run_id_is_uuid4_hex_and_unique_per_run(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    captured: list[str] = []
+
+    @step(output=PartitionedJSONDataset(name="ctx_probe"))
+    def probe(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        captured.append(context.run_id)  # type: ignore[attr-defined]
+        return dict(partitions)
+
+    pipeline = Pipeline(
+        name="run_id_probe",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[Stage(name="bronze", entries=[probe])],
+    )
+
+    run(pipeline, run_root=tmp_path)
+    run(pipeline, run_root=tmp_path)
+
+    assert len(captured) == 2
+    first, second = captured
+    assert first != second
+    for value in captured:
+        assert len(value) == 32
+        assert value != tmp_path.name
+        int(value, 16)
+
+
+def test_step_after_branch_receives_merged_output(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="pre"), persist=False)
+    def pre_step(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return {key: {**record, "pre": True} for key, record in partitions.items()}
+
+    @step(output=PartitionedJSONDataset(name="left"), persist=False)
+    def tag_left(partitions: object, *, context: object) -> object:
+        _ = context
+        return {key: {**record, "route": "left"} for key, record in partitions.items()}  # type: ignore[union-attr]
+
+    @step(output=PartitionedJSONDataset(name="collect"))
+    def collect(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return dict(partitions)
+
+    branch = Branch(name="split", by="source", routes={"left": [tag_left]})
+    pipeline = Pipeline(
+        name="post_branch_flow",
+        loader=_StubLoader({"a": {"id": "a", "__source__": "left"}}),
+        stages=[Stage(name="bronze", entries=[pre_step, branch, collect])],
+    )
+
+    run(pipeline, run_root=tmp_path, keep_source_tag=True)
+
+    collect_dir = tmp_path / pipeline.name / "_001_bronze" / "_003_collect"
+    payload = json.loads((collect_dir / "a.json").read_text("utf-8"))
+    assert payload["route"] == "left"
+    assert payload["pre"] is True
+
+
+def test_full_run_crosses_stage_boundary_in_memory_with_non_persisted_terminal(
+    tmp_path: Path,
+) -> None:
+    from caravel.runner import run
+
+    @step(output=PartitionedJSONDataset(name="transient"), persist=False)
+    def transient_terminal(
+        partitions: dict[str, dict[str, object]], *, context: object
+    ) -> dict[str, dict[str, object]]:
+        _ = context
+        return {key: {**record, "transient": True} for key, record in partitions.items()}
+
+    @step(output=JSONDataset(name="final"))
+    def final(partitions: dict[str, dict[str, object]], *, context: object) -> dict[str, object]:
+        _ = context
+        return {
+            "count": len(partitions),
+            "transient": all(bool(record.get("transient")) for record in partitions.values()),
+        }
+
+    pipeline = Pipeline(
+        name="memory_stage_crossing",
+        loader=_StubLoader({"a": {"id": "a"}, "b": {"id": "b"}}),
+        stages=[
+            Stage(name="bronze", entries=[transient_terminal]),
+            Stage(name="silver", entries=[final]),
+        ],
+    )
+
+    run(pipeline, run_root=tmp_path)
+
+    final_file = tmp_path / pipeline.name / "_002_silver" / "_001_final" / "_001_final.json"
+    assert json.loads(final_file.read_text("utf-8")) == {"count": 2, "transient": True}
+    assert not (tmp_path / pipeline.name / "_001_bronze" / "_001_transient_terminal").exists()
+
+
+def test_non_dict_payload_cannot_cross_stage_boundary(tmp_path: Path) -> None:
+    from caravel.runner import run
+
+    @step(output=JSONDataset(name="summary"))
+    def summarize(partitions: dict[str, dict[str, object]], *, context: object) -> object:
+        _ = context
+        return ["not", "partitions"]
+
+    @step(output=JSONDataset(name="downstream"))
+    def downstream(partitions: object, *, context: object) -> object:
+        _ = context
+        return partitions
+
+    pipeline = Pipeline(
+        name="bad_stage_crossing",
+        loader=_StubLoader({"a": {"id": "a"}}),
+        stages=[
+            Stage(name="bronze", entries=[summarize]),
+            Stage(name="silver", entries=[downstream]),
+        ],
+    )
+
+    with pytest.raises(TypeError, match="must be dict partitions"):
+        run(pipeline, run_root=tmp_path)
