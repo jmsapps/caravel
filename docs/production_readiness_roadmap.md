@@ -20,6 +20,12 @@ ST-01 through ST-14 establish the core framework:
 This is enough for a working proof of concept. It is not yet enough to call the
 runner production-ready.
 
+C-6 delivers the hardened core, explicit first-party plugin profile, and local,
+`memory://`, and Azure technical qualification. C-7 owns the workload-specific
+ST-17 through ST-20 evidence: scale, target-runtime operations, security and
+retention approval, shadow parity, cutover, and rollback. Merging C-6 does not
+authorize a production workload before C-7 completes.
+
 Clean-checkout GitHub Actions cover supported Python versions with tests, ruff,
 formatting, strict mypy, package metadata, and a minimum-fsspec compatibility
 job as required gates.
