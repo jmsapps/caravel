@@ -31,7 +31,7 @@ from ..types import (
     UnsupportedCapabilityError,
     UnsupportedCheckpointVersionError,
 )
-from .api import CheckpointContext
+from .api import CheckpointContext, CheckpointReuse
 
 CHECKPOINT_SCHEMA_VERSION = 1
 _SCHEMA_DIRNAME = f"v{CHECKPOINT_SCHEMA_VERSION}"
@@ -311,7 +311,7 @@ class CheckpointPlugin:
 
     # -- CheckpointCapability ----------------------------------------------
 
-    def reuse_verdict(self, context: CheckpointContext, dataset: Dataset) -> bool:
+    def reuse_verdict(self, context: CheckpointContext, dataset: Dataset) -> bool | CheckpointReuse:
         """Bless a node's output as reusable only on verified committed evidence."""
         node = context.node
         if not self._supported_dataset(context, dataset):
@@ -341,7 +341,10 @@ class CheckpointPlugin:
         assert isinstance(dataset, CheckpointInspectableDataset)
         assert node.step_dir is not None
         dataset.verify_physical_output(node.step_dir, record["partition_keys"])
-        return True
+        return CheckpointReuse(
+            reusable=True,
+            committed_empty=record["partition_keys"] == [],
+        )
 
     def before_replacement(self, context: CheckpointContext, dataset: Dataset) -> None:
         """Invalidate prior evidence and confirm absence before output replacement."""

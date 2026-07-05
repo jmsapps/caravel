@@ -22,7 +22,11 @@ from typing import Any, Callable, Mapping, NoReturn, Sequence
 
 from .logger import get_logger
 from .branch import Branch
-from .datasets import CheckpointLoadableDataset, ValidatedDataset
+from .datasets import (
+    CheckpointLoadableDataset,
+    CommittedEmptyLoadableDataset,
+    ValidatedDataset,
+)
 from .paths import (
     format_stage_dir,
     format_step_dir,
@@ -39,6 +43,7 @@ from .plan import _normalize_route_step as _plan_normalize_route_step
 from .plugins import (
     CheckpointCapability,
     CheckpointContext,
+    CheckpointReuse,
     NodeFacts,
     OwnershipContext,
     PlanOutput,
@@ -671,14 +676,34 @@ def execute(execution_plan: ExecutionPlan) -> RunResult:
             facts = _node_facts(bound)
             context = CheckpointContext(run=run_facts, node=facts)
             dataset = bound.step.output
-            if not checkpoint.reuse_verdict(context, dataset):
+            verdict = checkpoint.reuse_verdict(context, dataset)
+            if isinstance(verdict, CheckpointReuse):
+                reusable = verdict.reusable
+                committed_empty = verdict.committed_empty
+            elif isinstance(verdict, bool):
+                reusable = verdict
+                committed_empty = False
+            else:
+                raise TypeError(
+                    "Checkpoint reuse_verdict() must return bool or CheckpointReuse, "
+                    f"got {type(verdict).__name__}."
+                )
+            if not reusable:
                 raise MissingPriorOutputError(
                     "Checkpoint capability found no committed evidence for "
                     f"stage='{facts.stage_name}' step='{facts.name}'; the "
                     "required prior output must be recomputed."
                 )
-            assert isinstance(dataset, CheckpointLoadableDataset)
-            payloads[f"node:{node_id}"] = dataset.load_from(bound.step_dir)
+            if committed_empty:
+                if not isinstance(dataset, CommittedEmptyLoadableDataset):
+                    raise UnsupportedCapabilityError(
+                        f"Dataset '{facts.dataset_type}' cannot reconstruct a "
+                        "checkpoint-proven empty output."
+                    )
+                payloads[f"node:{node_id}"] = dataset.load_committed_empty()
+            else:
+                assert isinstance(dataset, CheckpointLoadableDataset)
+                payloads[f"node:{node_id}"] = dataset.load_from(bound.step_dir)
             _emit("node_skipped", node=facts)
 
     def _execute_step_node(node: BoundNode, step_input: Any) -> Any:

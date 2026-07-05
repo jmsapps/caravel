@@ -50,6 +50,8 @@ at `tests/qualification/test_azure_profile.py` verifies these behaviors on a
 unique Azure prefix:
 
 - checkpoint-backed selective execution and sanitized run events;
+- reconstruction of checkpoint-proven empty partitioned output when Azure
+  preserves no empty directory;
 - interruption after checkpoint invalidation followed by safe recovery;
 - malformed checkpoint evidence failing closed;
 - ownership pruning of a removed output;

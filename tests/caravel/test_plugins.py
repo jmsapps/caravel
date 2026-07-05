@@ -14,6 +14,7 @@ from caravel.datasets import JSONDataset, PartitionedJSONDataset
 from caravel.pipeline import Pipeline, Stage, step
 from caravel.plugins import (
     CheckpointContext,
+    CheckpointReuse,
     PluginFailureError,
     RunEvent,
     RunFacts,
@@ -98,6 +99,11 @@ class FakeCheckpointPlugin:
         self.calls.append(f"commit:{context.node.node_id}")
         assert context.node.step_dir is not None
         self.evidence[context.node.node_id] = context.node.step_dir
+
+
+def test_committed_empty_reuse_must_be_reusable() -> None:
+    with pytest.raises(ValueError, match="must be reusable"):
+        CheckpointReuse(reusable=False, committed_empty=True)
 
 
 def _linear_pipeline(loader: _StubLoader, calls: dict[str, int]) -> Pipeline:

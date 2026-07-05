@@ -89,6 +89,24 @@ class CheckpointContext:
 
 
 @dataclass(frozen=True)
+class CheckpointReuse:
+    """A checkpoint capability's decision about one historical output.
+
+    Boolean verdicts remain supported for compatibility. The structured form
+    additionally identifies a committed-empty partitioned output, whose
+    payload must be reconstructed through the declared Dataset because some
+    object stores do not preserve empty directories.
+    """
+
+    reusable: bool
+    committed_empty: bool = False
+
+    def __post_init__(self) -> None:
+        if self.committed_empty and not self.reusable:
+            raise ValueError("A committed-empty checkpoint must be reusable.")
+
+
+@dataclass(frozen=True)
 class RunOutcome:
     """Terminal outcome facts handed to run guards at exit."""
 
@@ -182,11 +200,15 @@ class CheckpointCapability(Protocol):
 
     and consults ``reuse_verdict`` before loading output of a node it does not
     execute. Only this capability may bless output as reusable; a verdict of
-    ``False`` means the output must be recomputed. The capability never calls
-    user code, never saves datasets, and never mutates the plan.
+    ``False`` means the output must be recomputed. A structured
+    ``CheckpointReuse`` may additionally report committed-empty output. The
+    capability never calls user code, never saves datasets, and never mutates
+    the plan.
     """
 
-    def reuse_verdict(self, context: CheckpointContext, dataset: Dataset) -> bool: ...
+    def reuse_verdict(
+        self, context: CheckpointContext, dataset: Dataset
+    ) -> bool | CheckpointReuse: ...
 
     def before_replacement(self, context: CheckpointContext, dataset: Dataset) -> None: ...
 

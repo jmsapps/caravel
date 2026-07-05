@@ -50,6 +50,13 @@ class CheckpointLoadableDataset(Protocol):
 
 
 @runtime_checkable
+class CommittedEmptyLoadableDataset(Protocol):
+    """Dataset contract for reconstructing checkpoint-proven empty output."""
+
+    def load_committed_empty(self) -> Any: ...
+
+
+@runtime_checkable
 class CheckpointInspectableDataset(Protocol):
     """Structural contract for physical-output inspection by a checkpoint plugin.
 
@@ -270,6 +277,14 @@ class PartitionedJSONDataset:
 
         return loaded
 
+    def load_committed_empty(self) -> dict[str, Any]:
+        """Reconstruct an empty payload proven committed by checkpoint evidence."""
+        if not self.allow_empty:
+            raise CheckpointIntegrityError(
+                f"Dataset '{self.name}' no longer permits the committed-empty output."
+            )
+        return {}
+
     def validate_payload(self, payload: Any) -> None:
         _validate_partitioned_payload(
             payload,
@@ -434,6 +449,14 @@ class PartitionedTextDataset:
 
         return loaded
 
+    def load_committed_empty(self) -> dict[str, str]:
+        """Reconstruct an empty payload proven committed by checkpoint evidence."""
+        if not self.allow_empty:
+            raise CheckpointIntegrityError(
+                f"Dataset '{self.name}' no longer permits the committed-empty output."
+            )
+        return {}
+
     def validate_payload(self, payload: Any) -> None:
         _validate_partitioned_payload(
             payload,
@@ -591,6 +614,14 @@ class PartitionedBytesDataset:
                 loaded[key] = bytes(handle.read())
 
         return loaded
+
+    def load_committed_empty(self) -> dict[str, bytes]:
+        """Reconstruct an empty payload proven committed by checkpoint evidence."""
+        if not self.allow_empty:
+            raise CheckpointIntegrityError(
+                f"Dataset '{self.name}' no longer permits the committed-empty output."
+            )
+        return {}
 
     def validate_payload(self, payload: Any) -> None:
         _validate_partitioned_payload(

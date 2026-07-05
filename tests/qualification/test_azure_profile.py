@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import pytest
 
 from caravel import (
+    Branch,
     JSONDataset,
     MissingPriorOutputError,
     PartitionedJSONDataset,
@@ -120,7 +121,7 @@ def _pipeline(
             return {"../escape": {"unsafe": True}}
         return {key: {**value, "mapped": True} for key, value in partitions.items()}
 
-    entries: list[Step] = [
+    entries: list[Step | Branch | Callable[..., Any]] = [
         Step(
             fn=map_records,
             name="map_records",
@@ -188,6 +189,44 @@ def test_full_selective_events_and_normal_lease_cleanup(
             event_payloads.append(json.load(handle))
     kinds = {event["kind"] for event in event_payloads}
     assert {"run_started", "node_skipped", "node_completed", "run_completed"} <= kinds
+
+
+def test_empty_checkpoint_reuses_without_a_durable_directory(
+    azure_root: str, azure_options: Mapping[str, Any]
+) -> None:
+    case = join_path(azure_root, "committed-empty")
+    output = join_path(case, "output")
+    metadata = join_path(case, "metadata")
+    pipeline_name = "azure_committed_empty"
+    pipeline = _pipeline(pipeline_name, _SeedLoader({}), azure_options)
+    checkpoint = CheckpointPlugin(metadata_root=metadata, storage_options=azure_options)
+
+    run(pipeline, run_root=output, plugins=[checkpoint])
+    record = checkpoint.read_record("stage-001-entry-001")
+    assert record is not None
+    assert record["partition_keys"] == []
+
+    empty_dir = join_path(output, pipeline_name, "_001_bronze", "_001_map_records")
+    fs, resolved_empty_dir = resolve_fs(empty_dir, azure_options)
+    if fs.exists(resolved_empty_dir):
+        fs.rm(resolved_empty_dir, recursive=True)
+    assert not _exists(empty_dir, azure_options)
+
+    run(
+        pipeline,
+        run_root=output,
+        only_stage="bronze",
+        only_step="summarize",
+        plugins=[checkpoint],
+    )
+    summary_path = join_path(
+        output,
+        pipeline_name,
+        "_001_bronze",
+        "_002_summarize",
+        "_002_summarize.json",
+    )
+    assert _read_json(summary_path, azure_options) == {"count": 0}
 
 
 def test_interrupted_replacement_invalidates_then_recovers(

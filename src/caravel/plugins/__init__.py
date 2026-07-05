@@ -1,6 +1,7 @@
 from .api import (
     CheckpointCapability,
     CheckpointContext,
+    CheckpointReuse,
     EventKind,
     NodeFacts,
     ObserverCriticality,
@@ -49,6 +50,7 @@ __all__ = [
     "LEASE_SCHEMA_VERSION",
     "CheckpointCapability",
     "CheckpointContext",
+    "CheckpointReuse",
     "CheckpointPlugin",
     "EventKind",
     "LeaseError",

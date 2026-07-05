@@ -324,9 +324,32 @@ def test_empty_partitioned_checkpoint_round_trips_without_sentinel(tmp_path: Pat
     assert record["count"] == 0
     bronze_dir = _pipeline_root(tmp_path / "runs") / "_001_bronze" / "_001_bronze_map"
     assert list(bronze_dir.iterdir()) == []
+    bronze_dir.rmdir()  # Simulate an object store that preserves no empty directory.
 
     run(pipeline, run_root=tmp_path / "runs", only_stage="silver", plugins=[plugin])
     assert _silver_payload(tmp_path / "runs") == {"count": 0}
+
+
+def test_committed_empty_reuse_rejects_allow_empty_declaration_change(tmp_path: Path) -> None:
+    loader = _SeedLoader({})
+    plugin = _plugin(tmp_path)
+    run(
+        _make_pipeline(loader, bronze_allow_empty=True),
+        run_root=tmp_path / "runs",
+        plugins=[plugin],
+    )
+
+    bronze_dir = _pipeline_root(tmp_path / "runs") / "_001_bronze" / "_001_bronze_map"
+    bronze_dir.rmdir()
+    changed_pipeline = _make_pipeline(loader, bronze_allow_empty=False)
+
+    with pytest.raises(CheckpointIntegrityError, match="no longer permits"):
+        run(
+            changed_pipeline,
+            run_root=tmp_path / "runs",
+            only_stage="silver",
+            plugins=[plugin],
+        )
 
 
 def test_stage_root_output_is_checked_from_plugin_metadata(tmp_path: Path) -> None:
@@ -806,5 +829,12 @@ def test_empty_partitioned_checkpoint_round_trips_on_memory() -> None:
     record = plugin.read_record(BRONZE_NODE_ID)
     assert record is not None
     assert record["count"] == 0
+
+    import fsspec
+
+    fs = fsspec.filesystem("memory")
+    bronze_dir = f"{base.removeprefix('memory://')}/runs/ckpt_demo/_001_bronze/_001_bronze_map"
+    if fs.exists(bronze_dir):
+        fs.rm(bronze_dir, recursive=True)
 
     run(pipeline, run_root=f"{base}/runs", only_stage="silver", plugins=[plugin])
