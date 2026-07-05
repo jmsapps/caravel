@@ -430,8 +430,12 @@ a loadable artifact for an empty partitioned output on object stores. These
 behaviors require explicitly configured application plugins. Interrupted runs
 may leave partial output; bare core never reuses it—a full rerun replaces it.
 
-The framework is currently suitable for local development, examples, smoke
-tests, and non-critical internal runs.
+Caravel is ready to try on real deterministic batch pipelines. Start with the
+bare core for the simplest experience, then opt into checkpoints, ownership,
+run evidence, and lease diagnostics as your operational needs grow. For a
+critical workload, qualify its actual data volume, backend, scheduler, and
+rollback path; the included production profile and Azure workflow provide a
+concrete starting point.
 
 ## Contributing
 
