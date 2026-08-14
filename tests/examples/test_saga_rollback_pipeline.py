@@ -20,6 +20,7 @@ def _read(path: Path) -> dict[str, Any]:
 def test_successful_saga_commits_business_actions(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     journal_path = tmp_path / "journal.json"
+    order = _read(repo_root / "examples" / "saga_rollback" / "data" / "order.json")
 
     run_saga_pipeline(
         run_root=tmp_path / "runs",
@@ -29,7 +30,7 @@ def test_successful_saga_commits_business_actions(tmp_path: Path) -> None:
 
     assert _read(state_path) == {
         "account_balance": 75,
-        "available_inventory": 8,
+        "available_inventory": 10 - int(order["quantity"]),
         "shipments": ["shipment-order-001"],
     }
     assert _read(journal_path)["status"] == "committed"

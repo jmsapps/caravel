@@ -1,0 +1,5 @@
+{
+  "document_id": "handbook",
+  "text": "Caravel runs deterministic pipelines and saga guards compensate external state.",
+  "version": "v2"
+}
