@@ -1,6 +1,6 @@
 # Durable partition execution
 
-Status: proposed. This document defines durable execution requirements, not existing behavior.
+Status: proposed. This document defines the target durable execution contract.
 
 ## Objective
 
@@ -14,7 +14,7 @@ batches become available immediately for incremental consumption; consumers may
 instead wait for a durable job completion marker and read the full result.
 
 The core abstraction is a batch/cursor interface backed by durable progress and
-durable batch output. No separate orchestration wrapper is required. A scheduler,
+durable batch output, integrated into the runner. A scheduler,
 queue, or caller is responsible for invoking work again when necessary.
 
 ## Scope
@@ -113,23 +113,8 @@ migration guidance for affected declarations, plugins, datasets, and stored stat
 Existing state must either be migrated with validated semantics or rejected with
 clear instructions; it must never be silently interpreted under a new contract.
 
-The interfaces and integration choices below express required behavior and a
-proposed design. They do not prescribe retaining the current implementation
-boundaries. Initial topology and delivery limits bound the first release's scope,
-not the architectural changes permitted to achieve it.
-
-## Current implementation baseline
-
-Caravel executes ordered stages and steps with optional branching. Its existing
-`CheckpointPlugin` records committed persisted node outputs and enables selective
-execution to load outputs from skipped nodes. These are whole-node checkpoints;
-they contain no cursor for work inside a node.
-
-The current `_persist_step_output` path validates payloads and replaces the owned
-step directory before saving built-in dataset output. Reusing that path for each
-batch would delete prior batch results. Resumable execution therefore requires a
-distinct persistence path and explicit runner integration. Existing checkpoint
-callbacks alone cannot implement this feature.
+The interfaces below express the target behavior. Implementation boundaries may
+change to meet it. Initial topology and delivery limits define release scope.
 
 ## Execution model
 
@@ -152,6 +137,38 @@ flowchart LR
 Each arrow requires that partition's preceding step to commit, not completion of
 other partitions. A single worker may process partition 1 through every step
 before starting partition 2; independent partitions may also run concurrently.
+
+### Execution partitions, datasets, and stages
+
+An execution partition is a stable scheduling and recovery identity. Dataset
+types define payload serialization and loading independently of that identity.
+`JSONDataset` and `TextDataset` can persist each execution partition's output,
+just as partitioned dataset types can. A partitioned storage format is not a
+prerequisite for durable execution or concurrency.
+
+| Concern | Responsibility |
+| --- | --- |
+| Execution partition | Identifies independently scheduled input and tracks its step progress. |
+| Dataset | Serializes and loads the payload of a committed work unit. |
+| Manifest | Maps execution identities to committed output references and dataset metadata. |
+| Stage | Groups and orders step declarations across the pipeline. |
+
+For example, a source may expose 100 documents as 100 execution partitions; each
+step may write one JSON or text artifact for each document. A single JSON or text
+file is one execution partition by default. Explicit source adapters may split
+its contents into stable replayable units when the format permits it. Dataset
+selection alone performs no automatic record splitting.
+
+Each dataset write targets an isolated work-unit attempt location. Dataset-owned
+replacement is confined to that location and preserves other units' artifacts.
+Manifest-backed readers reconstruct committed output using each reference's
+dataset metadata, including when a payload itself uses a partitioned format.
+Storage partition keys inside such a payload and execution partition IDs occupy
+distinct namespaces.
+
+Stages are organizational boundaries, with partition dependencies continuing
+across stage boundaries. A partition can enter the next stage while others are
+still in earlier stages. Whole-run waiting is expressed by `input_scope="all"`.
 
 ```mermaid
 flowchart LR
@@ -198,9 +215,8 @@ Names below are illustrative; implementation must preserve the semantics.
 
 ### Unified step and batching defaults
 
-Every step executes durable work units using the same commit and recovery model.
-There is no separate `ResumableStep` declaration. Durability is the execution
-foundation. The default recovery boundary is a partition–step pair; batching
+Every `Step` executes durable work units using the same commit and recovery model.
+The default recovery boundary is a partition–step pair; batching
 provides finer recovery within that pair.
 
 | Configuration | Work and recovery boundary |
@@ -266,6 +282,199 @@ Invocation limits may include a maximum batch count or record count alongside th
 time budget. A yielded invocation retains no required in-memory continuation
 state; total job size does not determine the producer's working memory.
 
+## Illustrative Python usage
+
+These examples describe the proposed developer experience, not runnable current
+Caravel APIs. Imports, constructors, and processor signatures are illustrative.
+`application.*` functions and adapters are supplied by the application; Caravel
+owns execution and progress. The examples use a generic document index as one
+possible destination, without adding domain-specific behavior to the library.
+
+### A simple pipeline and progressive partition output
+
+```python
+from caravel import Pipeline, Stage, Step
+from application.documents import enrich, load, sync_index
+
+pipeline = Pipeline(
+    name="documents",
+    stages=[
+        Stage(name="prepare", entries=[Step(load), Step(enrich)]),
+        Stage(name="publish", entries=[Step(sync_index)]),
+    ],
+)
+```
+
+Every step defaults to `input_scope="partition"` and `batch_size=None`. With a
+partitioned source, the default single worker can execute:
+
+```text
+partition A: load ✓ → enrich ✓ → sync_index ✓   # visible in destination
+partition B: load ✓ → enrich ✗                  # invocation fails
+
+next invocation, same job:
+partition A: already complete
+partition B: restore load output → enrich → sync_index
+partition C: load → enrich → sync_index
+```
+
+Without declared partitions, the input is one partition and each entire function
+call is a recovery unit. The runner does not infer how to split the function.
+
+### Snapshot execution across short invocations
+
+```python
+from caravel import ExecutionBudget, SnapshotInput, run
+
+result = run(
+    pipeline,
+    pipeline_id="customer-42/documents",
+    job_id="snapshot-2026-11-11-v7",
+    source=SnapshotInput(
+        adapter=document_source,
+        snapshot="v7",                  # immutable, adapter-defined identity
+    ),
+    progress=durable_store,
+    output=durable_output,
+    budget=ExecutionBudget(seconds=50, shutdown_margin_seconds=5),
+)
+
+if result.status == "yielded":
+    scheduler.enqueue(job_id=result.job_id)  # application-owned reinvocation
+```
+
+The scheduler passes the same job identity and configuration to every invocation,
+including after a hard kill that produced no result. Completed work is restored
+from durable storage. A changed `v7` input fails validation rather than silently
+reading a newer version. Neither storage location may be ephemeral local disk
+when invocations run on different hosts.
+
+### Incremental updates use the same pipeline
+
+```python
+from caravel import IncrementalInput, run
+
+# Application orchestration resolves one durable active job for this lineage.
+# Retry that job until completed; allocate the next job only afterward.
+result = run(
+    pipeline,
+    pipeline_id="customer-42/document-changes",
+    job_id=active_job_id,
+    source=IncrementalInput(
+        adapter=document_changes,
+        max_events=1_000,                # bound this run, not the whole stream
+    ),
+    progress=durable_store,
+    output=durable_output,
+    budget=invocation_budget,
+)
+
+if result.status == "yielded":
+    scheduler.enqueue(job_id=result.job_id)
+elif result.status == "completed":
+    scheduler.request_next_range(pipeline_id=result.pipeline_id)
+elif result.status == "caught_up":
+    scheduler.poll_later(pipeline_id=result.pipeline_id)
+```
+
+Caravel selects and persists the range before processing; retrying its job ID
+reuses those exact bounds. A document update arriving afterward is processed in a
+later range. Change envelopes carry entity keys, operations, and source revisions
+through the same steps. The application's index adapter applies version-aware
+upserts/deletes, including cleanup of obsolete derived records. `completed`
+finishes one range; `caught_up` means the live source currently has no new range.
+
+### Whole-dataset work is an explicit barrier
+
+```python
+def summarize(dataset, context):
+    # Reader over committed partition references, not one giant in-memory list.
+    return {"records": sum(partition.count for partition in dataset.partitions())}
+
+pipeline = Pipeline(
+    name="documents-with-summary",
+    stages=[
+        Stage(name="prepare", entries=[Step(load), Step(enrich)]),
+        Stage(name="publish", entries=[Step(sync_index)]),
+        Stage(
+            name="summary",
+            entries=[Step(summarize, input_scope="all")],
+        ),
+    ],
+)
+
+```
+
+Publishing remains progressive. The summary waits for every required partition
+and sealed upstream production. For incremental input, it summarizes this run's
+change output; a full current-state summary requires an application-provided
+materialized view.
+
+### Choose recovery granularity and reuse one retry policy
+
+```python
+from caravel import RetryPolicy, retry
+from application.errors import VendorError
+
+default_retry = RetryPolicy()            # 3 retries, exponential backoff + jitter
+
+def retryable(failure):
+    error = failure.exception
+    return (
+        default_retry.should_retry(failure)
+        or isinstance(error, VendorError) and error.code == "TEMPORARILY_BUSY"
+    )
+
+vendor_retry = RetryPolicy(when=retryable)
+
+# Retry only a record operation inside the batch.
+def enrich_batch(records, context):
+    return [
+        retry(
+            lambda: enrich_record(record),
+            policy=vendor_retry,
+            context=context,             # shares deadline and any retry budget
+        )
+        for record in records
+    ]
+
+record_retry_step = Step(enrich_batch, batch_size=100)  # no outer retry enabled
+
+# Alternatively, retry the batch as a whole, using a processor without inner retries.
+def enrich_without_inner_retry(records, context):
+    return [enrich_record(record) for record in records]
+
+batched_step = Step(enrich_without_inner_retry, batch_size=100, retry=vendor_retry)
+per_record_commit_step = Step(
+    enrich_without_inner_retry, batch_size=1, retry=vendor_retry
+)
+```
+
+These are alternative configurations. A batch-enabled step requires a replayable
+batch reader over its selected input scope. Batch processors receive a collection,
+including a one-record collection when size is 1. With size 100, record retry
+success remains in memory until the batch commits: termination
+can repeat those records. Size 1 gives each record a durable commit boundary.
+Applications can also match explicit error text through the failure context;
+default classification does not guess from arbitrary messages.
+
+### Optional parallel workers
+
+```python
+from caravel import ExecutionPolicy, LeasePolicy
+
+# Pass this policy to run() only when the backend supports atomic fenced claims.
+execution = ExecutionPolicy(
+    workers=4,
+    leases=LeasePolicy(ttl_seconds=60, heartbeat_seconds=10),
+)
+```
+
+Workers claim eligible partition–step pairs; different partitions may advance
+concurrently while each partition retains dependency order. A stale worker cannot
+commit after takeover. Destination writes still require replay-safe/version-aware
+semantics. A single-worker-only release rejects this configuration explicitly.
+
 ## Durable state and identity
 
 Progress is namespaced by job ID, node ID, and partition ID, outside directories subject to
@@ -274,6 +483,7 @@ ordinary step replacement or stage cleanup.
 Durable state includes:
 
 - Schema version, pipeline ID, job ID, partition ID, node ID, and generation.
+- Ownership identity, claim epoch/fencing token, and applicable lease expiry.
 - Source mode, snapshot identity or bounded source-position range, discovery
   position, and pipeline completed-range checkpoint.
 - Explicit step revision, pipeline declaration identity, input version/event metadata,
@@ -288,19 +498,47 @@ Code, source, parameters, or output identity mismatches fail before processing o
 mutation. Revision checks are explicit; automatic Python code hashing is not a
 correctness guarantee. Restarting with a new job ID begins separate work.
 
-State must survive host replacement. A local store is suitable only when the
-filesystem itself survives invocations and provides the required atomicity.
-Remote stores must provide conditional writes or transactions. Generic `fsspec`
-access alone does not establish these guarantees. Unsupported backends fail
-configuration validation rather than silently weakening correctness.
+### Authoritative storage contract
+
+One authoritative progress store owns the durable execution state machine.
+Before runner implementation, define its concrete schema, transition table,
+transaction boundaries, isolation, durability settings, and supported deployment
+envelope. Every backend implements that same contract.
+
+Validate required capabilities before user execution, cleanup, or durable mutation:
+atomic conditional state transitions, generation and fencing validation, durable
+reads, and transactional metadata publication. Generic `fsspec` access establishes
+none of these capabilities. Reject unsupported metadata backends explicitly;
+artifact storage is independently configured and validated for durable immutable
+writes and reads.
+
+State must survive host replacement. Local storage qualifies only when its
+filesystem survives invocations and supplies the declared transactional guarantees.
+Ownership epochs and fencing checks are foundational schema and commit features,
+including single-worker deployments. Concurrent scheduling uses those same fields.
+
+| Transition | Atomic authoritative state change |
+| --- | --- |
+| Register discovery | Publish replayable partition inputs and advance discovery position together. |
+| Commit batch | Validate ownership/fence/generation, publish immutable output references, and advance batch progress together. The partition–step remains open. |
+| Seal partition–step | Validate exhausted input and committed batches, then seal completion and establish dependent eligibility together. |
+| Complete job | Validate sealed production and all required work, seal output manifests, and publish job completion together. For incremental runs, advance the completed-range checkpoint in the same transaction. |
+
+Dependent eligibility is derived from authoritative committed state or maintained
+as an index in the sealing transaction. A durable bounded eligible-work query
+supports restart without scanning every partition. Successful batch publication
+and partition–step sealing are distinct state transitions, even when an
+implementation combines them in one transaction after validating end of input.
+An all-input barrier becomes eligible only under its input-scope contract.
 
 ## Batch commit protocol
 
 1. Read committed state and its generation.
 2. Read and process the batch at the committed cursor.
 3. Write output to a unique immutable attempt location and verify persistence.
-4. Atomically publish a new progress record referencing that output and the next
-   cursor, conditional on the generation still matching.
+4. In one authoritative transaction, validate current ownership, fencing token,
+   applicable lease expiry, and expected generation; publish the batch's manifest
+   reference and advance its cursor/progress together.
 5. Only after publication, regard the batch as complete and continue.
 
 ```mermaid
@@ -318,7 +556,7 @@ sequenceDiagram
     F-->>R: Output
     R->>O: Persist immutable attempt output
     O-->>R: Verified output reference
-    R->>P: Conditional commit of reference and next cursor
+    R->>P: Commit reference and progress with ownership, fence, generation checks
     P-->>R: New generation
     Note over R,P: Batch is now committed
 ```
@@ -517,10 +755,9 @@ producer commits or prevent other consumers from progressing.
 
 ## Pipeline and output integration
 
-Downstream partition-scoped steps become eligible when their upstream partition
-commits. Destination publication, such as index sync, is a normal pipeline step;
-incremental delivery requires no independent consumer service. External consumers
-may still use the committed feed.
+Destination publication, such as index sync, is a normal partition-scoped step.
+External consumers may also use the committed feed. Dependency readiness follows
+the input-scope contract.
 
 Finalization seals the existing manifest without combining the entire job output
 in memory or copying all batches within one invocation.
@@ -530,12 +767,9 @@ commits, enrichment output is restored and only uncommitted embedding work repea
 All-input dependencies follow the barrier contract above. Processor calls must
 fit their runtime and memory limits.
 
-The runner must restore completed upstream outputs across invocations rather than
-replaying completed ordinary steps. Existing `CheckpointPlugin` evidence may be
-used for ordinary persisted boundaries. Reject configurations with required
-cross-invocation upstream outputs that lack durable completion evidence or are
-in-memory only. A yielded result must propagate through the runner without marking
-the active node or pipeline complete.
+Required cross-invocation upstream outputs need durable completion evidence and
+loadable artifacts. Configuration validation rejects in-memory-only dependencies.
+A yielded result preserves the active work unit and pipeline's incomplete status.
 
 The initial durable topology is ordered stages with partition-scoped and all-input
 steps. Cross-invocation execution inside branches
@@ -544,11 +778,10 @@ Single-invocation branch execution must have explicit supported behavior and
 migration guidance if its execution contract changes.
 
 Validate cleanup and path ownership before mutation: `clean_dirs` or output
-replacement must never erase active progress or committed batch data. Ordinary
-datasets must have explicit replacement semantics distinct from batch publication.
-Batch progress and whole-node completion must have clearly defined ownership;
-the existing checkpoint capability may be adapted or replaced to support that
-contract.
+replacement must preserve active progress and committed batch data. Whole-output
+replacement and batch publication have explicit persistence contracts. The runner
+and progress store own work-unit commits and node completion; checkpoint reuse
+uses the same authoritative evidence.
 
 ## Failure and concurrency requirements
 
@@ -558,15 +791,16 @@ contract.
 | During output write | Ignore partial uncommitted output and replay. |
 | After output persistence, before progress publication | Replay; previous attempt output remains invisible. |
 | After progress publication, before receiving acknowledgment | Discover the commit and continue without committing that batch twice. |
-| During partition finalization | Retry idempotently; published batches remain readable, while that partition's next step waits for completion. |
+| During partition sealing/dependency activation | Recover either the unsealed state or sealed completion with valid dependent eligibility; retry idempotently. |
+| During job completion/incremental checkpoint advancement | Recover either the incomplete job with its prior lineage checkpoint or the completed job with its advanced checkpoint. |
 | After consumer destination write, before acknowledgment | Replay that consumer's batch safely without changing producer progress. |
 | Two invocations read the same generation | At most one conditional commit succeeds; loser reloads or exits with a conflict. |
 | State or committed output is corrupt/missing | Fail explicitly; never silently skip work or reset the cursor. |
 
 Single-worker execution is the default. Concurrent workers require an explicit
 lease policy for eligible partition–step work: atomic claims, expiry, heartbeat
-renewal, takeover, and increasing fencing tokens. Publication atomically validates
-the current claim, fencing token, and expected state generation. Independent
+renewal, takeover, and increasing fencing tokens, using the authoritative storage
+contract. Independent
 partitions may run concurrently while dependent steps retain partition order.
 Lease storage must support the required atomic operations.
 
@@ -581,8 +815,10 @@ Verification must demonstrate:
 
 1. A job spans several short invocations and produces the same logical output as
    uninterrupted execution, without reprocessing committed batches.
-2. Fault injection at every commit boundary preserves committed output and resumes
-   from authoritative progress, including a lost publication acknowledgment.
+2. Process termination before and after discovery, batch publication, partition
+   sealing, dependency activation, job completion, and incremental checkpoint
+   advancement preserves the authoritative transaction invariants. Include lost
+   acknowledgments, durable reopen, and rejection of stale fenced commits.
 3. Concurrent invocations cannot overwrite committed batch output or advance from
    stale state; external-effect idempotency is tested separately where applicable.
 4. Budget exhaustion yields before another batch starts; a hard kill replays only
@@ -593,8 +829,10 @@ Verification must demonstrate:
    before user processing or cleanup.
 7. Completed partition–step pairs survive continuation. A partition reaches later
    steps before other partitions finish ingestion. Finalization remains bounded.
-8. Cleanup cannot erase progress or committed batches; unsupported storage
-   atomicity and unsupported branch placement fail during validation.
+8. Cleanup preserves progress and committed batches. Unsupported storage
+   capabilities and branch placement fail before execution or mutation. Every
+   supported backend proves the authoritative storage contract through real
+   transaction and crash tests, including single-worker fencing.
 9. Supported ordinary pipelines and selective execution have regression coverage.
    Any changed public or storage contracts have migration guidance and explicit
    compatibility validation; incompatible stored state is never silently reused.
@@ -637,19 +875,9 @@ Verification must demonstrate:
 22. Empty live input returns caught-up status; later arrivals remain processable.
     Retention gaps fail explicitly. Incremental all-input barriers operate over
     bounded ranges, and change output is distinguished from full snapshot output.
-
-## Delivery boundary
-
-The smallest complete implementation includes snapshot and incremental source
-contracts, bounded range selection and durable pipeline checkpoints, the unified durable step model,
-partition flow and all-input barriers,
-batch source/sink contracts, a durable conditional progress store, runner yield
-propagation, a readable committed-batch feed with sealed manifests and durable job
-completion, the shared retry policy/utility, and crash-recovery, retry, and
-consumer-continuation tests. Include an example consumer that persists its own
-position and applies batches idempotently, plus examples applying the same retry
-policy at batch and record boundaries.
-Automatic reinvocation adapters, destination-specific connectors, notification
-delivery, multi-worker execution, branch continuation, and garbage collection
-tooling can follow independently. Multi-worker execution includes the mandatory
-lease and fencing contract; the initial release may enforce single-worker mode.
+23. JSON, text, and partitioned datasets persist execution-unit output with isolated
+    replacement, correct manifest metadata, and restart loading. Execution identity
+    remains independent of serialization and internal storage partition keys.
+24. A partition crosses stage boundaries and publishes before other partitions
+    complete earlier stages. Only explicit all-input dependencies impose whole-run
+    barriers; dataset types introduce no scheduling barriers.
