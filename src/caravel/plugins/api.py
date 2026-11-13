@@ -12,16 +12,9 @@ declares one or more small typed capabilities:
   around one complete run. Guards enter in plugin order before user code runs
   and exit in reverse order, with teardown attempted for every guard whose
   startup completed.
-- **Checkpoint policy** (`CheckpointCapability`, singleton): supplies reuse
-  verdicts and durable evidence around the node commit boundary. The core
-  executor owns the node state machine and invokes the capability at fixed,
-  core-defined points; the capability cannot reorder, skip, or add boundary
-  points, cannot invoke user code, and cannot save datasets. Skipped output
-  loads only through the declared Dataset.
-
-Stateful plugins own and require their storage configuration. The runner does
-not choose a metadata location or assume plugin state lives beside pipeline
-output.
+Checkpoint, ownership, and lease capabilities have been retired. The
+authoritative progress store owns committed-output evidence, cross-run
+inventory, and worker leases, so a plugin can no longer contradict it.
 """
 
 from __future__ import annotations
@@ -29,7 +22,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from ..types import Dataset
 
 ObserverCriticality = Literal["required", "best_effort"]
 
@@ -48,8 +40,8 @@ class PluginFailureError(Exception):
     """Raised when a plugin fails in a way that must fail the run.
 
     A required observer failure or a run-guard failure produces this distinct
-    operational failure. It never invalidates checkpoint evidence that was
-    already committed.
+    operational failure. It never invalidates durable state that was already
+    committed.
     """
 
 
@@ -58,85 +50,34 @@ class RunFacts:
     """Immutable facts describing one run; contains no mutable runner objects."""
 
     pipeline_name: str
-    run_id: str
-    run_root: str
-    is_selective: bool
+    pipeline_id: str
+    job_id: str
+    invocation_id: str
+    storage_root: str
+    restart_safe: bool
 
 
 @dataclass(frozen=True)
 class NodeFacts:
-    """Immutable facts describing one plan node."""
+    """Immutable facts describing one partition-step work unit."""
 
     node_id: str
-    kind: str
+    partition_id: str
     stage_index: int
     stage_name: str
     entry_index: int
     name: str
-    persist: bool
-    dataset_type: str | None
-    dataset_name: str | None
-    step_dir: str | None
-    route_key: str | None
-
-
-@dataclass(frozen=True)
-class CheckpointContext:
-    """Immutable run and node facts supplied to checkpoint callbacks."""
-
-    run: RunFacts
-    node: NodeFacts
-
-
-@dataclass(frozen=True)
-class CheckpointReuse:
-    """A checkpoint capability's decision about one historical output.
-
-    Boolean verdicts remain supported for compatibility. The structured form
-    additionally identifies a committed-empty partitioned output, whose
-    payload must be reconstructed through the declared Dataset because some
-    object stores do not preserve empty directories.
-    """
-
-    reusable: bool
-    committed_empty: bool = False
-
-    def __post_init__(self) -> None:
-        if self.committed_empty and not self.reusable:
-            raise ValueError("A committed-empty checkpoint must be reusable.")
+    input_scope: str
+    dataset_type: str
+    dataset_name: str
 
 
 @dataclass(frozen=True)
 class RunOutcome:
     """Terminal outcome facts handed to run guards at exit."""
 
-    status: Literal["completed", "failed"]
+    status: Literal["completed", "yielded", "caught_up", "failed"]
     error_type: str | None = None
-
-
-@dataclass(frozen=True)
-class PlanOutput:
-    """One bound step or route-step output declared by the current plan.
-
-    ``managed`` is computed by core from stage configuration: it is True only
-    when the output directory lives beneath the Caravel-managed pipeline root
-    (no ``stage_root`` override). Ownership is a plan fact, never inferred
-    from a path's name.
-    """
-
-    node_id: str
-    step_dir: str
-    persist: bool
-    managed: bool
-
-
-@dataclass(frozen=True)
-class OwnershipContext:
-    """Immutable bound-plan facts supplied to the ownership capability."""
-
-    run: RunFacts
-    managed_root: str
-    outputs: tuple[PlanOutput, ...]
 
 
 @dataclass(frozen=True)
@@ -170,51 +111,6 @@ class RunGuard(Protocol):
     def exit(self, run: RunFacts, outcome: RunOutcome) -> None: ...
 
 
-@runtime_checkable
-class OwnershipCapability(Protocol):
-    """Singleton ownership capability: cross-run inventory reconciliation.
-
-    The core executor invokes ``reconcile`` once per run, after run startup
-    and before any node executes, with the complete bound-plan output facts.
-    Deletion candidates may come only from a previously recorded valid
-    inventory and must stay inside the managed root; selective runs must
-    neither prune nor replace the recorded inventory. The capability never
-    invokes user code, never mutates the plan, and never creates or blesses
-    checkpoint evidence.
-    """
-
-    def reconcile(self, context: OwnershipContext) -> None: ...
-
-
-@runtime_checkable
-class CheckpointCapability(Protocol):
-    """Singleton checkpoint/reuse policy capability.
-
-    The core executor invokes exactly this sequence for a persisted node:
-
-        core validates payload
-        -> before_replacement(...)   # invalidate prior evidence, confirm absence
-        -> core replaces the owned output directory
-        -> core saves through the Dataset
-        -> after_save(...)           # build, publish, and verify evidence last
-
-    and consults ``reuse_verdict`` before loading output of a node it does not
-    execute. Only this capability may bless output as reusable; a verdict of
-    ``False`` means the output must be recomputed. A structured
-    ``CheckpointReuse`` may additionally report committed-empty output. The
-    capability never calls user code, never saves datasets, and never mutates
-    the plan.
-    """
-
-    def reuse_verdict(
-        self, context: CheckpointContext, dataset: Dataset
-    ) -> bool | CheckpointReuse: ...
-
-    def before_replacement(self, context: CheckpointContext, dataset: Dataset) -> None: ...
-
-    def after_save(self, context: CheckpointContext, dataset: Dataset) -> None: ...
-
-
 def _validate_plugin_id(plugin_id: object) -> str:
     if not isinstance(plugin_id, str) or not plugin_id:
         raise ValueError("Plugin id must be a non-empty string.")
@@ -230,8 +126,6 @@ class PluginSet:
     plugins: tuple[Any, ...] = ()
     observers: tuple[tuple[str, RunObserver, ObserverCriticality], ...] = ()
     guards: tuple[tuple[str, RunGuard], ...] = ()
-    checkpoint: CheckpointCapability | None = None
-    ownership: OwnershipCapability | None = None
 
 
 def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
@@ -239,8 +133,6 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
     seen_ids: set[str] = set()
     observers: list[tuple[str, RunObserver, ObserverCriticality]] = []
     guards: list[tuple[str, RunGuard]] = []
-    checkpoint: CheckpointCapability | None = None
-    ownership: OwnershipCapability | None = None
 
     for plugin in plugins:
         plugin_id = _validate_plugin_id(getattr(plugin, "plugin_id", None))
@@ -264,24 +156,6 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
             guards.append((plugin_id, plugin))
             has_capability = True
 
-        if isinstance(plugin, CheckpointCapability):
-            if checkpoint is not None:
-                raise ValueError(
-                    "Only one plugin may provide the checkpoint capability; "
-                    f"'{plugin_id}' conflicts with an earlier plugin."
-                )
-            checkpoint = plugin
-            has_capability = True
-
-        if isinstance(plugin, OwnershipCapability):
-            if ownership is not None:
-                raise ValueError(
-                    "Only one plugin may provide the ownership capability; "
-                    f"'{plugin_id}' conflicts with an earlier plugin."
-                )
-            ownership = plugin
-            has_capability = True
-
         if not has_capability:
             raise ValueError(f"Plugin '{plugin_id}' declares no supported capability.")
 
@@ -289,6 +163,4 @@ def validate_plugins(plugins: tuple[Any, ...]) -> PluginSet:
         plugins=tuple(plugins),
         observers=tuple(observers),
         guards=tuple(guards),
-        checkpoint=checkpoint,
-        ownership=ownership,
     )

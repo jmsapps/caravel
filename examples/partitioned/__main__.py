@@ -7,7 +7,7 @@ from .pipeline import build_partitioned_pipeline
 
 def main() -> int:
     pipeline = build_partitioned_pipeline()
-    cli = make_cli(pipeline)
+    cli = make_cli(pipeline, source=pipeline.source)
     return cli()
 
 

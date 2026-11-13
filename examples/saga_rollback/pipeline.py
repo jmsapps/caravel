@@ -5,7 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, cast
 
-from caravel import Branch, JSONDataset, Pipeline, Stage, Step, dataset_as_loader, run
+from caravel import (
+    Branch,
+    CallableLoader,
+    DurableStorage,
+    JSONDataset,
+    Pipeline,
+    Stage,
+    Step,
+    run,
+)
 from caravel.plugins import RunFacts, RunOutcome
 
 PIPELINE_NAME = "saga_rollback_example"
@@ -44,7 +53,7 @@ class SagaTransaction:
             )
         _write_json(
             self.journal_path,
-            {"run_id": run.run_id, "status": "active", "compensations": []},
+            {"run_id": run.invocation_id, "status": "active", "compensations": []},
         )
 
     def exit(self, run: RunFacts, outcome: RunOutcome) -> None:
@@ -129,22 +138,29 @@ def build_saga_pipeline(
         Step(create_shipment, JSONDataset(), name="create_shipment"),
         Step(finalize_order, JSONDataset(), name="finalize_order"),
     ]
-    loader = dataset_as_loader(JSONDataset(name="order", path=seed_path))
-    return Pipeline(name=PIPELINE_NAME, loader=loader, stages=[Stage(STAGE_NAME, steps)])
+
+    # One order is one execution partition: the whole document is the
+    # recovery unit, not each of its fields.
+    def load_order() -> dict[str, Any]:
+        return {"order": cast(dict[str, Any], JSONDataset(name="order", path=seed_path).load())}
+
+    loader = CallableLoader("order", load_order)
+    return Pipeline(name=PIPELINE_NAME, source=loader, stages=[Stage(STAGE_NAME, steps)])
 
 
 def run_saga_pipeline(
     *,
-    run_root: Path | str,
+    state_root: Path | str,
     state_path: Path,
     journal_path: Path,
     fail: bool = False,
-) -> Path | str:
+) -> Any:
     transaction = SagaTransaction(state_path=state_path, journal_path=journal_path)
     pipeline = build_saga_pipeline(transaction)
     return run(
         pipeline,
-        run_root=run_root,
+        job_id="saga-1",
+        storage=DurableStorage.at(state_root),
         params={"fail": "true"} if fail else None,
         plugins=[transaction],
     )

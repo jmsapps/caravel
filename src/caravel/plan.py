@@ -139,7 +139,7 @@ def _dataset_intent(dataset: Dataset) -> tuple[str, str]:
 def _compile_step(
     entry: Step, *, stage_index: int, stage_name: str, entry_index: int, input_ref: str
 ) -> LogicalNode:
-    dataset_type, dataset_name = _dataset_intent(entry.output)
+    dataset_type, dataset_name = _dataset_intent(entry.dataset)
     step_name = entry.name if entry.name is not None else ""
     _validate_path_safe_name(step_name, what=f"Step name in stage '{stage_name}'")
     return LogicalNode(
@@ -203,7 +203,7 @@ def _compile_branch(
                 )
             seen_route_step_names.add(route_step_name)
 
-            dataset_type, dataset_name = _dataset_intent(route_step.output)
+            dataset_type, dataset_name = _dataset_intent(route_step.dataset)
             node_id = f"{entry_id}-route-{route_index:03d}-step-{route_step_index:03d}"
             nodes.append(
                 LogicalNode(

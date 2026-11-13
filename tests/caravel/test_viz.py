@@ -34,7 +34,6 @@ def _build_viz_fixture_pipeline() -> Pipeline:
 
     return Pipeline(
         name="viz_fixture",
-        loader=_StubLoader(),
         stages=[
             Stage(name="bronze", entries=[normalize, branch_entry, merge]),
             Stage(name="silver", entries=[normalize_silver]),

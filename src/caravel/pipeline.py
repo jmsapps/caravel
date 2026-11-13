@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from .branch import Branch
 from .datasets import JSONDataset
+from .retry import RetryPolicy
 from .types import Dataset, Loader, StepFn
 
 _STEP_OUTPUT_ATTR = "__step_output_dataset__"
@@ -79,17 +80,38 @@ def step(*, output: Dataset, persist: bool = True) -> Callable[[StepFn], StepFn]
 
 @dataclass
 class Step:
-    """Normalized executable step declaration."""
+    """Normalized executable step declaration.
+
+    ``output`` defaults to a JSON dataset named for the processor, so
+    ``Step(load)`` is a complete declaration.
+
+    ``input_scope``, ``batch_size``, ``revision``, and ``retry`` configure the
+    one durable execution model. Their defaults give whole-partition recovery
+    with no retries, which is the simplest useful behavior.
+
+    ``retry`` attaches a policy at the step boundary only. Nested boundaries
+    acquire no policy automatically; use the ``retry`` utility explicitly inside
+    a processor to retry a batch, record, or single operation.
+    """
 
     fn: StepFn
-    output: Dataset
+    output: Dataset | None = None
     persist: bool = True
     name: str | None = None
+    input_scope: str = "partition"
+    batch_size: int | None = None
+    revision: str = "1"
+    retry: Any = None
 
     def __post_init__(self) -> None:
         if not callable(self.fn):
             raise TypeError(f"Step.fn must be callable, got {type(self.fn).__name__}.")
 
+        if self.output is None:
+            # A simple declaration needs no dataset: the processor's output is
+            # persisted as JSON under the step's own name.
+            decorated = _get_decorated_output(self.fn)
+            self.output = decorated if decorated is not None else JSONDataset()
         if not isinstance(self.output, Dataset):
             raise TypeError(
                 f"Step.output must satisfy Dataset protocol, got {type(self.output).__name__}."
@@ -97,6 +119,12 @@ class Step:
 
         if not isinstance(self.persist, bool):
             raise TypeError(f"Step.persist must be bool, got {type(self.persist).__name__}.")
+        if not self.persist:
+            raise ValueError(
+                f"Step '{self.name or _callable_name(self.fn)}' sets persist=False, but "
+                "durable execution must commit every step's output: a later invocation "
+                "restores it instead of recomputing. Remove persist=False."
+            )
 
         if self.name is None or self.name == "":
             self.name = _callable_name(self.fn)
@@ -104,7 +132,38 @@ class Step:
         if not isinstance(self.name, str):
             raise TypeError(f"Step.name must be str, got {type(self.name).__name__}.")
 
+        if self.input_scope not in ("partition", "all"):
+            raise ValueError(
+                f"Step.input_scope must be 'partition' or 'all', got {self.input_scope!r}."
+            )
+
+        if self.batch_size is not None:
+            if not isinstance(self.batch_size, int) or isinstance(self.batch_size, bool):
+                raise TypeError(
+                    f"Step.batch_size must be a positive integer or None, got "
+                    f"{type(self.batch_size).__name__}."
+                )
+            if self.batch_size < 1:
+                raise ValueError(
+                    f"Step.batch_size must be a positive integer, got {self.batch_size}."
+                )
+
+        if not isinstance(self.revision, str) or not self.revision:
+            raise ValueError("Step.revision must be a non-empty string.")
+
+        if self.retry is not None and not isinstance(self.retry, RetryPolicy):
+            raise TypeError(
+                f"Step.retry must be a RetryPolicy or None, got {type(self.retry).__name__}."
+            )
+
         self.output = _with_default_dataset_name(self.output, step_name=self.name)
+
+    @property
+    def dataset(self) -> Dataset:
+        """The resolved output dataset. Always set once the Step is built."""
+        if self.output is None:  # pragma: no cover - guaranteed by __post_init__
+            raise TypeError(f"Step '{self.name}' has no resolved output dataset.")
+        return self.output
 
 
 @dataclass
@@ -156,16 +215,24 @@ class Stage:
 
 @dataclass
 class Pipeline:
-    """Top-level pipeline declaration with one loader and ordered stages."""
+    """Top-level pipeline declaration: a name, ordered stages, and an input source.
+
+    ``source`` is optional on the declaration because execution supplies it.
+    Anything satisfying the :class:`~caravel.types.Loader` protocol is accepted
+    and adapted, so a loader remains a valid way to describe input.
+    """
 
     name: str
-    loader: Loader
     stages: list[Stage]
+    source: Any = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.loader, Loader):
+        if self.source is not None and not (
+            isinstance(self.source, Loader) or hasattr(self.source, "discover")
+        ):
             raise TypeError(
-                f"Pipeline loader must satisfy Loader protocol, got {type(self.loader).__name__}."
+                "Pipeline source must satisfy the Loader protocol or provide "
+                f"discover(), got {type(self.source).__name__}."
             )
 
         seen_stage_names: set[str] = set()

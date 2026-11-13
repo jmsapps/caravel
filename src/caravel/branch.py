@@ -55,6 +55,15 @@ class Branch:
 
         return route_key
 
+    def route_key_for(self, partition_key: str, record: Any) -> str:
+        """Decide one partition's route.
+
+        Durable execution calls this at the branch boundary and commits the
+        result, so the predicate is consulted exactly once per partition even
+        across restarts.
+        """
+        return self._route_key_for(partition_key, record)
+
     def route_partitions(self, partitions: Partitions) -> dict[str, Partitions]:
         grouped: dict[str, Partitions] = {route_key: {} for route_key in self.routes}
 

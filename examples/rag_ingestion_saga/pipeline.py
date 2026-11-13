@@ -6,7 +6,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, cast
 
-from caravel import Branch, JSONDataset, Pipeline, Stage, Step, dataset_as_loader, run
+from caravel import (
+    Branch,
+    CallableLoader,
+    DurableStorage,
+    JSONDataset,
+    Pipeline,
+    Stage,
+    Step,
+    run,
+)
 from caravel.plugins import RunFacts, RunOutcome
 
 PIPELINE_NAME = "rag_ingestion_saga_example"
@@ -48,7 +57,7 @@ class RagWorkspaceSaga:
             _write(self.root / "index" / "documents.json", {"version": "v1", "chunks": 1})
         _write(
             self.journal,
-            {"run_id": run_facts.run_id, "status": "active", "compensations": []},
+            {"run_id": run_facts.invocation_id, "status": "active", "compensations": []},
         )
 
     def exit(self, run_facts: RunFacts, outcome: RunOutcome) -> None:
@@ -137,17 +146,26 @@ def build_rag_ingestion_pipeline(
         Step(promote_chunks, JSONDataset(), name="promote_chunks"),
         Step(commit_version, JSONDataset(), name="commit_version"),
     ]
-    loader = dataset_as_loader(JSONDataset(name="document", path=seed))
-    return Pipeline(PIPELINE_NAME, loader, [Stage("ingestion", entries)])
+
+    # One document is one execution partition.
+    def load_document() -> dict[str, Any]:
+        return {"document": cast(dict[str, Any], JSONDataset(name="document", path=seed).load())}
+
+    return Pipeline(
+        name=PIPELINE_NAME,
+        stages=[Stage("ingestion", entries)],
+        source=CallableLoader("document", load_document),
+    )
 
 
 def run_rag_ingestion(
-    *, run_root: Path | str, workspace_root: Path, fail: bool = False
+    *, state_root: Path | str, workspace_root: Path, fail: bool = False
 ) -> Path | str:
     saga = RagWorkspaceSaga(workspace_root)
     return run(
         build_rag_ingestion_pipeline(saga),
-        run_root=run_root,
+        job_id="rag-1",
+        storage=DurableStorage.at(state_root),
         params={"fail": "true"} if fail else None,
         plugins=[saga],
     )

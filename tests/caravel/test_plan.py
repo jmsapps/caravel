@@ -24,7 +24,7 @@ class _StubLoader:
 
 
 def _linear_pipeline(name: str = "linear_demo") -> Pipeline:
-    @step(output=PartitionedJSONDataset(name="normalized"), persist=False)
+    @step(output=PartitionedJSONDataset(name="normalized"))
     def normalize(
         partitions: dict[str, dict[str, object]], *, context: object
     ) -> dict[str, dict[str, object]]:
@@ -40,13 +40,12 @@ def _linear_pipeline(name: str = "linear_demo") -> Pipeline:
 
     return Pipeline(
         name=name,
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[normalize, summarize])],
     )
 
 
 def _branching_pipeline() -> Pipeline:
-    @step(output=PartitionedJSONDataset(name="parsed"), persist=False)
+    @step(output=PartitionedJSONDataset(name="parsed"))
     def parse(partitions: object, *, context: object) -> object:
         _ = context
         return partitions
@@ -68,7 +67,6 @@ def _branching_pipeline() -> Pipeline:
     )
     return Pipeline(
         name="branch_demo",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -83,13 +81,11 @@ def test_linear_pipeline_compiles_to_expected_nodes() -> None:
     assert first.node_id == "stage-001-entry-001"
     assert first.name == "normalize"
     assert first.input_ref == SEED_INPUT
-    assert first.persist is False
     assert first.dataset_type == "PartitionedJSONDataset"
     assert first.dataset_name == "normalized"
 
     assert second.node_id == "stage-001-entry-002"
     assert second.input_ref == "node:stage-001-entry-001"
-    assert second.persist is True
     assert second.dataset_type == "JSONDataset"
 
 
@@ -165,7 +161,6 @@ def test_repeated_route_step_names_across_routes_get_distinct_node_ids() -> None
     )
     pipeline = Pipeline(
         name="dup_across_routes",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -188,7 +183,6 @@ def test_duplicate_route_step_names_within_one_route_are_rejected() -> None:
     branch = Branch(name="dup_route", by="source", routes={"a": duplicate})
     pipeline = Pipeline(
         name="dup_in_route",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -204,7 +198,6 @@ def test_undecorated_route_callable_is_rejected() -> None:
     branch = Branch(name="undecorated", by="source", routes={"a": [bare]})
     pipeline = Pipeline(
         name="undecorated_route",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -221,7 +214,6 @@ def test_unsupported_branch_by_shape_is_rejected() -> None:
     branch = Branch(name="bad_by", by=42, routes={"a": [fine]})  # type: ignore[arg-type]
     pipeline = Pipeline(
         name="bad_by_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -233,7 +225,6 @@ def test_branch_without_routes_is_rejected() -> None:
     branch = Branch(name="empty_routes", by="source", routes={})
     pipeline = Pipeline(
         name="empty_routes_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -250,7 +241,6 @@ def test_empty_route_step_list_models_pass_through_to_merge() -> None:
     branch = Branch(name="passthrough", by="source", routes={"a": [only], "b": []})
     pipeline = Pipeline(
         name="passthrough_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -277,14 +267,12 @@ def test_path_unsafe_stage_names_are_rejected(bad_name: str) -> None:
         with pytest.raises(ValueError):
             Pipeline(
                 name="unsafe_stage",
-                loader=_StubLoader(),
                 stages=[Stage(name=bad_name, entries=[fine])],
             )
         return
 
     pipeline = Pipeline(
         name="unsafe_stage",
-        loader=_StubLoader(),
         stages=[Stage(name=bad_name, entries=[fine])],
     )
     with pytest.raises(ValueError, match="path"):
@@ -300,7 +288,6 @@ def test_path_unsafe_route_keys_are_rejected() -> None:
     branch = Branch(name="unsafe_route", by="source", routes={"a/b": [fine]})
     pipeline = Pipeline(
         name="unsafe_route_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -316,7 +303,6 @@ def test_empty_stage_compiles_to_no_nodes_and_preserves_flow() -> None:
 
     pipeline = Pipeline(
         name="empty_stage_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="empty", entries=[]), Stage(name="silver", entries=[final])],
     )
 

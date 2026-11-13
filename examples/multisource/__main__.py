@@ -7,7 +7,7 @@ from .pipeline import build_multisource_pipeline
 
 def main() -> int:
     pipeline = build_multisource_pipeline()
-    cli = make_cli(pipeline)
+    cli = make_cli(pipeline, source=pipeline.source)
     return cli()
 
 

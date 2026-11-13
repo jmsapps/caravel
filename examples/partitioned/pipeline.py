@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from caravel import (
+    DurableStorage,
     PartitionedJSONDataset,
     PartitionedTextDataset,
     Pipeline,
@@ -34,64 +35,55 @@ def _extract_between(value: str, start: str, end: str) -> str:
 
 
 @step(output=PartitionedTextDataset(suffix=".html", encoding="utf-8"))
-def bronze_render_html(partitions: dict[str, dict[str, Any]], *, context: object) -> dict[str, str]:
-    """Render source JSON partitions into deterministic HTML partitions."""
+def bronze_render_html(record: dict[str, Any], *, context: object) -> dict[str, str]:
+    """Render one source record into a deterministic HTML partition."""
     _ = context
-    rendered: dict[str, str] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
-        item_id = str(record["id"])
-        lang = str(record["lang"])
-        title = str(record["title"])
-        snippet = str(record["snippet"])
-        rendered[key] = (
-            f"<article data-id='{item_id}' data-lang='{lang}'>"
-            f"<h1>{title}</h1>"
-            f"<p>{snippet}</p>"
+    item_id = str(record["id"])
+    return {
+        item_id: (
+            f"<article data-id='{item_id}' data-lang='{record['lang']}'>"
+            f"<h1>{record['title']}</h1>"
+            f"<p>{record['snippet']}</p>"
             "</article>"
         )
-
-    return rendered
+    }
 
 
 @step(output=PartitionedJSONDataset())
 def silver_extract_structured(
-    partitions: dict[str, str], *, context: object
+    payload: dict[str, str], *, context: object
 ) -> dict[str, dict[str, Any]]:
-    """Convert bronze HTML partitions back into structured JSON records."""
+    """Convert one partition's bronze HTML back into a structured record."""
     _ = context
     structured: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        html = partitions[key]
-        item_id = _extract_between(html, "data-id='", "'")
-        lang = _extract_between(html, "data-lang='", "'")
-        title = _extract_between(html, "<h1>", "</h1>")
+    for key in sorted(payload):
+        html = payload[key]
         snippet = _extract_between(html, "<p>", "</p>")
-
         structured[key] = {
-            "id": item_id,
-            "lang": lang,
-            "title": title,
+            "id": _extract_between(html, "data-id='", "'"),
+            "lang": _extract_between(html, "data-lang='", "'"),
+            "title": _extract_between(html, "<h1>", "</h1>"),
             "snippet": snippet,
             "normalized_snippet": snippet.lower(),
             "source_key": key,
         }
-
     return structured
 
 
 @step(output=PartitionedJSONDataset())
 def gold_partition_by_language(
-    partitions: dict[str, dict[str, Any]], *, context: object
+    payload: dict[str, dict[str, Any]], *, context: object
 ) -> dict[str, dict[str, Any]]:
-    """Emit path-style keys (`<lang>/<id>`) to prove nested partition output paths."""
+    """Emit path-style keys (`<lang>/<id>`) to prove nested storage keys.
+
+    These are *storage* partition keys inside one payload. They occupy a
+    different namespace from execution partition identity, which the engine
+    keeps stable across steps.
+    """
     _ = context
     repartitioned: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
+    for key in sorted(payload):
+        record = payload[key]
         lang = str(record["lang"])
         item_id = str(record["id"])
         repartitioned[f"{lang}/{item_id}"] = {
@@ -101,7 +93,6 @@ def gold_partition_by_language(
             "normalized_snippet": record["normalized_snippet"],
             "origin_partition": key,
         }
-
     return repartitioned
 
 
@@ -109,11 +100,9 @@ def build_partitioned_pipeline(input_dir: Path | str | None = None) -> Pipeline:
     """Build the partitioned pipeline declaration."""
     seed_dir = Path(input_dir) if input_dir is not None else _DEFAULT_INPUT_DIR
 
-    loader = dataset_as_loader(PartitionedJSONDataset(name="partitioned_seed", path=seed_dir))
-
     return Pipeline(
         name=PIPELINE_NAME,
-        loader=loader,
+        source=dataset_as_loader(PartitionedJSONDataset(name="partitioned_seed", path=seed_dir)),
         stages=[
             Stage(name=BRONZE_STAGE_NAME, entries=[bronze_render_html]),
             Stage(name=SILVER_STAGE_NAME, entries=[silver_extract_structured]),
@@ -124,12 +113,13 @@ def build_partitioned_pipeline(input_dir: Path | str | None = None) -> Pipeline:
 
 def run_partitioned_pipeline(
     *,
-    run_root: Path | str | None = None,
+    state_root: Path | str,
+    job_id: str = "partitioned-1",
     input_dir: Path | str | None = None,
-) -> Path | str:
-    """Run the partitioned example pipeline and return resolved run root."""
+) -> Any:
+    """Run the partitioned example and return its structured status."""
     pipeline = build_partitioned_pipeline(input_dir=input_dir)
-    return run(pipeline, run_root=run_root)
+    return run(pipeline, job_id=job_id, storage=DurableStorage.at(state_root))
 
 
 __all__ = [

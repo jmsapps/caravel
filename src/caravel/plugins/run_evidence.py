@@ -59,8 +59,9 @@ _EVENT_FIELDS = frozenset(
         "schema_version",
         "run_id",
         "pipeline",
-        "is_selective",
-        "run_root",
+        "job_id",
+        "pipeline_id",
+        "restart_safe",
         "sequence",
         "kind",
         "node",
@@ -139,8 +140,11 @@ def validate_run_event(payload: object) -> dict[str, Any]:
     if not isinstance(pipeline, str) or not pipeline:
         raise ValueError("Run event pipeline must be a non-empty string.")
 
-    if not isinstance(payload["is_selective"], bool):
-        raise ValueError("Run event is_selective must be a boolean.")
+    if not isinstance(payload["restart_safe"], bool):
+        raise ValueError("Run event restart_safe must be a boolean.")
+    for field in ("job_id", "pipeline_id"):
+        if not isinstance(payload[field], str) or not payload[field]:
+            raise ValueError(f"Run event {field} must be a non-empty string.")
 
     run_root = payload["run_root"]
     if not isinstance(run_root, str) or not run_root:
@@ -308,7 +312,7 @@ class RunEvidencePlugin:
     # -- RunObserver -----------------------------------------------------------
 
     def on_event(self, event: RunEvent) -> None:
-        run_id = event.run.run_id
+        run_id = event.run.invocation_id
         sequence = self._sequences.get(run_id, 0) + 1
         self._sequences[run_id] = sequence
 
@@ -316,16 +320,14 @@ class RunEvidencePlugin:
         if event.node is not None:
             node_block = {
                 "node_id": event.node.node_id,
-                "kind": event.node.kind,
                 "stage_index": event.node.stage_index,
                 "stage_name": event.node.stage_name,
                 "entry_index": event.node.entry_index,
                 "name": event.node.name,
-                "persist": event.node.persist,
+                "partition_id": event.node.partition_id,
+                "input_scope": event.node.input_scope,
                 "dataset_type": event.node.dataset_type,
                 "dataset_name": event.node.dataset_name,
-                "step_dir": event.node.step_dir,
-                "route_key": event.node.route_key,
             }
 
         record = validate_run_event(
@@ -333,8 +335,9 @@ class RunEvidencePlugin:
                 "schema_version": RUN_EVENT_SCHEMA_VERSION,
                 "run_id": run_id,
                 "pipeline": event.run.pipeline_name,
-                "is_selective": event.run.is_selective,
-                "run_root": event.run.run_root,
+                "job_id": event.run.job_id,
+                "pipeline_id": event.run.pipeline_id,
+                "restart_safe": event.run.restart_safe,
                 "sequence": sequence,
                 "kind": event.kind,
                 "node": node_block,

@@ -3,7 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-from caravel import JSONDataset, Pipeline, Stage, dataset_as_loader, run, step
+from caravel import (
+    DurableStorage,
+    JSONDataset,
+    Pipeline,
+    Stage,
+    Step,
+    dataset_as_loader,
+    run,
+    step,
+)
 
 PIPELINE_NAME = "minimal_example"
 BRONZE_STAGE_NAME = "bronze"
@@ -25,45 +34,34 @@ def _runtime_params(context: object) -> Mapping[str, str]:
 
 
 @step(output=JSONDataset())
-def bronze_collect(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Add deterministic bronze fields to each incoming record."""
+def bronze_collect(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+    """Add deterministic bronze fields. Runs once per execution partition."""
     _ = context
-    transformed: dict[str, dict[str, Any]] = {}
-    for key in sorted(partitions):
-        record = partitions[key]
-        transformed[key] = {
-            **record,
-            "bronze": True,
-            "doubled_value": int(record["value"]) * 2,
-        }
-    return transformed
+    return {**record, "bronze": True, "doubled_value": int(record["value"]) * 2}
 
 
 @step(output=JSONDataset())
-def silver_transform(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Normalize bronze records while preserving partition keys."""
+def silver_transform(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+    """Normalize one bronze record. Partition identity is preserved by the engine."""
     _ = context
-    normalized: dict[str, dict[str, Any]] = {}
-    for key in sorted(partitions):
-        record = partitions[key]
-        normalized[key] = {
-            **record,
-            "normalized": float(record["doubled_value"]) / 4.0,
-        }
-    return normalized
+    return {**record, "normalized": float(record["doubled_value"]) / 4.0}
 
 
 @step(output=JSONDataset())
-def silver_finalize(partitions: dict[str, dict[str, Any]], *, context: object) -> dict[str, Any]:
-    """Produce deterministic final summary payload for smoke testing."""
+def silver_finalize(dataset: Any, *, context: object) -> dict[str, Any]:
+    """Summarize the whole run behind an explicit all-input barrier.
+
+    Aggregation is the one thing that genuinely needs every partition, so it is
+    declared with ``input_scope="all"``. It receives a reader over committed
+    partitions rather than a materialized dictionary.
+    """
     params = _runtime_params(context)
     mode = params.get("mode")
-    ordered_keys = sorted(partitions)
-    records: dict[str, dict[str, Any]] = {key: partitions[key] for key in ordered_keys}
+    records: dict[str, dict[str, Any]] = {
+        partition.partition_id: partition.load() for partition in dataset.partitions()
+    }
+    ordered_keys = sorted(records)
+    records = {key: records[key] for key in ordered_keys}
     total_normalized = sum(float(record["normalized"]) for record in records.values())
 
     payload: dict[str, Any] = {
@@ -84,26 +82,38 @@ def build_minimal_pipeline(input_path: Path | str | None = None) -> Pipeline:
     """Build the minimal example pipeline declaration."""
     seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
 
-    loader = dataset_as_loader(JSONDataset(name="minimal_seed", path=seed_path))
-
     return Pipeline(
         name=PIPELINE_NAME,
-        loader=loader,
         stages=[
             Stage(name=BRONZE_STAGE_NAME, entries=[bronze_collect]),
-            Stage(name=SILVER_STAGE_NAME, entries=[silver_transform, silver_finalize]),
+            Stage(
+                name=SILVER_STAGE_NAME,
+                entries=[
+                    silver_transform,
+                    Step(silver_finalize, output=JSONDataset(), input_scope="all"),
+                ],
+            ),
         ],
+        # A loader describes input; it is not a separate execution path.
+        source=dataset_as_loader(JSONDataset(name="minimal_seed", path=seed_path)),
     )
 
 
 def run_minimal_pipeline(
     *,
-    run_root: Path | str | None = None,
+    state_root: Path | str,
+    job_id: str = "minimal-1",
     input_path: Path | str | None = None,
-) -> Path | str:
-    """Run the minimal example pipeline and return the resolved run root."""
+    params: dict[str, str] | None = None,
+) -> Any:
+    """Run the minimal example and return its structured status."""
     pipeline = build_minimal_pipeline(input_path=input_path)
-    return run(pipeline, run_root=run_root)
+    return run(
+        pipeline,
+        job_id=job_id,
+        storage=DurableStorage.at(state_root),
+        params=params,
+    )
 
 
 __all__ = [

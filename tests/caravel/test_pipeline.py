@@ -26,7 +26,6 @@ def test_step_defaults_name_from_function_name() -> None:
     s = Step(fn=_plain_step, output=JSONDataset(name="custom_name"))
 
     assert s.name == "_plain_step"
-    assert s.persist is True
 
 
 def test_step_rejects_non_callable_fn() -> None:
@@ -96,15 +95,14 @@ def test_stage_uses_decorator_dataset_when_present() -> None:
     assert stage.entries[0].output is dataset
 
 
-def test_stage_uses_decorator_persist_when_present() -> None:
-    @step(output=JSONDataset(name="decorator_dataset"), persist=False)
+def test_stage_uses_decorator_output_when_present() -> None:
+    @step(output=JSONDataset(name="decorator_dataset"))
     def decorated(payload: dict[str, str], *, _context: object) -> dict[str, str]:
         return payload
 
     stage = Stage(name="bronze", entries=[decorated])
 
     assert isinstance(stage.entries[0], Step)
-    assert stage.entries[0].persist is False
 
 
 def test_stage_defaults_decorator_dataset_name_to_function_name_when_omitted() -> None:
@@ -170,30 +168,27 @@ def test_stage_requires_clean_dirs_to_be_bool() -> None:
         Stage(name="bronze", entries=[_plain_step], clean_dirs="yes")  # type: ignore[arg-type]
 
 
-def test_pipeline_requires_loader_protocol_and_preserves_stage_order() -> None:
-    stage_a = Stage(name="bronze", entries=[_plain_step])
-    stage_b = Stage(name="silver", entries=[_plain_step])
+def test_pipeline_validates_its_source_and_preserves_stage_order() -> None:
+    """A source is optional, but a non-source is rejected."""
+    stages = [Stage(name="a", entries=[]), Stage(name="b", entries=[])]
+    pipeline = Pipeline(name="p", stages=stages)
+    assert [stage.name for stage in pipeline.stages] == ["a", "b"]
+    assert pipeline.source is None
 
-    pipeline = Pipeline(name="demo", loader=_StubLoader(), stages=[stage_a, stage_b])
-
-    assert [stage.name for stage in pipeline.stages] == ["bronze", "silver"]
-
-    with pytest.raises(TypeError, match="loader"):
-        Pipeline(name="bad", loader=_BadLoader(), stages=[stage_a])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="source"):
+        Pipeline(name="p", stages=[], source=object())
 
 
 def test_pipeline_rejects_duplicate_or_empty_stage_names() -> None:
     with pytest.raises(ValueError, match="empty stage name"):
         Pipeline(
             name="demo",
-            loader=_StubLoader(),
             stages=[Stage(name="", entries=[_plain_step])],
         )
 
     with pytest.raises(ValueError, match="duplicate stage name"):
         Pipeline(
             name="demo",
-            loader=_StubLoader(),
             stages=[
                 Stage(name="bronze", entries=[_plain_step]),
                 Stage(name="bronze", entries=[_plain_step]),
