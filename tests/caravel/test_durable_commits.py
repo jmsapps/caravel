@@ -749,3 +749,33 @@ def test_publication_sealing_and_dependent_eligibility_agree(
     assert sealed.owner_id is None
     assert sealed.batch_count == len(publisher.committed_references(key))
     assert publisher.load_work_unit(key, dataset=dataset) == ({"a": 1},)
+
+
+def test_the_output_store_supplies_its_own_access_to_the_dataset(
+    tmp_path: Path,
+) -> None:
+    """Regression: committed artifacts were written with the dataset's access.
+
+    A dataset describes serialization; the output store owns where committed
+    artifacts live and how to reach them. Writing an attempt with the dataset's
+    own (absent) storage options silently bypassed the store's credentials,
+    which no local-filesystem or memory test could expose.
+    """
+    store = AttemptOutputStore(tmp_path / "artifacts", storage_options={"auto_mkdir": True})
+    dataset = JSONDataset(name="docs")
+    assert dataset.storage_options is None
+
+    configured = store._with_store_access(dataset)
+    assert configured is not dataset, "the dataset was used without store access"
+    assert configured.storage_options == {"auto_mkdir": True}
+    assert dataset.storage_options is None, "the caller's dataset was mutated"
+
+    key = WorkUnitKey(JOB, "load", "p1")
+    reference = store.write_attempt(key, "b1", dataset=dataset, payload={"a": 1})
+    assert store.load(reference, dataset=dataset) == {"a": 1}
+
+
+def test_a_store_without_options_leaves_the_dataset_untouched(tmp_path: Path) -> None:
+    store = AttemptOutputStore(tmp_path / "artifacts")
+    dataset = JSONDataset(name="docs")
+    assert store._with_store_access(dataset) is dataset

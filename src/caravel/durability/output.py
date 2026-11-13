@@ -13,6 +13,7 @@ partition keys live inside that path, so the two namespaces cannot collide.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import uuid
@@ -204,6 +205,22 @@ class AttemptOutputStore:
         self.root: StoragePath = str(root) if "://" in str(root) else Path(root)
         self.storage_options = dict(storage_options) if storage_options is not None else None
 
+    def _with_store_access(self, dataset: Dataset) -> Dataset:
+        """Return ``dataset`` configured to reach *this store's* artifact location.
+
+        A dataset describes serialization; the output store owns where committed
+        artifacts live and how to authenticate there. Without this, a dataset
+        constructed with no storage options would try to write an attempt to a
+        remote location unauthenticated.
+        """
+        if self.storage_options is None:
+            return dataset
+        if getattr(dataset, "storage_options", None) == self.storage_options:
+            return dataset
+        configured = copy.copy(dataset)
+        setattr(configured, "storage_options", dict(self.storage_options))
+        return configured
+
     def attempt_location(self, key: WorkUnitKey, batch_id: str, token: str) -> str:
         """Return the unique immutable location for one write attempt."""
         validate_identifier("batch_id", batch_id)
@@ -234,6 +251,7 @@ class AttemptOutputStore:
         """
         attempt_token = new_attempt_token() if token is None else token
         destination = self.attempt_location(key, batch_id, attempt_token)
+        dataset = self._with_store_access(dataset)
 
         remove_and_recreate_dir(destination, self.storage_options)
         dataset.save(payload, destination)
@@ -268,6 +286,7 @@ class AttemptOutputStore:
         The dataset is supplied by the caller and checked against the reference's
         recorded metadata. A class is never resolved from stored text.
         """
+        dataset = self._with_store_access(dataset)
         declared_type = type(dataset).__name__
         declared_name = getattr(dataset, "name", "")
         if reference.dataset_type != declared_type or reference.dataset_name != declared_name:

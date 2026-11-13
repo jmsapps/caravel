@@ -25,6 +25,13 @@ test = [
   "pytest>=8",
   "python-dotenv==1.2.2",
   "ruff>=0.12",
+  # Storage emulators for tests/qualification. The suite starts them itself;
+  # moto runs in-process, so S3 qualification needs no container runtime.
+  "adlfs>=2024.6.0",
+  "gcsfs>=2024.6.0",
+  "moto[server]>=5",
+  # Unbounded, pip resolves s3fs to 0.4.2, which fsspec itself warns about.
+  "s3fs>=2024.6.0",
 ]
 azure = [
   "adlfs",
@@ -34,13 +41,13 @@ gcp = [
   "gcsfs",
 ]
 s3 = [
-  "s3fs",
+  "s3fs>=2024.6.0",
 ]
 cloud = [
-  "adlfs",
+  "adlfs>=2024.6.0",
   "azure-identity",
   "gcsfs",
-  "s3fs",
+  "s3fs>=2024.6.0",
 ]
 
 [tool.setuptools.packages.find]

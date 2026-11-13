@@ -1,27 +1,24 @@
-"""Credentialed qualification of remote artifact storage.
+"""Qualification of remote artifact storage against real object-storage backends.
 
-Two claims are kept apart deliberately:
+Three claims are kept apart, because they prove different things:
 
-- *Implemented and locally qualified* — the remote artifact code path runs
-  against a non-local fsspec store in the ordinary suite.
-- *Credentialed qualification passed* — this module, and only when it has
-  actually run against real object storage.
+1. *Locally qualified* — the remote artifact code path runs against a non-local
+   fsspec store (``memory://``) in the ordinary suite. Proves the code path, not
+   the protocol.
+2. *Emulator-qualified* — this module against Azurite or moto: the real wire
+   protocol, the real cloud SDK, real authentication, real listing and read-back
+   over HTTP. Does **not** reproduce a cloud service's consistency model,
+   latency, throttling, or IAM.
+3. *Cloud-verified* — this module against the real service with real
+   credentials. Only this closes the gap in (2).
 
-It skips with a precise reason when no target is configured, so the skip can
-never be mistaken for a pass. To run it:
-
-    export CARAVEL_QUALIFICATION_ARTIFACTS_ROOT="az://<container>/<prefix>"
-    # plus whatever that backend's SDK needs to authenticate, e.g.
-    export AZURE_STORAGE_ACCOUNT_NAME=...     # adlfs
-    python3 -m pytest -q tests/qualification
-
-The root must be a container or prefix dedicated to qualification: the suite
-writes committed artifacts under it.
+Every reachable backend is discovered by ``conftest.py`` and each test runs
+against all of them. The suite skips with a precise reason when none is
+reachable, so a skip can never be mistaken for a pass.
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -39,29 +36,21 @@ from caravel import (
 )
 from caravel.durability import BatchPublisher, WorkUnitKey
 
-ARTIFACTS_ROOT_VAR = "CARAVEL_QUALIFICATION_ARTIFACTS_ROOT"
-
-_SKIP_REASON = (
-    f"No credentialed target configured. Set {ARTIFACTS_ROOT_VAR} to an fsspec URL "
-    "for a dedicated container or prefix (for example "
-    "'az://caravel-qualification/run', 's3://bucket/prefix', 'gs://bucket/prefix') "
-    "and authenticate that backend's SDK. Until this runs, remote artifact "
-    "storage is IMPLEMENTED AND LOCALLY QUALIFIED, not cloud-verified."
-)
-
 DOCUMENTS = {f"doc-{index}": {"id": f"doc-{index}", "n": index} for index in range(1, 4)}
 
 
-def _artifacts_root() -> str:
-    root = os.getenv(ARTIFACTS_ROOT_VAR, "").strip()
-    if not root:
-        pytest.skip(_SKIP_REASON, allow_module_level=False)
-    if "://" not in root:
-        pytest.fail(
-            f"{ARTIFACTS_ROOT_VAR}='{root}' is not an fsspec URL. A local path would "
-            "qualify nothing that the ordinary suite does not already cover."
-        )
-    return root.rstrip("/")
+@pytest.fixture()
+def remote_root(backend: Any) -> str:
+    """A unique prefix per test, so repeated qualification never collides."""
+    return f"{backend.root}/{uuid.uuid4().hex}"
+
+
+def _durable(tmp_path: Path, remote_root: str, backend: Any) -> DurableStorage:
+    return DurableStorage.at(
+        tmp_path,
+        artifacts_root=remote_root,
+        storage_options=backend.storage_options or None,
+    )
 
 
 def load(document: Any, *, context: Any) -> Any:
@@ -85,18 +74,12 @@ def _pipeline() -> Pipeline:
     )
 
 
-@pytest.fixture()
-def remote_root() -> str:
-    """A unique prefix per run, so repeated qualification never collides."""
-    return f"{_artifacts_root()}/{uuid.uuid4().hex}"
-
-
 def test_a_job_commits_and_reads_artifacts_on_real_object_storage(
-    tmp_path: Path, remote_root: str
+    tmp_path: Path, remote_root: str, backend: Any
 ) -> None:
     """The supported envelope: local authoritative state, remote artifacts."""
     pipeline = _pipeline()
-    storage = DurableStorage.at(tmp_path, artifacts_root=remote_root)
+    storage = _durable(tmp_path, remote_root, backend)
     try:
         result = run(
             pipeline,
@@ -116,9 +99,11 @@ def test_a_job_commits_and_reads_artifacts_on_real_object_storage(
     assert not (tmp_path / "artifacts").exists(), "artifacts were written locally"
 
 
-def test_committed_artifacts_survive_reopening_the_store(tmp_path: Path, remote_root: str) -> None:
+def test_committed_artifacts_survive_reopening_the_store(
+    tmp_path: Path, remote_root: str, backend: Any
+) -> None:
     pipeline = _pipeline()
-    first = DurableStorage.at(tmp_path, artifacts_root=remote_root)
+    first = _durable(tmp_path, remote_root, backend)
     try:
         run(
             pipeline,
@@ -129,7 +114,7 @@ def test_committed_artifacts_survive_reopening_the_store(tmp_path: Path, remote_
     finally:
         first.close()
 
-    second = DurableStorage.at(tmp_path, artifacts_root=remote_root)
+    second = _durable(tmp_path, remote_root, backend)
     try:
         assert set(second.results(pipeline, job_id="qualification-1").of("load")) == set(DOCUMENTS)
     finally:
@@ -137,7 +122,7 @@ def test_committed_artifacts_survive_reopening_the_store(tmp_path: Path, remote_
 
 
 def test_resuming_reads_committed_remote_output_instead_of_recomputing(
-    tmp_path: Path, remote_root: str
+    tmp_path: Path, remote_root: str, backend: Any
 ) -> None:
     calls: list[str] = []
 
@@ -149,7 +134,7 @@ def test_resuming_reads_committed_remote_output_instead_of_recomputing(
         name="qualification",
         stages=[Stage(name="prepare", entries=[Step(counted, output=JSONDataset(name="load"))])],
     )
-    storage = DurableStorage.at(tmp_path, artifacts_root=remote_root)
+    storage = _durable(tmp_path, remote_root, backend)
     try:
         run(
             pipeline,
@@ -171,10 +156,12 @@ def test_resuming_reads_committed_remote_output_instead_of_recomputing(
         storage.close()
 
 
-def test_an_unreferenced_remote_attempt_is_invisible(tmp_path: Path, remote_root: str) -> None:
+def test_an_unreferenced_remote_attempt_is_invisible(
+    tmp_path: Path, remote_root: str, backend: Any
+) -> None:
     """Readers see only output reachable from a committed reference."""
     pipeline = _pipeline()
-    storage = DurableStorage.at(tmp_path, artifacts_root=remote_root)
+    storage = _durable(tmp_path, remote_root, backend)
     try:
         run(
             pipeline,
@@ -196,10 +183,10 @@ def test_an_unreferenced_remote_attempt_is_invisible(tmp_path: Path, remote_root
 
 
 def test_recomputation_supersedes_remote_output_without_deleting_it(
-    tmp_path: Path, remote_root: str
+    tmp_path: Path, remote_root: str, backend: Any
 ) -> None:
     pipeline = _pipeline()
-    storage = DurableStorage.at(tmp_path, artifacts_root=remote_root)
+    storage = _durable(tmp_path, remote_root, backend)
     try:
         run(
             pipeline,
