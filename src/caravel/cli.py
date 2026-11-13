@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
-from .durability.storage import DurableStorage
+from .durability.storage import DurableStorage, LegacyStateError
 from .runner import run
 from .viz import to_mermaid
 
@@ -56,22 +56,37 @@ def make_cli(
         prog=pipeline.name,
         description=f"Run the '{pipeline.name}' pipeline.",
     )
+    default_output = Path("data") / pipeline.name / "output"
+    parser.add_argument(
+        "--output",
+        default=None,
+        metavar="PATH",
+        help=(f"Where published results go. Default: {default_output}. May be an fsspec URL."),
+    )
     parser.add_argument(
         "--state",
         default=None,
-        help=("Directory for durable state and artifacts. Required unless --ephemeral is given."),
+        metavar="PATH",
+        help=(
+            "Recovery storage directory: the progress store and attempt "
+            "artifacts. Reserved for Caravel; deleting it loses the ability to "
+            "resume. Default: '.caravel' beside the output directory, or "
+            f"data/{pipeline.name}/.caravel when output is remote."
+        ),
     )
     parser.add_argument(
         "--ephemeral",
         action="store_true",
         help=(
-            "Run without durable state. Nothing resumes, and the run reports restart_safe=false."
+            "Use throwaway recovery storage. Published results still go to the "
+            "configured output; nothing resumes and the run reports "
+            "restart_safe=false."
         ),
     )
     parser.add_argument(
         "--job-id",
         default=None,
-        help="Identity of this bounded run. Required with --state.",
+        help="Identity of this bounded run. Required unless --ephemeral.",
     )
     parser.add_argument(
         "--param",
@@ -95,12 +110,14 @@ def make_cli(
             print(mermaid_fn(pipeline))
             return 0
 
-        if args.state and args.ephemeral:
-            parser.error("Choose either --state or --ephemeral, not both.")
-        if not args.state and not args.ephemeral:
+        if args.ephemeral and args.state:
             parser.error(
-                "Durable execution needs a storage decision: pass --state DIR to "
-                "keep state across invocations, or --ephemeral to opt out."
+                "--ephemeral uses throwaway recovery storage, so --state has no effect. Choose one."
+            )
+        if not args.ephemeral and not args.job_id:
+            parser.error(
+                "--job-id is required: a durable run needs a stable identity to "
+                "resume. Use --ephemeral for a throwaway run."
             )
 
         try:
@@ -108,11 +125,19 @@ def make_cli(
         except ValueError as error:
             parser.error(str(error))
 
-        storage = (
-            DurableStorage.ephemeral() if args.ephemeral else DurableStorage.at(Path(args.state))
-        )
-        if storage.restart_safe and not args.job_id:
-            parser.error("--job-id is required with --state: a resume needs an identity.")
+        output = args.output if args.output is not None else default_output
+        try:
+            if args.ephemeral:
+                storage = DurableStorage.ephemeral(output)
+            else:
+                state = args.state
+                if state is None and "://" in str(output):
+                    # Remote output cannot host the progress store; fall back to
+                    # a documented pipeline-scoped local directory.
+                    state = Path("data") / pipeline.name / ".caravel"
+                storage = DurableStorage.at(output, state=state)
+        except (ValueError, LegacyStateError) as error:
+            parser.error(str(error))
 
         result = run_fn(
             pipeline,
@@ -126,6 +151,7 @@ def make_cli(
             f"status={result.status} job_id={result.job_id} "
             f"batches={result.committed_batches} restart_safe={result.restart_safe}"
         )
+        print(f"output={storage.output_root}")
         return 0 if result.status in ("completed", "caught_up", "yielded") else 1
 
     return entrypoint

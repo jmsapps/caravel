@@ -33,7 +33,7 @@ def test_the_branching_example_completes(tmp_path: Path) -> None:
 
 def test_each_record_travels_exactly_one_route(tmp_path: Path) -> None:
     run_branching_pipeline(state_root=tmp_path)
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     try:
         routes: dict[str, str] = {}
         for partition_id in storage.progress.work_unit_partitions("branching-1", BRANCH_NODE):
@@ -54,7 +54,7 @@ def test_each_record_travels_exactly_one_route(tmp_path: Path) -> None:
 
 def test_both_sources_converge_through_the_merge(tmp_path: Path) -> None:
     run_branching_pipeline(state_root=tmp_path)
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     try:
         results = storage.results(build_branching_pipeline(), job_id="branching-1")
         gold = results.of("gold_partition_by_language")
@@ -70,7 +70,7 @@ def test_the_source_tag_does_not_reach_committed_output(tmp_path: Path) -> None:
     from caravel import SOURCE_FIELD
 
     run_branching_pipeline(state_root=tmp_path)
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     try:
         results = storage.results(build_branching_pipeline(), job_id="branching-1")
         for payload in results.of("gold_partition_by_language").values():

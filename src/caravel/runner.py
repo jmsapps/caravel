@@ -92,6 +92,7 @@ def run(
         restart_safe=storage.restart_safe,
         plugins=plugins,
         storage_root=str(storage.root or ""),
+        publisher=storage.publisher(pipeline_id or pipeline.name),
     )
     return invocation.run()
 

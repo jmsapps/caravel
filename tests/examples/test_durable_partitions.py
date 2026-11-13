@@ -27,7 +27,7 @@ def test_the_example_produces_a_summary_behind_its_barrier(tmp_path: Path) -> No
 
     run_to_completion(tmp_path)
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     try:
         job = storage.progress.load_job("snapshot-v1")
         assert job is not None and job.status == "completed"

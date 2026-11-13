@@ -10,27 +10,10 @@ from .datasets import JSONDataset
 from .retry import RetryPolicy
 from .types import Dataset, Loader, StepFn
 
-_STEP_OUTPUT_ATTR = "__step_output_dataset__"
-_STEP_PERSIST_ATTR = "__step_persist__"
-
 
 def _callable_name(fn: Callable[..., Any]) -> str:
     """Return a stable callable name for default step naming."""
     return getattr(fn, "__name__", fn.__class__.__name__)
-
-
-def _get_decorated_output(fn: Callable[..., Any]) -> Dataset | None:
-    output = getattr(fn, _STEP_OUTPUT_ATTR, None)
-    if output is None:
-        return None
-
-    if not isinstance(output, Dataset):
-        raise TypeError(
-            f"Callable '{_callable_name(fn)}' has invalid decorated output "
-            f"type {type(output).__name__}; expected Dataset."
-        )
-
-    return output
 
 
 def _with_default_dataset_name(output: Dataset, *, step_name: str) -> Dataset:
@@ -46,36 +29,6 @@ def _with_default_dataset_name(output: Dataset, *, step_name: str) -> Dataset:
         raise TypeError(f"Dataset name must be str, got {type(dataset_name).__name__}.")
 
     return output
-
-
-def _get_decorated_persist(fn: Callable[..., Any]) -> bool | None:
-    persist = getattr(fn, _STEP_PERSIST_ATTR, None)
-    if persist is None:
-        return None
-    if not isinstance(persist, bool):
-        raise TypeError(
-            f"Callable '{_callable_name(fn)}' has invalid decorated persist "
-            f"type {type(persist).__name__}; expected bool."
-        )
-    return persist
-
-
-def step(*, output: Dataset, persist: bool = True) -> Callable[[StepFn], StepFn]:
-    """Attach a Dataset to a step function without wrapping callable identity."""
-    if not isinstance(output, Dataset):
-        raise TypeError(f"step(output=...) expected Dataset, got {type(output).__name__}.")
-    if not isinstance(persist, bool):
-        raise TypeError(f"step(..., persist=...) expected bool, got {type(persist).__name__}.")
-
-    def decorator(fn: StepFn) -> StepFn:
-        if not callable(fn):
-            raise TypeError(f"step decorator expected callable, got {type(fn).__name__}.")
-        attached_output = _with_default_dataset_name(output, step_name=_callable_name(fn))
-        setattr(fn, _STEP_OUTPUT_ATTR, attached_output)
-        setattr(fn, _STEP_PERSIST_ATTR, persist)
-        return fn
-
-    return decorator
 
 
 @dataclass
@@ -108,10 +61,9 @@ class Step:
             raise TypeError(f"Step.fn must be callable, got {type(self.fn).__name__}.")
 
         if self.output is None:
-            # A simple declaration needs no dataset: the processor's output is
+            # A declaration needs no dataset: the processor's output is
             # persisted as JSON under the step's own name.
-            decorated = _get_decorated_output(self.fn)
-            self.output = decorated if decorated is not None else JSONDataset()
+            self.output = JSONDataset()
         if not isinstance(self.output, Dataset):
             raise TypeError(
                 f"Step.output must satisfy Dataset protocol, got {type(self.output).__name__}."
@@ -198,11 +150,8 @@ class Stage:
                 continue
 
             if callable(entry):
-                decorated_output = _get_decorated_output(entry)
-                decorated_persist = _get_decorated_persist(entry)
-                output = decorated_output or JSONDataset()
-                persist = True if decorated_persist is None else decorated_persist
-                normalized.append(Step(fn=entry, output=output, persist=persist))
+                # Shorthand for a step that wants every documented default.
+                normalized.append(Step(fn=entry))
                 continue
 
             raise TypeError(
@@ -254,4 +203,4 @@ class Pipeline:
         self.stages = normalized_stages
 
 
-__all__ = ["Step", "Stage", "Pipeline", "step"]
+__all__ = ["Pipeline", "Stage", "Step"]

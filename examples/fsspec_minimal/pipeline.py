@@ -23,7 +23,6 @@ from caravel import (
     Step,
     dataset_as_loader,
     run,
-    step,
 )
 
 PIPELINE_NAME = "fsspec_minimal_example"
@@ -44,14 +43,12 @@ def _runtime_params(context: object) -> Mapping[str, str]:
     return {}
 
 
-@step(output=JSONDataset())
 def bronze_collect(record: dict[str, Any], *, context: object) -> dict[str, Any]:
     """Add bronze fields to one execution partition's record."""
     _ = context
     return {**record, "bronze": True, "doubled_value": int(record["value"]) * 2}
 
 
-@step(output=JSONDataset())
 def silver_transform(record: dict[str, Any], *, context: object) -> dict[str, Any]:
     """Normalize one bronze record."""
     _ = context
@@ -86,11 +83,11 @@ def build_fsspec_pipeline(
     return Pipeline(
         name=PIPELINE_NAME,
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[bronze_collect]),
+            Stage(name=BRONZE_STAGE_NAME, entries=[Step(bronze_collect, output=JSONDataset())]),
             Stage(
                 name=SILVER_STAGE_NAME,
                 entries=[
-                    silver_transform,
+                    Step(silver_transform, output=JSONDataset()),
                     Step(
                         silver_finalize,
                         output=JSONDataset(name="finalize"),
@@ -113,7 +110,7 @@ def build_fsspec_storage(
 ) -> DurableStorage:
     """Local authoritative state; artifacts wherever they are configured."""
     return DurableStorage.at(
-        state_root,
+        Path(state_root) / "output",
         artifacts_root=artifacts_root or os.getenv("CARAVEL_ARTIFACTS_ROOT"),
         storage_options=storage_options,
     )

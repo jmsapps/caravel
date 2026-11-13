@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from caravel.datasets import PartitionedJSONDataset
-from caravel.pipeline import Pipeline, Stage, step
+from caravel.pipeline import Pipeline, Stage, Step
 
 PARAM_CANARY = "PARAM_SECRET_CANARY"
 PAYLOAD_CANARY = "PAYLOAD_SECRET_CANARY"
@@ -28,14 +28,18 @@ class _StubLoader:
 
 
 def _canary_pipeline(name: str = "canary_pipeline") -> Pipeline:
-    @step(output=PartitionedJSONDataset(name="canary_output"))
     def emit(record: dict[str, object], *, context: object) -> dict[str, dict[str, object]]:
         _ = context
         return {"canary": {**record, "secret": PAYLOAD_CANARY}}
 
     return Pipeline(
         name=name,
-        stages=[Stage(name="bronze", entries=[emit])],
+        stages=[
+            Stage(
+                name="bronze",
+                entries=[Step(emit, output=PartitionedJSONDataset(name="canary_output"))],
+            )
+        ],
     )
 
 
@@ -50,7 +54,7 @@ def test_framework_logs_contain_no_payload_or_param_values(
             _canary_pipeline(),
             job_id="canary",
             source=InMemorySource({"p1": {"secret": PAYLOAD_CANARY}}),
-            storage=DurableStorage.at(tmp_path),
+            storage=DurableStorage.at(tmp_path / "output"),
             params={"api_key": PARAM_CANARY},
         )
 
@@ -109,7 +113,7 @@ def test_committed_artifacts_contain_only_payload_files(tmp_path: Path) -> None:
     from caravel import DurableStorage, InMemorySource
     from caravel.runner import run
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     run(
         _canary_pipeline(),
         job_id="layout",

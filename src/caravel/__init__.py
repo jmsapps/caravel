@@ -43,7 +43,7 @@ from .durability import (
 )
 from .loaders import CallableLoader, MultiSourceLoader, dataset_as_loader
 from .paths import partition_key_to_relpath, validate_partition_key
-from .pipeline import Pipeline, Stage, Step, step
+from .pipeline import Pipeline, Stage, Step
 from .retry import (
     FailureContext,
     RetryBudget,
@@ -81,7 +81,6 @@ __all__ = [
     "Pipeline",
     "Stage",
     "Step",
-    "step",
     "Branch",
     # Execution: one entry point, one model
     "run",

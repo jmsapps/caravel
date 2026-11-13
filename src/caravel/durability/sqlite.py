@@ -12,6 +12,7 @@ a read-validate-write sequence can never interleave with a competing writer.
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from contextlib import contextmanager
@@ -19,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from types import TracebackType
-from typing import Callable, Iterator, Sequence, cast
+from typing import Any, Callable, Iterator, Sequence, cast
 
 from .store import validate_capabilities
 from .types import (
@@ -62,6 +63,10 @@ _WAL_FIXED_RANGES = (
 )
 
 _SCHEMA_STATEMENTS = (
+    "CREATE TABLE IF NOT EXISTS publication_files ("
+    "job_id TEXT NOT NULL, node_id TEXT NOT NULL, partition_id TEXT NOT NULL, "
+    "output_generation INTEGER NOT NULL, files TEXT NOT NULL, "
+    "PRIMARY KEY(job_id, node_id, partition_id, output_generation))",
     "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS jobs ("
     "job_id TEXT PRIMARY KEY, pipeline_id TEXT NOT NULL, lineage TEXT NOT NULL, "
@@ -89,6 +94,7 @@ _SCHEMA_STATEMENTS = (
     "claim_epoch INTEGER NOT NULL DEFAULT 0, fence_token INTEGER NOT NULL DEFAULT 0, "
     "lease_expires_at TEXT, generation INTEGER NOT NULL DEFAULT 0, sealed_at TEXT, "
     "error_type TEXT, route_key TEXT, output_generation INTEGER NOT NULL DEFAULT 0, "
+    "published_generation INTEGER NOT NULL DEFAULT -1, "
     "PRIMARY KEY (job_id, node_id, partition_id))",
     "CREATE INDEX IF NOT EXISTS work_units_eligible ON work_units "
     "(job_id, status, pending_deps, partition_id, node_id)",
@@ -267,6 +273,7 @@ def _work_unit_from_row(row: sqlite3.Row) -> WorkUnitState:
         error_type=_optional_text(row, "error_type"),
         route_key=_optional_text(row, "route_key"),
         output_generation=_integer(row, "output_generation"),
+        published_generation=_integer(row, "published_generation"),
     )
 
 
@@ -1524,12 +1531,121 @@ class SQLiteDurableStore:
             _fire_failpoint("after_unit_failed")
             return _work_unit_from_row(self._require_work_unit(connection, key))
 
+    def mark_published(
+        self, key: WorkUnitKey, *, generation: int, files: Sequence[str] | None = None
+    ) -> bool:
+        """Compare-and-set the materialized generation for a unit.
+
+        Publication progress lives in the authoritative store rather than
+        beside the published files. The update applies only while
+        ``generation`` is still the unit's current output generation, so a
+        publisher that paused across a recomputation loses the race and learns
+        about it from the return value: ``False`` means a newer generation
+        exists and this publisher's physical writes are stale.
+        """
+        validate_counter("generation", generation)
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE work_units SET published_generation = ? "
+                "WHERE job_id = ? AND node_id = ? AND partition_id = ? "
+                "AND output_generation = ?",
+                (generation, key.job_id, key.node_id, key.partition_id, generation),
+            )
+            if cursor.rowcount and files is not None:
+                connection.execute(
+                    "INSERT OR REPLACE INTO publication_files VALUES (?, ?, ?, ?, ?)",
+                    (
+                        key.job_id,
+                        key.node_id,
+                        key.partition_id,
+                        generation,
+                        json.dumps(sorted(files)),
+                    ),
+                )
+            return bool(cursor.rowcount)
+
+    def publication_snapshot(self, job_id: str) -> dict[str, Any]:
+        """Everything a completion manifest must agree with, read atomically.
+
+        Validating a manifest with separate reads can straddle a commit and
+        approve a state that never existed. One transaction gives the job's
+        identity, status, generation, and the full set of sealed units.
+        """
+        validate_identifier("job_id", job_id)
+        with self._transaction() as connection:
+            job_row = connection.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if job_row is None:
+                return {"job": None, "sealed": {}}
+            rows = connection.execute(
+                "SELECT node_id, partition_id, output_generation FROM work_units "
+                "WHERE job_id = ? AND status = 'sealed'",
+                (job_id,),
+            ).fetchall()
+            file_rows = connection.execute(
+                "SELECT p.node_id, p.partition_id, p.files FROM publication_files p "
+                "JOIN work_units w ON w.job_id = p.job_id AND w.node_id = p.node_id "
+                "AND w.partition_id = p.partition_id "
+                "AND w.output_generation = p.output_generation "
+                "WHERE p.job_id = ? AND w.status = 'sealed' "
+                "AND w.published_generation = w.output_generation",
+                (job_id,),
+            ).fetchall()
+        return {
+            "job": _job_from_row(job_row),
+            "sealed": {
+                (_text(row, "node_id"), _text(row, "partition_id")): _integer(
+                    row, "output_generation"
+                )
+                for row in rows
+            },
+            "files": {
+                (_text(row, "node_id"), _text(row, "partition_id")): json.loads(_text(row, "files"))
+                for row in file_rows
+            },
+        }
+
+    def mark_unpublished(self, key: WorkUnitKey) -> None:
+        """Forget that a unit was published, so a rebuild republishes it.
+
+        Used by the explicit rebuild operation, which repairs a published tree
+        that was changed behind the store's back.
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE work_units SET published_generation = -1 "
+                "WHERE job_id = ? AND node_id = ? AND partition_id = ?",
+                (key.job_id, key.node_id, key.partition_id),
+            )
+
+    def unpublished_sealed_units(
+        self, job_id: str, *, limit: int = 1000
+    ) -> tuple[WorkUnitState, ...]:
+        """Sealed units whose current output generation is not yet materialized.
+
+        This is how publication recovers: a crash between sealing and writing
+        leaves the unit here, and the next invocation picks it up.
+        """
+        validate_identifier("job_id", job_id)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("unpublished_sealed_units limit must be a positive integer.")
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT * FROM work_units WHERE job_id = ? AND status = 'sealed' "
+                "AND published_generation != output_generation "
+                "ORDER BY partition_id, node_id LIMIT ?",
+                (job_id, limit),
+            ).fetchall()
+        return tuple(_work_unit_from_row(row) for row in rows)
+
     def invalidate_node(
         self,
         job_id: str,
         node_id: str,
         *,
         partitions: Sequence[str] | None = None,
+        invalidated_generations: dict[WorkUnitKey, int] | None = None,
     ) -> tuple[WorkUnitKey, ...]:
         """Invalidate a node's output and everything derived from it.
 
@@ -1564,9 +1680,14 @@ class SQLiteDurableStore:
             self._reject_live_claims(connection, job_id, closure)
 
             for unit_node_id, unit_partition_id in sorted(closure):
+                if invalidated_generations is not None:
+                    key = WorkUnitKey(job_id, unit_node_id, unit_partition_id)
+                    row = self._require_work_unit(connection, key)
+                    invalidated_generations[key] = _integer(row, "output_generation")
                 connection.execute(
                     "UPDATE work_units SET status = 'eligible', "
                     "output_generation = output_generation + 1, "
+                    "published_generation = -1, "
                     "generation = generation + 1, cursor = NULL, batch_count = 0, "
                     "input_exhausted = 0, owner_id = NULL, lease_expires_at = NULL, "
                     "sealed_at = NULL, error_type = NULL, route_key = NULL "

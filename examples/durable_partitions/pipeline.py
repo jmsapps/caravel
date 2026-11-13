@@ -6,6 +6,21 @@ barrier. An invocation budget forces the work across several invocations, and a
 consumer reads committed batches from its own durable position while production
 is still ongoing.
 
+``DurableStorage.at(<root>/output)`` publishes readable results there and
+keeps reserved execution storage in ``.caravel`` beside it:
+
+.. code-block:: text
+
+    <root>/
+      .caravel/                            reserved; required for recovery
+        state.sqlite3
+        attempts/...                       immutable, uuid-named
+      output/examples/durable-partitions/snapshot-v1/
+        001-prepare/001-enrich/doc-001.json
+        002-publish/001-publish/doc-001.json
+        003-summary/001-summarize/__all__.json
+        _job.json                          advisory completion snapshot
+
 Nothing here is domain specific: the "documents" are plain dictionaries.
 """
 
@@ -95,7 +110,7 @@ def build_pipeline() -> Pipeline:
 
 def run_to_completion(root: Path, *, job_id: str = "snapshot-v1") -> dict[str, Any]:
     """Invoke the job repeatedly until it completes, as a scheduler would."""
-    storage = DurableStorage.at(root)
+    storage = DurableStorage.at(Path(root) / "output")
     store = storage.progress
     output = storage.output
     pipeline = build_pipeline()
@@ -139,6 +154,7 @@ def run_to_completion(root: Path, *, job_id: str = "snapshot-v1") -> dict[str, A
             "status": result.status,
             "invocations": invocations,
             "consumed_before_completion": consumed,
+            "published_root": str(storage.output_root),
         }
     finally:
         store.close()

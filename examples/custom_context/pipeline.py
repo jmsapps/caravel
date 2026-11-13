@@ -84,7 +84,7 @@ def run_custom_context_pipeline(*, state_root: Path | str, job_id: str = "custom
     return run(
         build_custom_context_pipeline(),
         job_id=job_id,
-        storage=DurableStorage.at(state_root),
+        storage=DurableStorage.at(Path(state_root) / "output"),
         context_factory=make_job_context,
     )
 

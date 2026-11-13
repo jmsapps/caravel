@@ -61,7 +61,8 @@ from .sources import (
     SourceVersionError,
 )
 from .sqlite import SQLiteDurableStore
-from .storage import DurableStorage, JobResults
+from .publish import OutputPublisher, read_job_manifest, validate_job_manifest
+from .storage import DurableStorage, JobResults, LegacyStateError
 from .store import DurableStore, validate_capabilities
 from .types import (
     DURABLE_SCHEMA_VERSION,
@@ -145,6 +146,10 @@ __all__ = [
     "PartitionSource",
     "PipelineCheckpoint",
     "DurableStorage",
+    "LegacyStateError",
+    "OutputPublisher",
+    "read_job_manifest",
+    "validate_job_manifest",
     "JobResults",
     "SQLiteDurableStore",
     "RetentionExpiredError",

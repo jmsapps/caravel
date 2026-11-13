@@ -79,7 +79,7 @@ def test_a_simple_pipeline_declares_no_loader_and_no_dataset(tmp_path: Path) -> 
         pipeline,
         job_id="snapshot-v7",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
     )
     assert result.status == "completed"
     assert result.pipeline_id == "documents"
@@ -92,7 +92,7 @@ def test_a_bare_callable_entry_is_still_a_step(tmp_path: Path) -> None:
         pipeline,
         job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
     )
     assert result.status == "completed"
 
@@ -117,10 +117,10 @@ def test_omitting_storage_is_rejected_rather_than_defaulted(tmp_path: Path) -> N
 
 
 def test_durable_storage_reports_restart_safety_honestly(tmp_path: Path) -> None:
-    durable = DurableStorage.at(tmp_path)
+    durable = DurableStorage.at(tmp_path / "output")
     assert durable.restart_safe is True
 
-    volatile = DurableStorage.ephemeral()
+    volatile = DurableStorage.ephemeral(tmp_path / "output")
     assert volatile.restart_safe is False
 
 
@@ -131,7 +131,7 @@ def test_ephemeral_storage_must_be_chosen_explicitly(tmp_path: Path) -> None:
         pipeline,
         job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.ephemeral(),
+        storage=DurableStorage.ephemeral(tmp_path / "output"),
     )
     assert result.status == "completed"
     assert result.restart_safe is False, "ephemeral runs must not claim restart safety"
@@ -143,7 +143,7 @@ def test_a_durable_run_reports_restart_safety(tmp_path: Path) -> None:
         pipeline,
         job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
     )
     assert result.restart_safe is True
 
@@ -169,7 +169,7 @@ def test_json_text_and_partitioned_datasets_all_persist_execution_output(
     tmp_path: Path, dataset: Any, processor: Any, expected: Any
 ) -> None:
     processor.__name__ = "produce"
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
         name="documents",
         stages=[Stage(name="prepare", entries=[Step(processor, output=dataset)])],
@@ -183,7 +183,7 @@ def test_json_text_and_partitioned_datasets_all_persist_execution_output(
 
 def test_an_undeclared_input_is_one_partition(tmp_path: Path) -> None:
     """A simple function declaration keeps one recovery unit; nothing is split."""
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(load)])])
     run(
         pipeline,
@@ -195,7 +195,7 @@ def test_an_undeclared_input_is_one_partition(tmp_path: Path) -> None:
 
 
 def test_declared_partitions_execute_independently(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(load)])])
     run(pipeline, job_id="j1", source=InMemorySource(DOCUMENTS), storage=storage)
     assert set(storage.results(pipeline, job_id="j1").of("load")) == set(DOCUMENTS)
@@ -230,7 +230,7 @@ def test_a_partition_crosses_a_stage_boundary_before_others_finish(
         pipeline,
         job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
     )
     assert result.status == "completed"
     # Depth-first per partition: no stage-wide barrier exists.
@@ -238,7 +238,7 @@ def test_a_partition_crosses_a_stage_boundary_before_others_finish(
 
 
 def test_an_all_input_step_is_the_only_whole_run_barrier(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
         name="documents",
         stages=[
@@ -253,7 +253,7 @@ def test_an_all_input_step_is_the_only_whole_run_barrier(tmp_path: Path) -> None
 
 
 def test_a_barrier_over_empty_input_still_runs(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
         name="documents",
         stages=[
@@ -282,7 +282,7 @@ def test_snapshot_execution_runs_through_run(tmp_path: Path) -> None:
         pipeline,
         job_id="snapshot-v7",
         source=SnapshotInput(adapter=adapter, snapshot="v7"),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
         budget=ExecutionBudget(seconds=50, shutdown_margin_seconds=5),
     )
     assert result.status == "completed"
@@ -298,7 +298,7 @@ def test_a_moved_snapshot_pin_fails_before_processing(tmp_path: Path) -> None:
             pipeline,
             job_id="snapshot-v7",
             source=SnapshotInput(adapter=adapter, snapshot="v7"),
-            storage=DurableStorage.at(tmp_path),
+            storage=DurableStorage.at(tmp_path / "output"),
         )
 
 
@@ -318,7 +318,7 @@ def test_incremental_execution_runs_through_run(tmp_path: Path) -> None:
         for i in range(3)
     ]
     adapter = ListChangeAdapter(events)
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="changes", stages=[Stage(name="apply", entries=[Step(load)])])
 
     first = run(
@@ -355,7 +355,7 @@ def test_a_failed_run_resumes_without_reprocessing_committed_work(
     tmp_path: Path,
 ) -> None:
     calls: list[str] = []
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
 
     def flaky(document: Any, *, context: Any) -> Any:
         calls.append(document["id"])
@@ -382,7 +382,7 @@ def test_a_budget_yields_and_a_later_invocation_finishes_the_job(
 ) -> None:
     import time
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
 
     def slow(document: Any, *, context: Any) -> Any:
         time.sleep(0.01)
@@ -405,7 +405,7 @@ def test_a_budget_yields_and_a_later_invocation_finishes_the_job(
 
 
 def test_reinvoking_a_completed_job_reprocesses_nothing(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(load)])])
     run(pipeline, job_id="j1", source=InMemorySource(DOCUMENTS), storage=storage)
     again = run(pipeline, job_id="j1", source=InMemorySource(DOCUMENTS), storage=storage)
@@ -436,14 +436,14 @@ def test_a_step_retry_recovers_a_transient_failure(tmp_path: Path) -> None:
         pipeline,
         job_id="j1",
         source=InMemorySource({"only": {"id": "only"}}),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
     )
     assert result.status == "completed"
     assert attempts["n"] == 2
 
 
 def test_batch_size_gives_a_finer_commit_boundary(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
 
     def double(records: Any, *, context: Any) -> Any:
         return [value * 2 for value in records]
@@ -483,7 +483,7 @@ def test_the_same_policy_retries_a_single_operation_inside_a_processor(
         pipeline,
         job_id="j1",
         source=InMemorySource({"p1": {"id": "p1"}}),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
     )
     assert result.status == "completed"
     assert attempts["n"] == 3
@@ -495,7 +495,7 @@ def test_the_same_policy_retries_a_single_operation_inside_a_processor(
 
 
 def test_concurrency_is_a_policy_on_the_same_engine(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(load)])])
     result = run(
         pipeline,
@@ -554,8 +554,8 @@ def test_ephemeral_runs_the_identical_state_machine(tmp_path: Path) -> None:
         ],
     )
 
-    durable = DurableStorage.at(tmp_path / "durable")
-    volatile = DurableStorage.ephemeral(root=tmp_path / "volatile")
+    durable = DurableStorage.at(tmp_path / "durable" / "output")
+    volatile = DurableStorage.ephemeral(tmp_path / "volatile")
 
     durable_result = run(pipeline, job_id="j1", source=InMemorySource(DOCUMENTS), storage=durable)
     volatile_result = run(pipeline, job_id="j1", source=InMemorySource(DOCUMENTS), storage=volatile)
@@ -579,7 +579,7 @@ def test_ephemeral_runs_the_identical_state_machine(tmp_path: Path) -> None:
 def test_ephemeral_still_resumes_within_one_process(tmp_path: Path) -> None:
     """Commit rules are unchanged, so a retry still skips committed work."""
     calls: list[str] = []
-    storage = DurableStorage.ephemeral(root=tmp_path)
+    storage = DurableStorage.ephemeral(tmp_path / "output")
 
     def flaky(document: Any, *, context: Any) -> Any:
         calls.append(document["id"])

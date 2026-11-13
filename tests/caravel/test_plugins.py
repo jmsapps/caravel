@@ -84,7 +84,7 @@ def test_an_observer_sees_the_run_and_work_unit_lifecycle(tmp_path: Path) -> Non
         _pipeline(),
         job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
         plugins=[recorder],
     )
     assert result.status == "completed"
@@ -102,7 +102,7 @@ def test_event_facts_describe_the_durable_work_unit(tmp_path: Path) -> None:
         _pipeline(),
         job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
         plugins=[recorder],
     )
     completed = [e for e in recorder.events if e.kind == "node_completed"]
@@ -127,7 +127,7 @@ def test_an_ephemeral_run_tells_observers_it_is_not_restart_safe(
     run(
         _pipeline(),
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.ephemeral(root=tmp_path),
+        storage=DurableStorage.ephemeral(tmp_path / "output"),
         plugins=[recorder],
     )
     assert all(event.run.restart_safe is False for event in recorder.events)
@@ -139,7 +139,7 @@ def test_a_required_observer_failure_fails_the_run(tmp_path: Path) -> None:
             _pipeline(),
             job_id="j1",
             source=InMemorySource(DOCUMENTS),
-            storage=DurableStorage.at(tmp_path),
+            storage=DurableStorage.at(tmp_path / "output"),
             plugins=[Exploder("required")],
         )
 
@@ -151,7 +151,7 @@ def test_a_best_effort_observer_failure_does_not_fail_the_run(
         _pipeline(),
         job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
         plugins=[Exploder("best_effort")],
     )
     assert result.status == "completed"
@@ -159,7 +159,7 @@ def test_a_best_effort_observer_failure_does_not_fail_the_run(
 
 def test_committed_work_survives_a_required_observer_failure(tmp_path: Path) -> None:
     """An observer cannot undo what already committed."""
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     with pytest.raises(PluginFailureError):
         run(
@@ -183,7 +183,7 @@ def test_guards_enter_in_order_and_exit_in_reverse(tmp_path: Path) -> None:
         _pipeline(),
         job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path),
+        storage=DurableStorage.at(tmp_path / "output"),
         plugins=[Guard("outer", log), Guard("inner", log)],
     )
     assert log == [
@@ -206,7 +206,7 @@ def test_a_failing_run_still_exits_its_guards(tmp_path: Path) -> None:
             pipeline,
             job_id="j1",
             source=InMemorySource(DOCUMENTS),
-            storage=DurableStorage.at(tmp_path),
+            storage=DurableStorage.at(tmp_path / "output"),
             plugins=[Guard("outer", log)],
         )
     assert log == ["enter:outer", "exit:outer:failed"]
@@ -219,7 +219,7 @@ def test_teardown_is_attempted_for_every_entered_guard(tmp_path: Path) -> None:
             _pipeline(),
             job_id="j1",
             source=InMemorySource(DOCUMENTS),
-            storage=DurableStorage.at(tmp_path),
+            storage=DurableStorage.at(tmp_path / "output"),
             plugins=[Guard("outer", log), Guard("inner", log, fail_exit=True)],
         )
     # The outer guard still got its exit despite the inner one failing.

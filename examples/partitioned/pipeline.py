@@ -9,9 +9,9 @@ from caravel import (
     PartitionedTextDataset,
     Pipeline,
     Stage,
+    Step,
     dataset_as_loader,
     run,
-    step,
 )
 
 PIPELINE_NAME = "partitioned_example"
@@ -34,7 +34,6 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx:end_idx]
 
 
-@step(output=PartitionedTextDataset(suffix=".html", encoding="utf-8"))
 def bronze_render_html(record: dict[str, Any], *, context: object) -> dict[str, str]:
     """Render one source record into a deterministic HTML partition."""
     _ = context
@@ -49,7 +48,6 @@ def bronze_render_html(record: dict[str, Any], *, context: object) -> dict[str, 
     }
 
 
-@step(output=PartitionedJSONDataset())
 def silver_extract_structured(
     payload: dict[str, str], *, context: object
 ) -> dict[str, dict[str, Any]]:
@@ -70,7 +68,6 @@ def silver_extract_structured(
     return structured
 
 
-@step(output=PartitionedJSONDataset())
 def gold_partition_by_language(
     payload: dict[str, dict[str, Any]], *, context: object
 ) -> dict[str, dict[str, Any]]:
@@ -104,9 +101,23 @@ def build_partitioned_pipeline(input_dir: Path | str | None = None) -> Pipeline:
         name=PIPELINE_NAME,
         source=dataset_as_loader(PartitionedJSONDataset(name="partitioned_seed", path=seed_dir)),
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[bronze_render_html]),
-            Stage(name=SILVER_STAGE_NAME, entries=[silver_extract_structured]),
-            Stage(name=GOLD_STAGE_NAME, entries=[gold_partition_by_language]),
+            Stage(
+                name=BRONZE_STAGE_NAME,
+                entries=[
+                    Step(
+                        bronze_render_html,
+                        output=PartitionedTextDataset(suffix=".html", encoding="utf-8"),
+                    )
+                ],
+            ),
+            Stage(
+                name=SILVER_STAGE_NAME,
+                entries=[Step(silver_extract_structured, output=PartitionedJSONDataset())],
+            ),
+            Stage(
+                name=GOLD_STAGE_NAME,
+                entries=[Step(gold_partition_by_language, output=PartitionedJSONDataset())],
+            ),
         ],
     )
 
@@ -119,7 +130,7 @@ def run_partitioned_pipeline(
 ) -> Any:
     """Run the partitioned example and return its structured status."""
     pipeline = build_partitioned_pipeline(input_dir=input_dir)
-    return run(pipeline, job_id=job_id, storage=DurableStorage.at(state_root))
+    return run(pipeline, job_id=job_id, storage=DurableStorage.at(Path(state_root) / "output"))
 
 
 __all__ = [

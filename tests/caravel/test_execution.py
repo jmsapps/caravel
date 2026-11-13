@@ -22,14 +22,13 @@ from caravel import (
     Step,
     TextDataset,
     run,
-    step,
 )
 
 DOCUMENTS = {"doc-1": {"id": "doc-1", "n": 1}, "doc-2": {"id": "doc-2", "n": 2}}
 
 
 def _run(pipeline: Pipeline, tmp_path: Path, **kwargs: Any) -> Any:
-    storage = kwargs.pop("storage", None) or DurableStorage.at(tmp_path)
+    storage = kwargs.pop("storage", None) or DurableStorage.at(tmp_path / "output")
     return run(
         pipeline,
         job_id=kwargs.pop("job_id", "j1"),
@@ -120,7 +119,7 @@ def test_a_downstream_step_receives_the_upstream_payload(tmp_path: Path) -> None
         assert set(payload) == {"produced"}
         return {"consumed": payload["produced"]}
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
         name="p",
         stages=[Stage(name="a", entries=[Step(produce)]), Stage(name="b", entries=[Step(consume)])],
@@ -134,13 +133,15 @@ def test_a_downstream_step_receives_the_upstream_payload(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_the_step_decorator_still_attaches_a_dataset(tmp_path: Path) -> None:
-    @step(output=TextDataset(name="rendered"))
+def test_a_declared_dataset_is_used_for_the_committed_output(tmp_path: Path) -> None:
     def render(document: Any, *, context: Any) -> Any:
         return f"id={document['id']}"
 
-    storage = DurableStorage.at(tmp_path)
-    pipeline = Pipeline(name="p", stages=[Stage(name="s", entries=[render])])
+    storage = DurableStorage.at(tmp_path / "output")
+    pipeline = Pipeline(
+        name="p",
+        stages=[Stage(name="s", entries=[Step(render, output=TextDataset(name="rendered"))])],
+    )
     _run(pipeline, tmp_path, storage=storage)
     assert storage.results(pipeline, job_id="j1").of("render")["doc-1"] == "id=doc-1"
 
@@ -170,7 +171,7 @@ def test_a_pipeline_may_declare_its_own_source(tmp_path: Path) -> None:
         source=InMemorySource(DOCUMENTS),
     )
     pipeline.stages[0].entries[0].name = "identity"
-    result = run(pipeline, job_id="j1", storage=DurableStorage.at(tmp_path))
+    result = run(pipeline, job_id="j1", storage=DurableStorage.at(tmp_path / "output"))
     assert result.status == "completed"
 
 
@@ -178,7 +179,7 @@ def test_a_loader_is_accepted_as_a_source(tmp_path: Path) -> None:
     """Loaders describe input; they are not a second execution path."""
     from caravel import CallableLoader
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="p", stages=[Stage(name="s", entries=[Step(lambda d, *, context: d)])])
     pipeline.stages[0].entries[0].name = "identity"
     result = run(
@@ -197,7 +198,7 @@ def test_running_without_any_source_is_rejected(tmp_path: Path) -> None:
     pipeline = Pipeline(name="p", stages=[Stage(name="s", entries=[Step(lambda d, *, context: d)])])
     pipeline.stages[0].entries[0].name = "identity"
     with pytest.raises(SourceError, match="No input source"):
-        run(pipeline, job_id="j1", storage=DurableStorage.at(tmp_path))
+        run(pipeline, job_id="j1", storage=DurableStorage.at(tmp_path / "output"))
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +214,7 @@ def test_the_source_tag_is_stripped_before_output_is_committed(tmp_path: Path) -
         assert SOURCE_FIELD in record, "steps still see the tag"
         return record
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="p", stages=[Stage(name="s", entries=[Step(passthrough)])])
     run(
         pipeline,
@@ -229,7 +230,7 @@ def test_the_source_tag_is_stripped_before_output_is_committed(tmp_path: Path) -
 def test_keep_source_tag_retains_it_when_asked(tmp_path: Path) -> None:
     from caravel import SOURCE_FIELD, CallableLoader
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
         name="p",
         stages=[Stage(name="s", entries=[Step(lambda r, *, context: r)])],

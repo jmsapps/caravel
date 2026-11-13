@@ -260,6 +260,9 @@ class WorkUnitState:
     output_generation: int = 0
     """Which generation of this unit's output is current. Invalidation bumps it,
     superseding earlier committed output without deleting it."""
+    published_generation: int = -1
+    """Which generation has been materialized into the published output tree.
+    Equal to ``output_generation`` once published; never a second authority."""
 
     def __post_init__(self) -> None:
         validate_member("input_scope", self.input_scope, INPUT_SCOPES)

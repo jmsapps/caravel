@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from .branch import Branch
-from .pipeline import Pipeline, Step, _get_decorated_output, _get_decorated_persist
+from .pipeline import Pipeline, Step
 from .types import Dataset
 
 PLAN_SCHEMA_VERSION = 1
@@ -38,29 +38,17 @@ def _validate_path_safe_name(value: str, *, what: str) -> None:
 def _normalize_route_step(step_like: Step | Callable[..., Any], *, branch_name: str) -> Step:
     """Normalize a branch route entry into a Step declaration.
 
-    Route callables must be decorated with ``@step``; a bare callable has no
-    declared output and is rejected, matching runner behavior.
+    A route entry is a ``Step``, or a bare callable that wants every documented
+    ``Step`` default -- the same shorthand a stage entry accepts.
     """
     if isinstance(step_like, Step):
         return step_like
 
     if callable(step_like):
-        decorated_output = _get_decorated_output(step_like)
-        if decorated_output is None:
-            raise TypeError(
-                f"Branch '{branch_name}' route step "
-                f"'{getattr(step_like, '__name__', type(step_like).__name__)}' "
-                "must be decorated with @step(output=...)."
-            )
-        decorated_persist = _get_decorated_persist(step_like)
-        return Step(
-            fn=step_like,
-            output=decorated_output,
-            persist=True if decorated_persist is None else decorated_persist,
-        )
+        return Step(fn=step_like)
 
     raise TypeError(
-        f"Branch '{branch_name}' route entry must be a Step or decorated callable, "
+        f"Branch '{branch_name}' route entry must be a Step or a callable, "
         f"got {type(step_like).__name__}."
     )
 

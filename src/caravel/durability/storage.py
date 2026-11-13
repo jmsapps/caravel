@@ -21,7 +21,123 @@ from .sqlite import SQLiteDurableStore
 from .types import WorkUnitKey, validate_identifier
 
 STATE_FILENAME = "state.sqlite3"
-ARTIFACTS_DIRNAME = "artifacts"
+ARTIFACTS_DIRNAME = "attempts"
+INTERNAL_DIRNAME = ".caravel"
+LEGACY_INTERNAL_DIRNAME = "_internal"
+OUTPUT_DIRNAME = "output"
+
+
+class LegacyStateError(Exception):
+    """Raised when durable state sits in the superseded ``_internal`` directory.
+
+    Reserved execution storage moved from ``_internal/`` to ``.caravel/``.
+    Existing state is never silently abandoned: a job whose progress store
+    lives in the old location would otherwise look like a brand new job and
+    reprocess everything.
+    """
+
+
+def _is_remote(location: str | Path) -> bool:
+    return "://" in str(location)
+
+
+def _as_location(value: str | Path) -> str | Path:
+    """Keep an fsspec URL as text; make a filesystem path a Path."""
+    return str(value) if _is_remote(value) else Path(value)
+
+
+def _resolve_state_dir(output: str | Path, state: str | Path | None) -> Path:
+    """Return the reserved recovery directory, named exactly as given.
+
+    ``state`` names the directory itself: no further ``.caravel`` is created
+    beneath it.
+    """
+    if state is not None:
+        if _is_remote(state):
+            raise ValueError(
+                f"Recovery storage must be a local filesystem path, got '{state}'. "
+                "It supplies transactions and fencing, which object storage does not."
+            )
+        reserved = Path(state)
+    elif _is_remote(output):
+        raise ValueError(
+            f"Output '{output}' is remote, so recovery storage cannot sit beside it. "
+            "Pass state=<local path>, or use the pipeline-scoped default "
+            "'data/<pipeline-name>/.caravel'."
+        )
+    else:
+        reserved = Path(output).parent / INTERNAL_DIRNAME
+
+    legacy = reserved.parent / LEGACY_INTERNAL_DIRNAME
+    if not (reserved / STATE_FILENAME).exists() and (legacy / STATE_FILENAME).exists():
+        raise LegacyStateError(
+            f"Durable state exists under '{legacy}', which has been renamed to "
+            f"'{reserved}'. Move it to keep the job resumable:\n"
+            f"    mv {legacy} {reserved}\n"
+            "Starting fresh instead would reprocess everything already committed."
+        )
+    nested = reserved / INTERNAL_DIRNAME
+    if not (reserved / STATE_FILENAME).exists() and (nested / STATE_FILENAME).exists():
+        raise LegacyStateError(
+            f"'{reserved}' contains '{nested}', so it was a *parent* of the recovery "
+            "directory under the previous meaning of --state/state=. It now names the "
+            f"recovery directory itself. Point it at '{nested}' to find existing jobs."
+        )
+    reserved.mkdir(parents=True, exist_ok=True)
+    return reserved
+
+
+def _options_for(
+    output: str | Path,
+    explicit: Mapping[str, Any] | None,
+    artifact_options: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Backend options for the *published* tree.
+
+    Artifact options describe the attempt store, which may be remote while the
+    published tree is local. Reusing them for a local path would hand a cloud
+    SDK's credentials to the local filesystem, so they carry over only when the
+    output is itself remote.
+    """
+    if explicit is not None:
+        return dict(explicit)
+    if artifact_options and _is_remote(output):
+        return dict(artifact_options)
+    return None
+
+
+def _reject_overlap(state: Path, output: str | Path, artifacts: str | Path | None) -> None:
+    """Refuse configurations where cleanup could destroy authoritative state."""
+    if _is_remote(output):
+        return
+    reserved = state.resolve()
+    published = Path(output).resolve()
+    if reserved == published:
+        raise ValueError(
+            f"Recovery storage and output are the same directory ('{published}'). "
+            "Publishing would overwrite authoritative state."
+        )
+    if reserved.is_relative_to(published):
+        raise ValueError(
+            f"Recovery storage '{reserved}' is inside the output directory "
+            f"'{published}'. Rebuilding or cleaning output would destroy the "
+            "progress store and attempt artifacts."
+        )
+    if published.is_relative_to(reserved):
+        raise ValueError(
+            f"Output '{published}' is inside recovery storage '{reserved}'. "
+            "Published results must not live in reserved execution storage."
+        )
+    if artifacts is not None and not _is_remote(artifacts):
+        resolved_artifacts = Path(artifacts).resolve()
+        if resolved_artifacts.is_relative_to(published) or published.is_relative_to(
+            resolved_artifacts
+        ):
+            raise ValueError(
+                f"Attempt artifacts '{resolved_artifacts}' overlap the output "
+                f"directory '{published}'. Publication could delete committed "
+                "artifacts."
+            )
 
 
 class JobResults:
@@ -64,6 +180,30 @@ class JobResults:
             collected[partition_id] = payloads[0] if len(payloads) == 1 else payloads
         return collected
 
+    def published(self, step: str, *, pipeline_id: str | None = None) -> dict[str, list[str]]:
+        """Where a step's current output is published, keyed by partition.
+
+        Published locations are generation-specific, so this is the supported
+        way to find the current files: never infer them from a directory
+        listing, which may still contain superseded generations.
+        """
+        node = self._node_for(step)
+        projection = self._storage.publisher(pipeline_id or self._plan.pipeline_name)
+        if projection is None:
+            return {}
+        located: dict[str, list[str]] = {}
+        for partition_id in self._storage.progress.work_unit_partitions(self.job_id, node.node_id):
+            key = WorkUnitKey(self.job_id, node.node_id, partition_id)
+            unit = self._storage.progress.load_work_unit(key)
+            if unit is None or unit.status != "sealed":
+                continue
+            job_dir = projection.layout(self.job_id).job_dir()
+            located[partition_id] = [
+                f"{job_dir}/{item.relative}"
+                for item in projection.planned_files(node, key, unit.output_generation)
+            ]
+        return located
+
     def feed(self, step: str, *, pipeline_id: str | None = None) -> BatchFeed:
         """Return the committed batch feed for a step's output node."""
         node = self._node_for(step)
@@ -90,65 +230,118 @@ class DurableStorage:
         *,
         restart_safe: bool,
         root: Path | None = None,
+        output_root: str | Path | None = None,
+        storage_options: Mapping[str, Any] | None = None,
+        keep_superseded: int | None = None,
         _temporary: Any = None,
     ) -> None:
         self.progress = progress
         self.output = output
         self.restart_safe = restart_safe
         self.root = root
+        self.output_root = output_root
+        self.storage_options = dict(storage_options) if storage_options else None
+        self.keep_superseded = keep_superseded
         self._temporary = _temporary
+
+    @property
+    def publishes(self) -> bool:
+        """Whether this storage materializes a readable output tree."""
+        return self.output_root is not None
+
+    def publisher(self, pipeline_id: str) -> Any:
+        """The projection that materializes committed results, or None."""
+        if self.output_root is None:
+            return None
+        from .publish import OutputPublisher
+
+        return OutputPublisher(
+            self.progress,
+            self.output,
+            root=self.output_root,
+            pipeline_id=pipeline_id,
+            storage_options=self.storage_options,
+            keep_superseded=self.keep_superseded,
+        )
 
     @classmethod
     def at(
         cls,
-        root: str | Path,
+        output: str | Path,
         *,
+        state: str | Path | None = None,
         artifacts_root: str | Path | None = None,
         storage_options: Mapping[str, Any] | None = None,
+        output_storage_options: Mapping[str, Any] | None = None,
+        keep_superseded: int | None = None,
         timeout: float = 5.0,
     ) -> DurableStorage:
-        """Durable state under ``root``, surviving invocations.
+        """Durable execution publishing to ``output``.
 
-        ``root`` holds the authoritative progress store and must be a local
-        filesystem path that outlives the process. It is the component that has
-        to supply transactions and fencing, so network filesystems and
-        ephemeral disk are not supported for it.
+        ``output`` is where readable results go, and it is the only required
+        argument: execution is durable by default.
 
-        ``artifacts_root`` locates committed output. It is configured and
-        validated independently and may be any fsspec target, including object
-        storage. Omit it to keep artifacts beside the state.
+        ``state`` is the recovery directory itself -- the progress store and
+        attempt artifacts -- and it defaults to ``.caravel`` beside ``output``.
+        It is reserved: nothing but Caravel may write there, and deleting it
+        loses the ability to resume. It must be a local filesystem path that
+        outlives the process, because it supplies transactions and fencing.
+
+        ``output`` may be any fsspec target. A remote one cannot host the
+        progress store, so pass ``state`` explicitly for it; callers that know
+        the pipeline name should use the pipeline-scoped local default
+        ``data/<pipeline-name>/.caravel``.
         """
-        base = Path(root)
-        base.mkdir(parents=True, exist_ok=True)
+        published = _as_location(output)
+        reserved = _resolve_state_dir(published, state)
+        _reject_overlap(reserved, published, artifacts_root)
         artifacts: str | Path = (
-            artifacts_root if artifacts_root is not None else base / ARTIFACTS_DIRNAME
+            artifacts_root if artifacts_root is not None else reserved / ARTIFACTS_DIRNAME
         )
         return cls(
-            progress=SQLiteDurableStore(base / STATE_FILENAME, timeout=timeout),
+            progress=SQLiteDurableStore(reserved / STATE_FILENAME, timeout=timeout),
             output=AttemptOutputStore(artifacts, storage_options=storage_options),
             restart_safe=True,
-            root=base,
+            root=reserved,
+            output_root=published,
+            storage_options=_options_for(published, output_storage_options, storage_options),
+            keep_superseded=keep_superseded,
         )
 
     @classmethod
-    def ephemeral(cls, *, root: str | Path | None = None) -> DurableStorage:
-        """State that does **not** survive the process.
+    def ephemeral(
+        cls,
+        output: str | Path,
+        *,
+        artifacts_root: str | Path | None = None,
+        storage_options: Mapping[str, Any] | None = None,
+        output_storage_options: Mapping[str, Any] | None = None,
+        keep_superseded: int | None = None,
+    ) -> DurableStorage:
+        """Throwaway recovery storage, with published results kept.
 
-        This is an explicit opt-out. A run using it reports
-        ``restart_safe == False``, because nothing here can honour a resume.
+        Only the recovery directory is temporary. Published output stays at
+        ``output``, so switching between durable and ephemeral execution never
+        moves where results land, and closing the storage never deletes them.
+
+        A run using this reports ``restart_safe == False``: nothing here can
+        honour a resume.
         """
-        temporary = None
-        if root is None:
-            temporary = tempfile.TemporaryDirectory(prefix="caravel-ephemeral-")
-            base = Path(temporary.name)
-        else:
-            base = Path(root)
-            base.mkdir(parents=True, exist_ok=True)
+        published = _as_location(output)
+        temporary = tempfile.TemporaryDirectory(prefix="caravel-state-")
+        reserved = Path(temporary.name)
+        _reject_overlap(reserved, published, artifacts_root)
+        artifacts: str | Path = (
+            artifacts_root if artifacts_root is not None else reserved / ARTIFACTS_DIRNAME
+        )
         return cls(
-            progress=SQLiteDurableStore(base / STATE_FILENAME),
-            output=AttemptOutputStore(base / ARTIFACTS_DIRNAME),
+            progress=SQLiteDurableStore(reserved / STATE_FILENAME),
+            output=AttemptOutputStore(artifacts, storage_options=storage_options),
             restart_safe=False,
-            root=base,
+            root=reserved,
+            output_root=published,
+            storage_options=_options_for(published, output_storage_options, storage_options),
+            keep_superseded=keep_superseded,
             _temporary=temporary,
         )
 
@@ -181,7 +374,44 @@ class DurableStorage:
         """
         plan = self.results(pipeline, job_id=job_id)._plan
         node = JobResults(self, plan, job_id)._node_for(step)
-        return self.progress.invalidate_node(job_id, node.node_id, partitions=partitions)
+        projection = self.publisher(plan.pipeline_name)
+
+        # Removing the advisory marker on both sides reduces staleness.
+        # Readers establish currency through transactional manifest validation.
+        if projection is not None:
+            projection.remove_job_manifest(job_id)
+
+        invalidated_generations: dict[WorkUnitKey, int] = {}
+        invalidated = self.progress.invalidate_node(
+            job_id,
+            node.node_id,
+            partitions=partitions,
+            invalidated_generations=invalidated_generations,
+        )
+
+        if projection is not None:
+            projection.remove_job_manifest(job_id)
+            by_id = {item.node_id: item for item in plan.nodes}
+            for key in invalidated:
+                target = by_id.get(key.node_id)
+                if target is not None:
+                    projection.unpublish_unit(
+                        target, key, through_generation=invalidated_generations[key]
+                    )
+        return invalidated
+
+    def rebuild_output(self, pipeline: Any, *, job_id: str) -> int:
+        """Rebuild the published tree from committed metadata.
+
+        ``reconcile`` republishes only what the store believes is pending, so
+        it cannot repair output that was deleted or altered behind its back.
+        This is the supported operation for that case.
+        """
+        projection = self.publisher(self.results(pipeline, job_id=job_id)._plan.pipeline_name)
+        if projection is None:
+            return 0
+        plan = self.results(pipeline, job_id=job_id)._plan
+        return int(projection.rebuild(job_id, plan.nodes))
 
     def close(self) -> None:
         self.progress.close()
@@ -200,4 +430,13 @@ class DurableStorage:
         return f"DurableStorage.{kind}({self.root!s}) restart_safe={self.restart_safe}"
 
 
-__all__ = ["ARTIFACTS_DIRNAME", "STATE_FILENAME", "DurableStorage", "JobResults"]
+__all__ = [
+    "ARTIFACTS_DIRNAME",
+    "INTERNAL_DIRNAME",
+    "LEGACY_INTERNAL_DIRNAME",
+    "LegacyStateError",
+    "OUTPUT_DIRNAME",
+    "STATE_FILENAME",
+    "DurableStorage",
+    "JobResults",
+]

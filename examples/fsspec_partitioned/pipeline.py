@@ -25,7 +25,6 @@ from caravel import (
     Step,
     dataset_as_loader,
     run,
-    step,
 )
 
 PIPELINE_NAME = "fsspec_partitioned_example"
@@ -45,7 +44,6 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx : value.index(end, start_idx)]
 
 
-@step(output=PartitionedTextDataset(suffix=".html", encoding="utf-8"))
 def bronze_render_html(record: dict[str, Any], *, context: object) -> dict[str, str]:
     """Render one source record into a deterministic HTML partition."""
     _ = context
@@ -60,7 +58,6 @@ def bronze_render_html(record: dict[str, Any], *, context: object) -> dict[str, 
     }
 
 
-@step(output=PartitionedJSONDataset())
 def silver_extract_structured(
     payload: dict[str, str], *, context: object
 ) -> dict[str, dict[str, Any]]:
@@ -105,8 +102,19 @@ def build_fsspec_partitioned_pipeline(
     return Pipeline(
         name=PIPELINE_NAME,
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[bronze_render_html]),
-            Stage(name=SILVER_STAGE_NAME, entries=[silver_extract_structured]),
+            Stage(
+                name=BRONZE_STAGE_NAME,
+                entries=[
+                    Step(
+                        bronze_render_html,
+                        output=PartitionedTextDataset(suffix=".html", encoding="utf-8"),
+                    )
+                ],
+            ),
+            Stage(
+                name=SILVER_STAGE_NAME,
+                entries=[Step(silver_extract_structured, output=PartitionedJSONDataset())],
+            ),
             Stage(
                 name=GOLD_STAGE_NAME,
                 entries=[
@@ -141,7 +149,7 @@ def run_fsspec_partitioned_pipeline(
         input_dir=input_dir, storage_options=storage_options
     )
     storage = DurableStorage.at(
-        state_root,
+        Path(state_root) / "output",
         artifacts_root=artifacts_root or os.getenv("CARAVEL_ARTIFACTS_ROOT"),
         storage_options=storage_options,
     )

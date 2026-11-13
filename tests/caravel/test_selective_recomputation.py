@@ -75,7 +75,7 @@ def _run(storage: DurableStorage, pipeline: Pipeline | None = None) -> Any:
 def test_invalidating_a_node_also_invalidates_what_was_derived_from_it(
     tmp_path: Path,
 ) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     assert _run(storage, pipeline).status == "completed"
 
@@ -89,7 +89,7 @@ def test_downstream_output_is_never_left_complete_against_stale_input(
     tmp_path: Path,
 ) -> None:
     """The exact failure a bare reset(job_id, node_id) would have produced."""
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     _run(storage, pipeline)
     storage.invalidate(pipeline, job_id="j1", step="load")
@@ -107,7 +107,7 @@ def test_downstream_output_is_never_left_complete_against_stale_input(
 
 
 def test_recomputation_produces_the_new_result(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     _run(storage, pipeline)
     assert storage.results(pipeline, job_id="j1").of("enrich")["p1"]["enriched"] == 10
@@ -133,7 +133,7 @@ def test_an_upstream_outside_the_closure_is_not_recomputed(tmp_path: Path) -> No
         name="documents",
         stages=[Stage(name="s", entries=[Step(counted_load), Step(enrich)])],
     )
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     _run(storage, pipeline)
     before = len(calls)
 
@@ -146,7 +146,7 @@ def test_an_upstream_outside_the_closure_is_not_recomputed(tmp_path: Path) -> No
 
 
 def test_a_single_partition_can_be_invalidated(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     _run(storage, pipeline)
 
@@ -163,7 +163,7 @@ def test_a_single_partition_can_be_invalidated(tmp_path: Path) -> None:
 
 
 def test_invalidation_supersedes_output_without_deleting_it(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     _run(storage, pipeline)
 
@@ -185,7 +185,7 @@ def test_invalidation_supersedes_output_without_deleting_it(tmp_path: Path) -> N
 
 
 def test_readers_return_only_the_current_generation(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     _run(storage, pipeline)
     _VERSION["n"] = 7
@@ -205,7 +205,7 @@ def test_the_same_batch_id_may_be_recommitted_in_a_new_generation(
     tmp_path: Path,
 ) -> None:
     """Idempotency holds within a generation, not across them."""
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     _run(storage, pipeline)
     storage.invalidate(pipeline, job_id="j1", step="load")
@@ -225,7 +225,7 @@ def test_a_live_claim_refuses_the_invalidation(tmp_path: Path) -> None:
     moment = dt.datetime(2026, 11, 12, 9, 0, 0, tzinfo=dt.timezone.utc)
     storage = DurableStorage(
         SQLiteDurableStore(tmp_path / "s.sqlite3", clock=lambda: moment),
-        DurableStorage.at(tmp_path / "a").output,
+        DurableStorage.at(tmp_path / "a" / "output").output,
         restart_safe=True,
         root=tmp_path,
     )
@@ -254,7 +254,7 @@ def test_an_expired_claim_does_not_block_invalidation(tmp_path: Path) -> None:
     clock = {"now": moment}
     storage = DurableStorage(
         SQLiteDurableStore(tmp_path / "s.sqlite3", clock=lambda: clock["now"]),
-        DurableStorage.at(tmp_path / "a").output,
+        DurableStorage.at(tmp_path / "a" / "output").output,
         restart_safe=True,
         root=tmp_path,
     )
@@ -276,7 +276,7 @@ def test_an_expired_claim_does_not_block_invalidation(tmp_path: Path) -> None:
 
 
 def test_invalidating_an_unknown_step_fails_closed(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     _run(storage, pipeline)
     with pytest.raises(KeyError, match="No step named"):
@@ -300,7 +300,7 @@ def test_an_incremental_lineage_checkpoint_is_not_rolled_back(tmp_path: Path) ->
         )
         for i in range(2)
     ]
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="changes", stages=[Stage(name="s", entries=[Step(load)])])
     run(
         pipeline,
@@ -339,7 +339,7 @@ def test_invalidating_a_branch_clears_its_committed_route(tmp_path: Path) -> Non
             )
         ],
     )
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     assert _run(storage, pipeline).status == "completed"
 
     branch_node = "stage-001-entry-002"
@@ -385,7 +385,9 @@ def enrich(r, *, context):
 
 
 pipeline = Pipeline(name="documents", stages=[Stage(name="s", entries=[Step(load), Step(enrich)])])
-storage = DurableStorage.at({state!r})
+storage = DurableStorage.at(
+    os.path.join({state!r}, "output"), state=os.path.join({state!r}, ".caravel")
+)
 run(pipeline, job_id="j1", source=InMemorySource({{"p1": {{"n": 1}}}}), storage=storage)
 
 sqlite_module._failpoint_hook = crash
@@ -409,7 +411,7 @@ def test_a_crash_during_invalidation_is_all_or_nothing(tmp_path: Path, crash_at:
     )
     assert killed.returncode == 137, f"{killed.stdout}\n{killed.stderr}"
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     try:
         load_unit = storage.progress.load_work_unit(WorkUnitKey("j1", LOAD_NODE, "p1"))
         enrich_unit = storage.progress.load_work_unit(WorkUnitKey("j1", ENRICH_NODE, "p1"))

@@ -19,7 +19,6 @@ from caravel import (
     Stage,
     Step,
     run,
-    step,
 )
 
 PIPELINE_NAME = "persist_only_final_example"
@@ -36,19 +35,16 @@ PARTITIONS: dict[str, dict[str, Any]] = {
 }
 
 
-@step(output=JSONDataset())
 def step_1_collect(record: dict[str, Any], *, context: object) -> dict[str, Any]:
     _ = context
     return {**record, "collected": True}
 
 
-@step(output=JSONDataset())
 def step_2_scale(record: dict[str, Any], *, context: object) -> dict[str, Any]:
     _ = context
     return {**record, "scaled": int(record["value"]) * 10}
 
 
-@step(output=JSONDataset())
 def step_3_label(record: dict[str, Any], *, context: object) -> dict[str, Any]:
     _ = context
     return {**record, "label": f"v{record['scaled']}"}
@@ -73,9 +69,9 @@ def build_persist_only_final_pipeline() -> Pipeline:
             Stage(
                 name=STAGE_NAME,
                 entries=[
-                    step_1_collect,
-                    step_2_scale,
-                    step_3_label,
+                    Step(step_1_collect, output=JSONDataset()),
+                    Step(step_2_scale, output=JSONDataset()),
+                    Step(step_3_label, output=JSONDataset()),
                     Step(
                         step_4_aggregate,
                         output=JSONDataset(name="aggregate"),
@@ -94,7 +90,7 @@ def run_persist_only_final_pipeline(
     return run(
         build_persist_only_final_pipeline(),
         job_id=job_id,
-        storage=DurableStorage.at(state_root),
+        storage=DurableStorage.at(Path(state_root) / "output"),
     )
 
 

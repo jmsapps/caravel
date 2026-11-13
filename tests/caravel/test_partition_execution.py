@@ -129,7 +129,7 @@ def test_durable_storage_requires_an_explicit_job_id(tmp_path: Path) -> None:
         caravel.run(
             _two_stage_pipeline(),
             source=InMemorySource({"p1": {"n": 1}}),
-            storage=DurableStorage.at(tmp_path),
+            storage=DurableStorage.at(tmp_path / "output"),
         )
 
 
@@ -141,7 +141,7 @@ def test_ephemeral_storage_may_omit_a_job_id_because_nothing_resumes(
     result = caravel.run(
         _two_stage_pipeline(),
         source=InMemorySource({"p1": {"n": 1}}),
-        storage=DurableStorage.ephemeral(root=tmp_path),
+        storage=DurableStorage.ephemeral(tmp_path / "output"),
     )
     assert result.status == "completed"
     assert result.restart_safe is False

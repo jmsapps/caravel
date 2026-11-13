@@ -11,8 +11,8 @@ from caravel import (
     PartitionedTextDataset,
     Pipeline,
     Stage,
+    Step,
     run,
-    step,
 )
 
 PIPELINE_NAME = "branching_example"
@@ -67,7 +67,6 @@ def make_branching_loader(
     )
 
 
-@step(output=PartitionedJSONDataset())
 def bronze_normalize_json_source(
     record: dict[str, Any], *, context: object
 ) -> dict[str, dict[str, Any]]:
@@ -86,7 +85,6 @@ def bronze_normalize_json_source(
     }
 
 
-@step(output=PartitionedJSONDataset())
 def bronze_normalize_html_source(
     record: dict[str, Any], *, context: object
 ) -> dict[str, dict[str, Any]]:
@@ -107,7 +105,6 @@ def bronze_normalize_html_source(
     }
 
 
-@step(output=PartitionedJSONDataset())
 def silver_unify_records(
     payload: dict[str, dict[str, Any]], *, context: object
 ) -> dict[str, dict[str, Any]]:
@@ -124,7 +121,6 @@ def silver_unify_records(
     return unified
 
 
-@step(output=PartitionedJSONDataset())
 def bronze_converged_records(
     payload: dict[str, dict[str, Any]], *, context: object
 ) -> dict[str, dict[str, Any]]:
@@ -141,7 +137,6 @@ def bronze_converged_records(
     return unified
 
 
-@step(output=PartitionedJSONDataset())
 def gold_partition_by_language(
     payload: dict[str, dict[str, Any]], *, context: object
 ) -> dict[str, dict[str, Any]]:
@@ -173,8 +168,8 @@ def build_branching_pipeline(
         name=BRANCH_STEP_NAME,
         by="source",
         routes={
-            JSON_SOURCE_NAME: [bronze_normalize_json_source],
-            HTML_SOURCE_NAME: [bronze_normalize_html_source],
+            JSON_SOURCE_NAME: [Step(bronze_normalize_json_source, output=PartitionedJSONDataset())],
+            HTML_SOURCE_NAME: [Step(bronze_normalize_html_source, output=PartitionedJSONDataset())],
         },
     )
 
@@ -182,9 +177,21 @@ def build_branching_pipeline(
         name=PIPELINE_NAME,
         source=loader,
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[branch_entry, bronze_converged_records]),
-            Stage(name=SILVER_STAGE_NAME, entries=[silver_unify_records]),
-            Stage(name=GOLD_STAGE_NAME, entries=[gold_partition_by_language]),
+            Stage(
+                name=BRONZE_STAGE_NAME,
+                entries=[
+                    branch_entry,
+                    Step(bronze_converged_records, output=PartitionedJSONDataset()),
+                ],
+            ),
+            Stage(
+                name=SILVER_STAGE_NAME,
+                entries=[Step(silver_unify_records, output=PartitionedJSONDataset())],
+            ),
+            Stage(
+                name=GOLD_STAGE_NAME,
+                entries=[Step(gold_partition_by_language, output=PartitionedJSONDataset())],
+            ),
         ],
     )
 
@@ -204,7 +211,7 @@ def run_branching_pipeline(
         pipeline,
         job_id=job_id,
         source=pipeline.source,
-        storage=DurableStorage.at(state_root),
+        storage=DurableStorage.at(Path(state_root) / "output"),
     )
 
 

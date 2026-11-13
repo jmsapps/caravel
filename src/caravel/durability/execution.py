@@ -257,6 +257,7 @@ class DurableInvocation:
         restart_safe: bool = True,
         plugins: Sequence[Any] = (),
         storage_root: str = "",
+        publisher: Any = None,
         source_mode: SourceMode = "snapshot",
         snapshot_id: str | None = None,
         logger: logging.Logger | None = None,
@@ -277,6 +278,7 @@ class DurableInvocation:
         self.lineage = validate_identifier("lineage", lineage)
         self.restart_safe = restart_safe
         self.storage_root = storage_root
+        self.publisher_projection = publisher
         self.plugin_set: PluginSet = validate_plugins(tuple(plugins))
         if isinstance(source, SnapshotInput):
             self.source_mode: SourceMode = "snapshot"
@@ -499,6 +501,25 @@ class DurableInvocation:
             return produced
         return self._without_source_tag(produced)
 
+    def _publish(self, node: DurableNode, key: WorkUnitKey) -> None:
+        """Materialize a sealed unit, so a partition is readable before the job ends.
+
+        Publication is a projection of committed state, so a failure here is
+        logged rather than failing a committed unit. The unit stays
+        sealed-but-unpublished and the next invocation republishes it.
+        """
+        if self.publisher_projection is None:
+            return
+        try:
+            self.publisher_projection.publish_unit(node, key)
+        except Exception as error:
+            self.logger.warning(
+                "Publishing %s/%s failed (%s); it will be republished.",
+                key.node_id,
+                key.partition_id,
+                type(error).__name__,
+            )
+
     def _materialize_context(self, base: StepContext) -> Any:
         """Hand the step its context, wrapped by an application factory if given.
 
@@ -566,6 +587,7 @@ class DurableInvocation:
 
         if node.kind == "branch":
             committed = self._execute_branch(node, unit, lease, claimed, payload, context)
+            self._publish(node, unit.key)
             self._emit("node_completed", node=facts)
             return committed
 
@@ -632,6 +654,7 @@ class DurableInvocation:
             fence_token=state.fence_token,
             expected_generation=state.generation,
         )
+        self._publish(node, unit.key)
         self._emit("node_completed", node=facts)
         return committed
 
@@ -964,6 +987,7 @@ class DurableInvocation:
             current = self.store.load_job(self.job_id)
             if current is None or current.status != "completed":
                 raise
+        self._publish_completion()
         return DurableRunResult(
             status="completed",
             pipeline_id=self.pipeline_id,
@@ -973,6 +997,26 @@ class DurableInvocation:
             active_node_id=active_node_id,
             restart_safe=self.restart_safe,
         )
+
+    def _publish_completion(self) -> None:
+        """Catch up any unpublished unit, then write the whole-job boundary last."""
+        if self.publisher_projection is None:
+            return
+        try:
+            # Drain first; write_job_manifest refuses while anything is pending,
+            # so the marker can never claim a job is fully materialized early.
+            self.publisher_projection.reconcile(self.job_id, self.plan.nodes)
+            if self.publisher_projection.write_job_manifest(self.job_id, self.plan.nodes) is None:
+                self.logger.warning(
+                    "Job %s completed but publication is incomplete; "
+                    "no completion marker was written.",
+                    self.job_id,
+                )
+        except Exception as error:
+            self.logger.warning(
+                "Publishing job completion failed (%s); committed state is unaffected.",
+                type(error).__name__,
+            )
 
 
 __all__ = [

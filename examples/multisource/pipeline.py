@@ -13,7 +13,6 @@ from caravel import (
     Pipeline,
     Stage,
     run,
-    step,
 )
 
 PIPELINE_NAME = "multisource_example"
@@ -49,7 +48,6 @@ def make_multisource_loader(
     )
 
 
-@step(output=JSONDataset())
 def summarize_by_source(dataset: Any, *, context: object) -> dict[str, Any]:
     """Count records by source tag behind an explicit all-input barrier.
 
@@ -119,7 +117,7 @@ def run_multisource_pipeline(
 ) -> Any:
     """Run the multisource example and return its structured status."""
     pipeline = build_multisource_pipeline(source_a_dir=source_a_dir, source_b_dir=source_b_dir)
-    return run(pipeline, job_id=job_id, storage=DurableStorage.at(state_root))
+    return run(pipeline, job_id=job_id, storage=DurableStorage.at(Path(state_root) / "output"))
 
 
 __all__ = [

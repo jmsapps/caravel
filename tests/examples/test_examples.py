@@ -18,6 +18,10 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from caravel import DurableStorage  # noqa: E402
+from examples.combining_results.pipeline import (  # noqa: E402
+    build_combining_pipeline,
+    run_combining_pipeline,
+)
 from examples.custom_context.pipeline import (  # noqa: E402
     build_custom_context_pipeline,
     run_custom_context_pipeline,
@@ -49,7 +53,7 @@ from examples.persist_only_final.pipeline import (  # noqa: E402
 
 
 def _results(tmp_path: Path, pipeline: Any, job_id: str) -> Any:
-    return DurableStorage.at(tmp_path).results(pipeline, job_id=job_id)
+    return DurableStorage.at(tmp_path / "output").results(pipeline, job_id=job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -57,20 +61,31 @@ def _results(tmp_path: Path, pipeline: Any, job_id: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def test_minimal_example_completes_and_aggregates(tmp_path: Path) -> None:
-    result = run_minimal_pipeline(state_root=tmp_path, params={"mode": "demo"})
+def test_minimal_example_keeps_results_per_partition(tmp_path: Path) -> None:
+    result = run_minimal_pipeline(state_root=tmp_path)
     assert result.status == "completed"
     assert result.restart_safe is True
 
     results = _results(tmp_path, build_minimal_pipeline(), "minimal-1")
     per_partition = results.of("silver_transform")
-    assert len(per_partition) > 1
-    assert all("normalized" in record for record in per_partition.values())
+    assert {key: record["normalized"] for key, record in per_partition.items()} == {
+        "alpha": 1.0,
+        "beta": 3.0,
+    }
+    assert set(results.of("bronze_collect")) == set(per_partition)
 
-    summary = list(results.of("silver_finalize").values())
+
+def test_combining_example_aggregates_all_partition_results(tmp_path: Path) -> None:
+    assert run_combining_pipeline(state_root=tmp_path).status == "completed"
+    results = _results(tmp_path, build_combining_pipeline(), "combining-1")
+    per_partition = results.of("transform")
+    summary = list(results.of("combine_results").values())
+
     assert len(summary) == 1, "the barrier produces one aggregate partition"
     assert summary[0]["count"] == len(per_partition)
-    assert summary[0]["mode"] == "demo"
+    assert summary[0]["ids"] == ["alpha", "beta"]
+    assert summary[0]["total_normalized"] == 4.0
+    assert summary[0]["records"] == per_partition
 
 
 def test_partitioned_example_keeps_storage_keys_distinct_from_identity(
@@ -136,7 +151,7 @@ def test_fsspec_example_runs_with_remote_artifacts(tmp_path: Path, artifacts_roo
     result = run_fsspec_pipeline(state_root=tmp_path, artifacts_root=artifacts_root)
     assert result.status == "completed"
 
-    storage = DurableStorage.at(tmp_path, artifacts_root=artifacts_root)
+    storage = DurableStorage.at(tmp_path / "output", artifacts_root=artifacts_root)
     summary = storage.results(build_fsspec_pipeline(), job_id="fsspec-minimal-1").of(
         "silver_finalize"
     )
@@ -151,7 +166,7 @@ def test_fsspec_partitioned_example_runs_with_remote_artifacts(
     result = run_fsspec_partitioned_pipeline(state_root=tmp_path, artifacts_root=artifacts_root)
     assert result.status == "completed"
 
-    storage = DurableStorage.at(tmp_path, artifacts_root=artifacts_root)
+    storage = DurableStorage.at(tmp_path / "output", artifacts_root=artifacts_root)
     summary = storage.results(
         build_fsspec_partitioned_pipeline(), job_id="fsspec-partitioned-1"
     ).of("gold_summarize")

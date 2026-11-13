@@ -47,7 +47,7 @@ def remote_root(backend: Any) -> str:
 
 def _durable(tmp_path: Path, remote_root: str, backend: Any) -> DurableStorage:
     return DurableStorage.at(
-        tmp_path,
+        tmp_path / "output",
         artifacts_root=remote_root,
         storage_options=backend.storage_options or None,
     )

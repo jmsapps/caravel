@@ -122,7 +122,51 @@ thing a caller must not get by accident.
 | `DurableStorage.at(path, artifacts_root="s3://bucket/run")` | Same, with committed artifacts in object storage. The authoritative store stays local. |
 | `DurableStorage.ephemeral()` | Explicit opt-out. Same state machine and same commit rules — only the persistence guarantee is lost. `job_id` is optional and `result.restart_safe` is `False`. |
 
-### Reading committed output
+### Reading output
+
+Two surfaces, for two jobs.
+
+**Readable files.** `DurableStorage.at(output)` publishes results named after
+the declaration. Execution is durable by default, and recovery storage lives in
+`.caravel` beside the output:
+
+```text
+data/minimal_example/
+├── .caravel/             reserved execution storage — do not write here
+│   ├── state.sqlite3     authoritative progress store
+│   └── attempts/...      immutable attempt artifacts
+└── output/
+    └── customer-42/documents/snapshot-2026-11-12/
+        ├── 001-prepare/001-load/doc-1/doc-1.json
+        ├── 002-publish/001-sync_index/doc-1/doc-1.json
+        └── _job.json     completion snapshot (advisory — see below)
+```
+
+`.caravel/` is **reserved execution storage** required for recovery: deleting it
+loses the ability to resume a job, and nothing but Caravel may write there. It
+must be a local filesystem path. Configurations where it would sit inside the
+output directory, or vice versa, are rejected — publishing or rebuilding must
+never be able to destroy authoritative state.
+
+A hierarchical `pipeline_id` such as `customer-42/documents` becomes nested
+directories. Each partition gets its own directory, so ownership is exact:
+`doc` and `doc.other` are different partitions and retiring one never touches
+the other. Partitioned datasets keep their internal paths, so `en/record_1`
+publishes to `en/record_1.json` rather than colliding with the French one.
+
+```python
+DurableStorage.at("exports/output")                                  # state beside it
+DurableStorage.at("exports/output", state="/persistent/.caravel")    # explicit
+DurableStorage.at("s3://bucket/output", state="data/docs/.caravel")  # remote output
+DurableStorage.ephemeral("exports/output")                           # results still kept
+```
+
+Remote output cannot host the progress store, so pass `state` explicitly for it;
+the CLI falls back to `data/<pipeline-name>/.caravel`. `ephemeral` makes only
+the *recovery* storage throwaway — published results stay at the same place a
+durable run would put them, and closing the storage never deletes them.
+
+**Manifest-aware access**, which is the authority:
 
 ```python
 storage = DurableStorage.at("state/")
@@ -130,6 +174,85 @@ results = storage.results(pipeline, job_id="snapshot-2026-11-12")
 results.of("enrich")        # {partition_id: payload}
 results.feed("enrich")      # a bounded, ordered consumer feed
 ```
+
+The published tree is a *projection* of committed state, never a second source
+of truth. Publication progress lives in the progress store, so the two cannot
+drift; deleting the tree loses nothing, and it is rebuilt from the manifest.
+
+A partition appears as soon as it seals, so output is readable while the job
+runs.
+
+**Three reader contracts, deliberately distinct.**
+
+| Contract | Use | Guarantee |
+| --- | --- | --- |
+| Authoritative | `storage.results(...)`, `.published(step)` | Always correct. Reads through committed metadata. |
+| Progressive physical | the output tree during a run | Partitions appear as they seal. Superseded generations may still be present; never infer "current" from a directory listing. |
+| Whole-job snapshot | `_job.json` | Names the exact file for every partition at the moment it was written. **Advisory**: presence is not proof of completion. |
+
+**Why concurrent publishers are safe.** Each generation of a partition
+publishes to its own write-once location (`doc-1.json`, then `doc-1@g1.json`).
+A publisher that stalls across a recomputation writes its own generation's
+files and can never overwrite a newer generation's, whenever it resumes and
+however it is interrupted. Write-once holds *within* a generation too: a second
+publisher of the same generation leaves the existing files untouched rather
+than rewriting them, and an explicit rebuild swaps through a temporary name, so
+no reader ever sees a truncated file.
+
+**Retention is a policy, and generations are retained by default.** A manifest
+names specific generations, so deleting one breaks a reader holding it.
+Pruning is therefore opt-in:
+
+```python
+DurableStorage.at("exports/output")                      # retain every generation
+DurableStorage.at("exports/output", keep_superseded=1)   # keep the previous one
+DurableStorage.at("exports/output", keep_superseded=0)   # keep only the current
+```
+
+Pruning preserves the current generation and other partitions. Invalidation
+cleanup is bounded by the old generations captured in its transaction, preserving
+output published by a concurrent recomputation.
+
+**The completion marker is advisory, and the store is the authority.**
+`_job.json` is written last, only once every sealed unit is materialized, and
+withdrawn if the job generation moved while it was being written. Invalidation
+removes it on both sides of its commit. All of that is best effort: a publisher
+that dies between writing the file and re-reading the job leaves a stale marker
+behind, and no file-only protocol can prevent it.
+
+So **the marker existing never means a job completed.** Turn it into a
+metadata guarantee with `validate_job_manifest(manifest, store)`, or ask the store
+directly. Validation compares identities, generations, completeness, and recorded
+file references in one transactional snapshot. It establishes currency at that
+instant; external deletion or corruption requires `storage.rebuild_output(...)`.
+
+Stores created before publication-reference tracking reject validation for units
+without recorded file references. Run `storage.rebuild_output(...)` once to record
+their references and regenerate the marker.
+
+```python
+from caravel.durability import read_job_manifest, validate_job_manifest
+
+manifest = read_job_manifest("exports/output", "customer-42/documents", "snapshot-1")
+if manifest is not None and not validate_job_manifest(manifest, storage.progress):
+    ...   # the job is complete and this snapshot is current
+```
+
+A reader with no store access gets a consistent snapshot of some past moment.
+That is genuinely weaker, and it is the strongest thing a file-only reader can
+have.
+
+Promotion is a rename on a local filesystem. On an object store there is no
+atomic directory swap, so a reader can observe a partially promoted partition.
+
+Recomputation replaces the logical current result: `storage.invalidate(...)`
+removes the completion marker first, then commits, then clears that step's
+published output. The next run writes the new generation, and a generation
+producing fewer files leaves none of the old ones behind.
+
+To repair a published tree that was deleted or edited outside Caravel, use
+`storage.rebuild_output(pipeline, job_id=...)`. Ordinary publication will not
+do this: the store correctly believes those units are already published.
 
 ## Dataset Quick Reference
 
@@ -224,6 +347,7 @@ step outside the branch.
 | `only_stage` / `only_step` | Re-invoking a job already skips committed work. Forcing one step to recompute is **designed but not implemented**; use a new `job_id` for now. |
 | `Stage(stage_root=...)` | One `artifacts_root` on `DurableStorage.at`. |
 | `Stage(clean_dirs=True)` | Rejected: cleanup could delete committed output. |
+| `@step(...)` decorator | `Step(...)` is the only step configuration surface. Move the decorator's arguments into the `Step(...)` that lists the processor in a stage or branch route: `@step(output=d)` above `def load` becomes `Step(load, output=d)`. A bare callable still works wherever it wants every documented `Step` default. |
 | `Step(persist=False)` | Rejected: recovery restores committed output. Use cheap steps plus one `input_scope="all"` step. |
 | `keep_source_tag` | **Still supported**, with its original default: the tag is stripped before commit unless you pass `keep_source_tag=True`. |
 | Stage-directory output layout | `storage.results(pipeline, job_id=...)` |
@@ -309,6 +433,10 @@ An empty page while production is ongoing means "no new batches yet"
 
 A runnable end-to-end example lives in [examples/durable_partitions](examples/durable_partitions).
 
+Start with [minimal](examples/minimal/README.md) for independent per-partition
+steps. See [combining_results](examples/combining_results/README.md) for combining
+partition outputs into one summary with `input_scope="all"`.
+
 ## Concurrent workers
 
 One worker is the default. Concurrent workers need an explicit lease policy:
@@ -338,31 +466,39 @@ something stable such as `(job_id, node_id, partition_id, batch_id)`.
 
 ## CLI Usage
 
-`make_cli(pipeline)` drives the same single execution model, so it requires the
-same explicit storage decision.
+`make_cli(pipeline)` drives the same single execution model.
 
-- `--state <dir>` — durable state and artifacts. Requires `--job-id`.
-- `--ephemeral` — run without durable state. Nothing resumes; the run reports
-  `restart_safe=False`.
-- `--job-id <id>` — identity of this bounded run.
+- `--output PATH` — where published results go. Default:
+  `data/<pipeline-name>/output`. May be an fsspec URL.
+- `--state PATH` — the recovery directory itself. Default: `.caravel` beside
+  the output directory, or `data/<pipeline-name>/.caravel` when output is
+  remote.
+- `--ephemeral` — throwaway recovery storage; published results still go to the
+  configured output.
+- `--job-id ID` — identity of this bounded run. Required unless `--ephemeral`.
 - `--param key=value` (repeatable)
-- `--graph` — print the Mermaid graph and exit without running.
-
-`--state` and `--ephemeral` are mutually exclusive, and omitting both is an
-error rather than a silent default.
+- `--graph` — print the Mermaid graph and exit.
 
 ```bash
-# A resumable run. Invoke it again with the same --job-id to continue.
-python3 -m examples.minimal --state data/minimal/state --job-id nightly-2026-11-12
+python3 -m examples.minimal --job-id nightly-2026-11-12
 
-# A throwaway run that makes no durability claim.
+python3 -m examples.minimal \
+  --output /exports/minimal/output \
+  --job-id nightly-2026-11-12
+
+python3 -m examples.minimal \
+  --output /exports/minimal/output \
+  --state /persistent/minimal/.caravel \
+  --job-id nightly-2026-11-12
+
 python3 -m examples.minimal --ephemeral
 ```
 
-The run line reports the outcome:
+The run line reports the outcome and where results landed:
 
 ```text
 status=completed job_id=nightly-2026-11-12 batches=5 restart_safe=True
+output=data/minimal_example/output
 ```
 
 ## Production Status And Support Statement

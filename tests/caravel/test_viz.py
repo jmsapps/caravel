@@ -1,6 +1,6 @@
 import re
 
-from caravel import Branch, JSONDataset, Pipeline, Stage, step, to_mermaid
+from caravel import Branch, JSONDataset, Pipeline, Stage, Step, to_mermaid
 
 
 class _StubLoader:
@@ -11,7 +11,6 @@ class _StubLoader:
 
 
 def _build_viz_fixture_pipeline() -> Pipeline:
-    @step(output=JSONDataset(name="bronze_first"))
     def normalize(payload: dict[str, str], *, _context: object) -> dict[str, str]:
         return payload
 
@@ -24,19 +23,27 @@ def _build_viz_fixture_pipeline() -> Pipeline:
         },
     )
 
-    @step(output=JSONDataset(name="bronze_after_branch"))
     def merge(payload: dict[str, str], *, _context: object) -> dict[str, str]:
         return payload
 
-    @step(output=JSONDataset(name="silver_normalize"))
     def normalize_silver(payload: dict[str, str], *, _context: object) -> dict[str, str]:
         return payload
 
     return Pipeline(
         name="viz_fixture",
         stages=[
-            Stage(name="bronze", entries=[normalize, branch_entry, merge]),
-            Stage(name="silver", entries=[normalize_silver]),
+            Stage(
+                name="bronze",
+                entries=[
+                    Step(normalize, output=JSONDataset(name="bronze_first")),
+                    branch_entry,
+                    Step(merge, output=JSONDataset(name="bronze_after_branch")),
+                ],
+            ),
+            Stage(
+                name="silver",
+                entries=[Step(normalize_silver, output=JSONDataset(name="silver_normalize"))],
+            ),
         ],
     )
 

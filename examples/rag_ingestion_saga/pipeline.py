@@ -165,7 +165,7 @@ def run_rag_ingestion(
     return run(
         build_rag_ingestion_pipeline(saga),
         job_id="rag-1",
-        storage=DurableStorage.at(state_root),
+        storage=DurableStorage.at(Path(state_root) / "output"),
         params={"fail": "true"} if fail else None,
         plugins=[saga],
     )

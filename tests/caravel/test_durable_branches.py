@@ -73,7 +73,7 @@ def _pipeline(**branch_kwargs: Any) -> Pipeline:
 
 
 def _run(tmp_path: Path, pipeline: Pipeline | None = None, **kwargs: Any) -> Any:
-    storage = kwargs.pop("storage", None) or DurableStorage.at(tmp_path)
+    storage = kwargs.pop("storage", None) or DurableStorage.at(tmp_path / "output")
     return run(
         pipeline or _pipeline(),
         job_id=kwargs.pop("job_id", "j1"),
@@ -91,7 +91,7 @@ def _run(tmp_path: Path, pipeline: Pipeline | None = None, **kwargs: Any) -> Any
 def test_a_branch_routes_on_values_produced_by_an_earlier_step(
     tmp_path: Path,
 ) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     assert _run(tmp_path, pipeline, storage=storage).status == "completed"
 
@@ -102,7 +102,7 @@ def test_a_branch_routes_on_values_produced_by_an_earlier_step(
 
 
 def test_the_route_decision_is_committed_per_partition(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     _run(tmp_path, storage=storage)
     for partition_id, expected in (("p1", "en"), ("p2", "fr")):
         unit = storage.progress.load_work_unit(WorkUnitKey("j1", BRANCH_NODE, partition_id))
@@ -137,7 +137,7 @@ def test_the_predicate_is_consulted_once_per_partition_even_across_invocations(
             )
         ],
     )
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     _run(tmp_path, pipeline, storage=storage)
     assert len(calls) == len(DOCUMENTS)
 
@@ -171,7 +171,7 @@ def test_a_flapping_predicate_cannot_reroute_a_committed_partition(
             )
         ],
     )
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     _run(tmp_path, pipeline, storage=storage, source=InMemorySource({"p1": {"n": 1}}))
 
     unit = storage.progress.load_work_unit(WorkUnitKey("j1", BRANCH_NODE, "p1"))
@@ -184,7 +184,7 @@ def test_a_flapping_predicate_cannot_reroute_a_committed_partition(
 
 
 def test_a_route_absent_from_the_declaration_fails_closed(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     with pytest.raises(KeyError, match="no route for key"):
         _run(
             tmp_path,
@@ -200,7 +200,7 @@ def test_a_route_absent_from_the_declaration_fails_closed(tmp_path: Path) -> Non
 
 
 def test_only_the_assigned_route_registers_work(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     _run(tmp_path, storage=storage, source=InMemorySource({"p1": {"n": 1}}))
 
     plan = compile_durable_plan(_pipeline())
@@ -213,7 +213,7 @@ def test_only_the_assigned_route_registers_work(tmp_path: Path) -> None:
 
 def test_an_unselected_route_never_blocks_completion(tmp_path: Path) -> None:
     """Routes nobody takes register nothing, so they cannot hold the job open."""
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     result = _run(tmp_path, storage=storage, source=InMemorySource({"p1": {"n": 1}}))
     assert result.status == "completed"
     job = storage.progress.load_job("j1")
@@ -236,7 +236,7 @@ def test_a_merge_waits_for_its_own_route_not_for_other_partitions(
 
     from caravel import ExecutionBudget
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline(routes={"en": [Step(slow_english)], "fr": [Step(french)]})
     partial = _run(
         tmp_path,
@@ -260,7 +260,7 @@ def test_a_merge_waits_for_its_own_route_not_for_other_partitions(
 
 
 def test_a_merge_is_blocked_until_its_route_step_seals(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     from caravel.durability.scheduler import register_plan_discovery
 
@@ -282,7 +282,7 @@ def test_whole_dataset_work_after_a_merge_still_needs_an_all_input_step(
     def summarize(dataset: Any, *, context: Any) -> Any:
         return {"routes": sorted({p.load()["route"] for p in dataset.partitions()})}
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
         name="documents",
         stages=[
@@ -334,7 +334,7 @@ def test_a_route_must_declare_at_least_one_step() -> None:
 
 
 def test_a_committed_route_cannot_be_overwritten(tmp_path: Path) -> None:
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     _run(tmp_path, storage=storage, source=InMemorySource({"p1": {"n": 1}}))
     key = WorkUnitKey("j1", BRANCH_NODE, "p1")
     sealed = storage.progress.load_work_unit(key)
@@ -393,7 +393,9 @@ pipeline = Pipeline(
     ])],
 )
 
-storage = DurableStorage.at({state!r})
+storage = DurableStorage.at(
+    os.path.join({state!r}, "output"), state=os.path.join({state!r}, ".caravel")
+)
 result = run(pipeline, job_id="j1",
              source=InMemorySource({{"p1": {{"n": 1}}, "p2": {{"n": 2}}}}),
              storage=storage)
@@ -425,7 +427,7 @@ def test_a_crash_around_routing_leaves_the_partition_unrouted_or_fully_routed(
     killed = _scenario(tmp_path, crash_at)
     assert killed.returncode == 137, f"{killed.stdout}\n{killed.stderr}"
 
-    storage = DurableStorage.at(tmp_path)
+    storage = DurableStorage.at(tmp_path / "output")
     try:
         plan = compile_durable_plan(_pipeline())
         for partition_id in ("p1", "p2"):

@@ -11,7 +11,6 @@ from caravel import (
     Step,
     dataset_as_loader,
     run,
-    step,
 )
 
 PIPELINE_NAME = "minimal_example"
@@ -33,21 +32,18 @@ def _runtime_params(context: object) -> Mapping[str, str]:
     return {}
 
 
-@step(output=JSONDataset())
 def bronze_collect(record: dict[str, Any], *, context: object) -> dict[str, Any]:
     """Add deterministic bronze fields. Runs once per execution partition."""
     _ = context
     return {**record, "bronze": True, "doubled_value": int(record["value"]) * 2}
 
 
-@step(output=JSONDataset())
 def silver_transform(record: dict[str, Any], *, context: object) -> dict[str, Any]:
     """Normalize one bronze record. Partition identity is preserved by the engine."""
     _ = context
     return {**record, "normalized": float(record["doubled_value"]) / 4.0}
 
 
-@step(output=JSONDataset())
 def silver_finalize(dataset: Any, *, context: object) -> dict[str, Any]:
     """Summarize the whole run behind an explicit all-input barrier.
 
@@ -85,11 +81,11 @@ def build_minimal_pipeline(input_path: Path | str | None = None) -> Pipeline:
     return Pipeline(
         name=PIPELINE_NAME,
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[bronze_collect]),
+            Stage(name=BRONZE_STAGE_NAME, entries=[Step(bronze_collect, output=JSONDataset())]),
             Stage(
                 name=SILVER_STAGE_NAME,
                 entries=[
-                    silver_transform,
+                    Step(silver_transform, output=JSONDataset()),
                     Step(silver_finalize, output=JSONDataset(), input_scope="all"),
                 ],
             ),
@@ -111,7 +107,7 @@ def run_minimal_pipeline(
     return run(
         pipeline,
         job_id=job_id,
-        storage=DurableStorage.at(state_root),
+        storage=DurableStorage.at(Path(state_root) / "output"),
         params=params,
     )
 

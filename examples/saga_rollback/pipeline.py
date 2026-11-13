@@ -160,7 +160,7 @@ def run_saga_pipeline(
     return run(
         pipeline,
         job_id="saga-1",
-        storage=DurableStorage.at(state_root),
+        storage=DurableStorage.at(Path(state_root) / "output"),
         params={"fail": "true"} if fail else None,
         plugins=[transaction],
     )
