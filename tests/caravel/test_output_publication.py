@@ -53,12 +53,26 @@ def _simulate_crash_before_publishing(tmp_path: Path, *partition_ids: str) -> No
 _VALUE = {"n": 1}
 
 
-def load(document: Any, *, context: Any) -> Any:
+def load_partition(partition, *, context: Any) -> Any:
+    document: Any = partition.load()
     return {**document, "loaded": _VALUE["n"]}
 
 
-def render(document: Any, *, context: Any) -> Any:
+def load(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(load_partition)
+
+
+def render_partition(partition, *, context: Any) -> Any:
+    document: Any = partition.load()
     return f"id={document['id']}"
+
+
+def render(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(render_partition)
 
 
 @pytest.fixture(autouse=True)
@@ -151,10 +165,16 @@ def test_manifest_aware_access_is_the_authority_not_the_files(tmp_path: Path) ->
 
 
 def test_a_failed_partition_publishes_nothing(tmp_path: Path) -> None:
-    def explode(document: Any, *, context: Any) -> Any:
+    def explode_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         if document["id"] == "doc-2":
             raise RuntimeError("boom")
         return {**document, "loaded": True}
+
+    def explode(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(explode_partition)
 
     with pytest.raises(RuntimeError, match="boom"):
         _run(tmp_path, _pipeline(Step(explode)))
@@ -193,9 +213,15 @@ def test_an_unreferenced_attempt_is_never_published(tmp_path: Path) -> None:
 def test_a_partition_is_published_before_the_job_finishes(tmp_path: Path) -> None:
     import time
 
-    def slow(document: Any, *, context: Any) -> Any:
+    def slow_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         time.sleep(0.02)
         return {**document, "loaded": True}
+
+    def slow(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(slow_partition)
 
     source = InMemorySource({f"doc-{i}": {"id": f"doc-{i}"} for i in range(8)})
     result = _run(
@@ -296,8 +322,13 @@ def test_recomputation_removes_files_a_smaller_result_no_longer_produces(
 ) -> None:
     shards = {"n": 3}
 
-    def shard(document: Any, *, context: Any) -> Any:
+    def shard_partition(partition, *, context: Any) -> Any:
         return {f"part-{i}": {"v": i} for i in range(shards["n"])}
+
+    def shard(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(shard_partition)
 
     pipeline = _pipeline(Step(shard, output=PartitionedJSONDataset(name="shard")))
     storage = DurableStorage.at(tmp_path / "output")
@@ -425,11 +456,16 @@ def test_a_traversing_pipeline_id_cannot_escape_the_output_root(
 def test_nested_dataset_paths_are_not_flattened(tmp_path: Path) -> None:
     """Finding 1: `en/record_1` and `fr/record_1` must not collide."""
 
-    def shard(document: Any, *, context: Any) -> Any:
+    def shard_partition(partition, *, context: Any) -> Any:
         return {
             "en/record_1": {"lang": "en"},
             "fr/record_1": {"lang": "fr"},
         }
+
+    def shard(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(shard_partition)
 
     storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline(Step(shard, output=PartitionedJSONDataset(name="shard")))
@@ -584,8 +620,13 @@ def test_every_manifest_reference_resolves_to_a_published_file(
 ) -> None:
     """Finding 5: recorded paths must be the paths publication actually wrote."""
 
-    def shard(document: Any, *, context: Any) -> Any:
+    def shard_partition(partition, *, context: Any) -> Any:
         return {"a/one": {"v": 1}, "b/two": {"v": 2}}
+
+    def shard(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(shard_partition)
 
     storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
@@ -1036,8 +1077,13 @@ def test_a_rebuild_swaps_rather_than_truncating(tmp_path: Path) -> None:
     """Repair must overwrite, but still never leave a partial file."""
     storage = DurableStorage.at(tmp_path / "output")
 
-    def shard(document: Any, *, context: Any) -> Any:
+    def shard_partition(partition, *, context: Any) -> Any:
         return {"a": {"v": 1}, "b": {"v": 2}}
+
+    def shard(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(shard_partition)
 
     pipeline = _pipeline(Step(shard, output=PartitionedJSONDataset(name="shard")))
     _run(tmp_path, pipeline, storage=storage)
@@ -1127,8 +1173,13 @@ def test_retention_rejects_a_negative_policy(tmp_path: Path) -> None:
 
 
 def _shard_pipeline() -> Pipeline:
-    def shard(document: Any, *, context: Any) -> Any:
+    def shard_partition(partition, *, context: Any) -> Any:
         return {"a": {"v": 1}}
+
+    def shard(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(shard_partition)
 
     return _pipeline(Step(shard, output=PartitionedJSONDataset(name="shard")))
 

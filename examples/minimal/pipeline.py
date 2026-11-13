@@ -32,25 +32,40 @@ def _runtime_params(context: object) -> Mapping[str, str]:
     return {}
 
 
-def bronze_collect(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+def bronze_collect_partition(partition, *, context: object) -> dict[str, Any]:
     """Add deterministic bronze fields. Runs once per execution partition."""
+    record: dict[str, Any] = partition.load()
     _ = context
     return {**record, "bronze": True, "doubled_value": int(record["value"]) * 2}
 
 
-def silver_transform(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+def bronze_collect(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(bronze_collect_partition)
+
+
+def silver_transform_partition(partition, *, context: object) -> dict[str, Any]:
     """Normalize one bronze record. Partition identity is preserved by the engine."""
+    record: dict[str, Any] = partition.load()
     _ = context
     return {**record, "normalized": float(record["doubled_value"]) / 4.0}
 
 
-def silver_finalize(dataset: Any, *, context: object) -> dict[str, Any]:
+def silver_transform(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(silver_transform_partition)
+
+
+def silver_finalize_all(partitions, *, context: object) -> dict[str, Any]:
     """Summarize the whole run behind an explicit all-input barrier.
 
     Aggregation is the one thing that genuinely needs every partition, so it is
-    declared with ``input_scope="all"``. It receives a reader over committed
+    declared with ``inputs.all(...)``. It receives a reader over committed
     partitions rather than a materialized dictionary.
     """
+    dataset = partitions
     params = _runtime_params(context)
     mode = params.get("mode")
     records: dict[str, dict[str, Any]] = {
@@ -74,6 +89,12 @@ def silver_finalize(dataset: Any, *, context: object) -> dict[str, Any]:
     return payload
 
 
+def silver_finalize(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(silver_finalize_all)
+
+
 def build_minimal_pipeline(input_path: Path | str | None = None) -> Pipeline:
     """Build the minimal example pipeline declaration."""
     seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
@@ -86,7 +107,7 @@ def build_minimal_pipeline(input_path: Path | str | None = None) -> Pipeline:
                 name=SILVER_STAGE_NAME,
                 entries=[
                     Step(silver_transform, output=JSONDataset()),
-                    Step(silver_finalize, output=JSONDataset(), input_scope="all"),
+                    Step(silver_finalize, output=JSONDataset()),
                 ],
             ),
         ],

@@ -26,12 +26,12 @@ from caravel import (
     LeasePolicy,
     PartitionedJSONDataset,
     Pipeline,
-    RetryPolicy,
+    RetryOptions,
     SnapshotInput,
     Stage,
     Step,
     TextDataset,
-    retry,
+    retry_operation,
     run,
 )
 
@@ -41,21 +41,49 @@ from caravel import (
 # ---------------------------------------------------------------------------
 
 
-def load(document: Any, *, context: Any) -> Any:
+def load_partition(partition, *, context: Any) -> Any:
+    document: Any = partition.load()
     return {**document, "loaded": True}
 
 
-def enrich(document: Any, *, context: Any) -> Any:
+def load(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(load_partition)
+
+
+def enrich_partition(partition, *, context: Any) -> Any:
+    document: Any = partition.load()
     return {**document, "enriched": True}
 
 
-def sync_index(document: Any, *, context: Any) -> Any:
+def enrich(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(enrich_partition)
+
+
+def sync_index_partition(partition, *, context: Any) -> Any:
+    document: Any = partition.load()
     return {"id": document["id"], "indexed": True}
 
 
-def summarize(dataset: Any, *, context: Any) -> Any:
+def sync_index(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(sync_index_partition)
+
+
+def summarize_all(partitions, *, context: Any) -> Any:
     """All-input barrier: a reader over committed partitions, not a materialized list."""
+    dataset = partitions
     return {"documents": sum(1 for _ in dataset.partitions())}
+
+
+def summarize(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(summarize_all)
 
 
 DOCUMENTS = {f"doc-{i}": {"id": f"doc-{i}", "words": i} for i in range(1, 4)}
@@ -156,11 +184,21 @@ def test_a_durable_run_reports_restart_safety(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "dataset,processor,expected",
     [
-        (JSONDataset(), lambda d, *, context: {"n": d["words"]}, {"n": 1}),
-        (TextDataset(), lambda d, *, context: f"id={d['id']}", "id=doc-1"),
+        (
+            JSONDataset(),
+            lambda i, *, context: i.each(lambda p, *, context: {"n": p.load()["words"]}),
+            {"n": 1},
+        ),
+        (
+            TextDataset(),
+            lambda i, *, context: i.each(lambda p, *, context: f"id={p.load()['id']}"),
+            "id=doc-1",
+        ),
         (
             PartitionedJSONDataset(),
-            lambda d, *, context: {d["id"]: {"words": d["words"]}},
+            lambda i, *, context: i.each(
+                lambda p, *, context: {p.load()["id"]: {"words": p.load()["words"]}}
+            ),
             {"doc-1": {"words": 1}},
         ),
     ],
@@ -211,13 +249,25 @@ def test_a_partition_crosses_a_stage_boundary_before_others_finish(
 ) -> None:
     order: list[str] = []
 
-    def first(document: Any, *, context: Any) -> Any:
+    def first_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         order.append("first")
         return document
 
-    def second(document: Any, *, context: Any) -> Any:
+    def first(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(first_partition)
+
+    def second_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         order.append("second")
         return document
+
+    def second(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(second_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -243,7 +293,7 @@ def test_an_all_input_step_is_the_only_whole_run_barrier(tmp_path: Path) -> None
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="summary", entries=[Step(summarize, input_scope="all")]),
+            Stage(name="summary", entries=[Step(summarize)]),
         ],
     )
     result = run(pipeline, job_id="j1", source=InMemorySource(DOCUMENTS), storage=storage)
@@ -258,7 +308,7 @@ def test_a_barrier_over_empty_input_still_runs(tmp_path: Path) -> None:
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="summary", entries=[Step(summarize, input_scope="all")]),
+            Stage(name="summary", entries=[Step(summarize)]),
         ],
     )
     result = run(pipeline, job_id="j1", source=InMemorySource({}), storage=storage)
@@ -357,11 +407,17 @@ def test_a_failed_run_resumes_without_reprocessing_committed_work(
     calls: list[str] = []
     storage = DurableStorage.at(tmp_path / "output")
 
-    def flaky(document: Any, *, context: Any) -> Any:
+    def flaky_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         calls.append(document["id"])
         if document["id"] == "doc-2" and calls.count("doc-2") == 1:
             raise RuntimeError("transient")
         return {**document, "loaded": True}
+
+    def flaky(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(flaky_partition)
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(flaky)])])
 
@@ -384,9 +440,15 @@ def test_a_budget_yields_and_a_later_invocation_finishes_the_job(
 
     storage = DurableStorage.at(tmp_path / "output")
 
-    def slow(document: Any, *, context: Any) -> Any:
+    def slow_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         time.sleep(0.01)
         return document
+
+    def slow(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(slow_partition)
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(slow)])])
     source = InMemorySource({f"doc-{i}": {"id": f"doc-{i}"} for i in range(12)})
@@ -421,13 +483,19 @@ def test_reinvoking_a_completed_job_reprocesses_nothing(tmp_path: Path) -> None:
 def test_a_step_retry_recovers_a_transient_failure(tmp_path: Path) -> None:
     attempts = {"n": 0}
 
-    def flaky(document: Any, *, context: Any) -> Any:
+    def flaky_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise ConnectionError("vendor down")
         return document
 
-    policy = RetryPolicy(jitter=lambda a, b: 0.0, sleep=lambda s: None)
+    def flaky(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(flaky_partition)
+
+    policy = RetryOptions(delay_seconds=lambda attempt: 0.0)
     pipeline = Pipeline(
         name="documents",
         stages=[Stage(name="prepare", entries=[Step(flaky, retry=policy)])],
@@ -445,8 +513,14 @@ def test_a_step_retry_recovers_a_transient_failure(tmp_path: Path) -> None:
 def test_batch_size_gives_a_finer_commit_boundary(tmp_path: Path) -> None:
     storage = DurableStorage.at(tmp_path / "output")
 
-    def double(records: Any, *, context: Any) -> Any:
+    def double_partition(partition, *, context: Any) -> Any:
+        records: Any = partition.load()
         return [value * 2 for value in records]
+
+    def double(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(double_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -467,7 +541,7 @@ def test_the_same_policy_retries_a_single_operation_inside_a_processor(
 ) -> None:
     """One retry contract, used at a boundary the step did not declare."""
     attempts = {"n": 0}
-    policy = RetryPolicy(jitter=lambda a, b: 0.0, sleep=lambda s: None)
+    policy = RetryOptions(delay_seconds=lambda attempt: 0.0)
 
     def enrich_record() -> str:
         attempts["n"] += 1
@@ -475,8 +549,14 @@ def test_the_same_policy_retries_a_single_operation_inside_a_processor(
             raise ConnectionError("vendor down")
         return "ok"
 
-    def processor(document: Any, *, context: Any) -> Any:
-        return {"value": retry(enrich_record, policy=policy)}
+    def processor_partition(partition, *, context: Any) -> Any:
+        value, _ = retry_operation(operation=enrich_record, retry=policy)
+        return {"value": value}
+
+    def processor(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(processor_partition)
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(processor)])])
     result = run(
@@ -550,7 +630,7 @@ def test_ephemeral_runs_the_identical_state_machine(tmp_path: Path) -> None:
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load), Step(enrich)]),
-            Stage(name="summary", entries=[Step(summarize, input_scope="all")]),
+            Stage(name="summary", entries=[Step(summarize)]),
         ],
     )
 
@@ -581,11 +661,17 @@ def test_ephemeral_still_resumes_within_one_process(tmp_path: Path) -> None:
     calls: list[str] = []
     storage = DurableStorage.ephemeral(tmp_path / "output")
 
-    def flaky(document: Any, *, context: Any) -> Any:
+    def flaky_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         calls.append(document["id"])
         if document["id"] == "doc-2" and calls.count("doc-2") == 1:
             raise RuntimeError("transient")
         return document
+
+    def flaky(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(flaky_partition)
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(flaky)])])
     with pytest.raises(RuntimeError):

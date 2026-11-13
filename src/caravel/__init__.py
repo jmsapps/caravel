@@ -41,17 +41,26 @@ from .durability import (
     StorageCapabilityError,
     UnsupportedDurableDeclarationError,
 )
+from .inputs import (
+    AggregateInput,
+    DeclarationContext,
+    Inputs,
+    ManagedDescriptor,
+    ManagedInputError,
+    PartitionInput,
+)
 from .loaders import CallableLoader, MultiSourceLoader, dataset_as_loader
 from .paths import partition_key_to_relpath, validate_partition_key
 from .pipeline import Pipeline, Stage, Step
 from .retry import (
-    FailureContext,
-    RetryBudget,
+    RetryBudgetExhaustedError,
+    RetryCancelledError,
     RetryError,
-    RetryPolicy,
+    RetryOptions,
     RetryPolicyError,
-    default_classifier,
-    retry,
+    RetryResultExhaustedError,
+    compute_retry_delay,
+    retry_operation,
 )
 from .runner import run
 from .types import (
@@ -102,14 +111,22 @@ __all__ = [
     "CallableLoader",
     "MultiSourceLoader",
     "dataset_as_loader",
+    # Managed inputs
+    "Inputs",
+    "ManagedDescriptor",
+    "DeclarationContext",
+    "PartitionInput",
+    "AggregateInput",
+    "ManagedInputError",
     # Retries
-    "RetryPolicy",
-    "RetryBudget",
+    "RetryOptions",
+    "retry_operation",
+    "compute_retry_delay",
     "RetryError",
     "RetryPolicyError",
-    "FailureContext",
-    "default_classifier",
-    "retry",
+    "RetryResultExhaustedError",
+    "RetryCancelledError",
+    "RetryBudgetExhaustedError",
     # Consumers and storage internals
     "BatchFeed",
     "AttemptOutputStore",

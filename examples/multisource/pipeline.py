@@ -48,7 +48,7 @@ def make_multisource_loader(
     )
 
 
-def summarize_by_source(dataset: Any, *, context: object) -> dict[str, Any]:
+def summarize_by_source_all(partitions, *, context: object) -> dict[str, Any]:
     """Count records by source tag behind an explicit all-input barrier.
 
     ``MultiSourceLoader`` still tags every record with ``__source__``. Durable
@@ -56,6 +56,7 @@ def summarize_by_source(dataset: Any, *, context: object) -> dict[str, Any]:
     nothing strips it, so the tag is visible to downstream steps and in
     committed output.
     """
+    dataset = partitions
     _ = context
     counts_by_source: dict[str, int] = {SOURCE_A_NAME: 0, SOURCE_B_NAME: 0}
 
@@ -84,6 +85,12 @@ def summarize_by_source(dataset: Any, *, context: object) -> dict[str, Any]:
     }
 
 
+def summarize_by_source(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(summarize_by_source_all)
+
+
 def build_multisource_pipeline(
     *,
     source_a_dir: Path | str | None = None,
@@ -99,7 +106,6 @@ def build_multisource_pipeline(
                     Step(
                         summarize_by_source,
                         output=JSONDataset(name="summary"),
-                        input_scope="all",
                     )
                 ],
             )

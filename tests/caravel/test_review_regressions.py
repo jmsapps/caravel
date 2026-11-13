@@ -30,15 +30,22 @@ from caravel.durability import (
     SQLiteDurableStore,
     WorkUnitKey,
 )
-from caravel.retry import RetryPolicy
+from caravel.retry import RetryOptions
 
 PIPELINE_ID = "customer-42/document-changes"
 NODE = "stage-001-entry-001"
 
 
-def apply_change(payload: Any, *, context: Any) -> Any:
+def apply_change_partition(partition, *, context: Any) -> Any:
+    payload: Any = partition.load()
     del context
     return {"applied": payload}
+
+
+def apply_change(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(apply_change_partition)
 
 
 def _pipeline(**step_kwargs: Any) -> Pipeline:
@@ -115,12 +122,18 @@ def test_an_incomplete_job_still_fails_closed_on_a_retention_gap(
     """The D-2 fix must not weaken retention enforcement for unfinished work."""
     calls = {"n": 0}
 
-    def fail_once(payload: Any, *, context: Any) -> Any:
+    def fail_once_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("stop")
         return {"applied": payload}
+
+    def fail_once(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(fail_once_partition)
 
     pipeline = _pipeline()
     pipeline.stages[0].entries[0] = Step(fn=fail_once, output=JSONDataset(name="apply"))
@@ -302,13 +315,16 @@ def test_a_retry_cannot_adopt_a_newer_token_after_being_fenced_out(
     """The exact escalation, through the runner, with a colliding worker id.
 
     Attempt 1 is displaced by a takeover under the same worker id, then fails.
-    Attempt 2 must present the token this worker acquired and be refused. Code
-    that re-reads the token from the store commits here instead.
+    Attempt 2 must be refused before its callback runs. The control checks the
+    acquired token without adopting the replacement's authority.
     """
     key = WorkUnitKey("r1", NODE, "p1")
     displaced: list[int] = []
+    callback_calls: list[int] = []
 
-    def fail_after_being_displaced(payload: Any, *, context: Any) -> Any:
+    def fail_after_being_displaced_partition(partition, *, context: Any) -> Any:
+        callback_calls.append(1)
+        payload: Any = partition.load()
         del context
         if not displaced:
             held = store.load_work_unit(key)
@@ -326,6 +342,11 @@ def test_a_retry_cannot_adopt_a_newer_token_after_being_fenced_out(
             raise ConnectionError("vendor down")
         return {"applied": payload}
 
+    def fail_after_being_displaced(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(fail_after_being_displaced_partition)
+
     pipeline = Pipeline(
         name="changes",
         stages=[
@@ -335,7 +356,7 @@ def test_a_retry_cannot_adopt_a_newer_token_after_being_fenced_out(
                     Step(
                         fn=fail_after_being_displaced,
                         output=JSONDataset(name="apply"),
-                        retry=RetryPolicy(jitter=lambda a, b: 0.0, sleep=lambda s: None),
+                        retry=RetryOptions(delay_seconds=lambda attempt: 0.0),
                     )
                 ],
             )
@@ -353,6 +374,7 @@ def test_a_retry_cannot_adopt_a_newer_token_after_being_fenced_out(
         )
 
     assert displaced, "the takeover did not happen; the test proves nothing"
+    assert len(callback_calls) == 1, "a displaced worker retried the external operation"
     assert store.lookup_batch(key, "batch-000000") is None, (
         "a fenced-out worker published by adopting the newer token"
     )

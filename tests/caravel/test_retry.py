@@ -1,419 +1,651 @@
-"""One retry contract at step, batch, record, and operation boundaries."""
+"""One retry contract: RetryOptions and retry_operation at every boundary."""
 
 from __future__ import annotations
 
+from functools import partial
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from caravel.retry import (
-    BASE_BACKOFF_SECONDS,
-    MAX_BACKOFF_SECONDS,
-    FailureContext,
-    RetryBudget,
+from caravel import (
+    DurableStorage,
+    Inputs,
+    ManagedInputError,
+    Pipeline,
     RetryBudgetExhaustedError,
-    RetryCancelled,
+    RetryCancelledError,
     RetryError,
-    RetryPolicy,
+    RetryOptions,
     RetryPolicyError,
-    default_classifier,
-    retry,
+    RetryResultExhaustedError,
+    Stage,
+    Step,
+    compute_retry_delay,
+    retry_operation,
+    run,
 )
+from caravel.durability import ExecutionBudget, ExecutionPolicy, InMemorySource
+from caravel.retry import DEFAULT_MAX_ATTEMPTS, MAX_RETRY_DELAY_SECONDS
 
-
-class _Clock:
-    """A controlled monotonic clock that advances only when slept on."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-        self.slept: list[float] = []
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.slept.append(seconds)
-        self.now += seconds
-
-
-def _policy(clock: _Clock, **kwargs: Any) -> RetryPolicy:
-    """A policy with deterministic time and maximum jitter."""
-    defaults: dict[str, Any] = {
-        "jitter": lambda low, high: high,
-        "sleep": clock.sleep,
-        "monotonic": clock.monotonic,
-    }
-    defaults.update(kwargs)
-    return RetryPolicy(**defaults)
+NO_DELAY = RetryOptions(delay_seconds=lambda attempt: 0.0)
 
 
 class _Vendor(Exception):
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
+    """A domain failure that is not a recognized transient class."""
 
 
-# ---------------------------------------------------------------------------
-# Defaults (coverage 1 and 2)
-# ---------------------------------------------------------------------------
+def _counting(failures: int, error: BaseException) -> Any:
+    """Return an operation that raises ``error`` the first ``failures`` times."""
+    calls = {"n": 0}
+
+    def operation() -> int:
+        calls["n"] += 1
+        if calls["n"] <= failures:
+            raise error
+        return calls["n"]
+
+    operation.calls = calls  # type: ignore[attr-defined]
+    return operation
 
 
-def test_the_default_policy_allows_four_total_attempts() -> None:
-    clock = _Clock()
-    attempts = {"n": 0}
-
-    def always_fails() -> None:
-        attempts["n"] += 1
-        raise ConnectionError("down")
-
-    with pytest.raises(ConnectionError):
-        retry(always_fails, policy=_policy(clock))
-
-    assert attempts["n"] == 4
-    assert len(clock.slept) == 3
+# -- defaults and delay ------------------------------------------------------
 
 
-def test_backoff_is_full_jitter_exponential_capped_at_thirty_seconds() -> None:
-    clock = _Clock()
-    sampled: list[tuple[float, float]] = []
+def test_the_default_options_allow_four_total_attempts() -> None:
+    assert RetryOptions().max_attempts == DEFAULT_MAX_ATTEMPTS == 4
+    operation = _counting(3, ConnectionError("down"))
+    result, attempts = retry_operation(operation=operation, retry=NO_DELAY)
+    assert (result, attempts) == (4, 4)
 
-    def record_jitter(low: float, high: float) -> float:
-        sampled.append((low, high))
-        return 0.0
 
-    policy = RetryPolicy(
-        max_retries=8, jitter=record_jitter, sleep=clock.sleep, monotonic=clock.monotonic
-    )
-    with pytest.raises(ConnectionError):
-        retry(lambda: (_ for _ in ()).throw(ConnectionError("down")), policy=policy)
+def test_omitting_options_uses_the_documented_defaults() -> None:
+    """retry_operation() with no options still retries under RetryOptions()."""
+    operation = _counting(0, ConnectionError("down"))
+    assert retry_operation(operation=operation) == (1, 1)
 
-    assert [low for low, _ in sampled] == [0.0] * 8
-    expected = [
-        min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2 ** (n - 1))) for n in range(1, 9)
-    ]
-    assert [high for _, high in sampled] == expected
-    assert expected[-3:] == [30.0, 30.0, 30.0]
+
+def test_delay_is_capped_exponential_plus_jitter() -> None:
+    for attempt in range(1, 12):
+        delay = compute_retry_delay(attempt)
+        assert 0.0 <= delay <= MAX_RETRY_DELAY_SECONDS + 1.0
+    assert 1.0 <= compute_retry_delay(1) < 2.0
+    assert 2.0 <= compute_retry_delay(2) < 3.0
+    # The exponential component caps at 16, so total delay never exceeds 17.
+    assert 16.0 <= compute_retry_delay(9) < 17.0
+
+
+def test_delay_rejects_a_non_positive_attempt_number() -> None:
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            compute_retry_delay(bad)
+
+
+# -- classification ----------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "error",
-    [ConnectionError("x"), TimeoutError("x"), BrokenPipeError("x"), _Vendor("429")],
+    [ConnectionError("reset"), TimeoutError("slow"), BrokenPipeError("broken")],
 )
 def test_recognized_transient_failures_are_retried(error: BaseException) -> None:
-    assert default_classifier(
-        FailureContext(exception=error, attempt=1, scope="s", elapsed_seconds=0.0)
-    )
+    assert RetryOptions().should_retry_error(error) is True
 
 
 @pytest.mark.parametrize(
     "error",
-    [
-        ValueError("invalid input"),
-        TypeError("programming error"),
-        PermissionError("denied"),
-        KeyError("missing"),
-        NotImplementedError("nope"),
-    ],
+    [ValueError("bad"), TypeError("bad"), PermissionError("denied"), KeyError("missing")],
 )
 def test_permanent_failures_are_not_retried(error: BaseException) -> None:
-    assert not default_classifier(
-        FailureContext(exception=error, attempt=1, scope="s", elapsed_seconds=0.0)
-    )
+    assert RetryOptions().should_retry_error(error) is False
 
 
-def test_cancellation_and_termination_are_never_transient() -> None:
-    clock = _Clock()
-    attempts = {"n": 0}
+def test_control_signals_propagate_without_retry() -> None:
+    """BaseException control signals are never caught, let alone classified."""
 
-    def cancelled() -> None:
-        attempts["n"] += 1
-        raise KeyboardInterrupt()
+    def interrupted() -> None:
+        raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
-        retry(cancelled, policy=_policy(clock))
-    assert attempts["n"] == 1
+        retry_operation(operation=interrupted, retry=NO_DELAY)
+
+    def exiting() -> None:
+        raise SystemExit(1)
+
+    with pytest.raises(SystemExit):
+        retry_operation(operation=exiting, retry=NO_DELAY)
 
 
 def test_a_more_specific_permanent_class_beats_a_broad_transport_category() -> None:
-    # PermissionError is an OSError, as ConnectionError is; permanent wins.
-    assert not default_classifier(
-        FailureContext(
-            exception=PermissionError("denied"), attempt=1, scope="s", elapsed_seconds=0.0
-        )
-    )
+    # PermissionError is an OSError, as ConnectionError is, but it is permanent.
+    assert RetryOptions().should_retry_error(PermissionError("denied")) is False
 
 
 def test_arbitrary_error_text_is_not_classified_as_transient() -> None:
-    assert not default_classifier(
-        FailureContext(
-            exception=Exception("connection timeout rate limit"),
-            attempt=1,
-            scope="s",
-            elapsed_seconds=0.0,
-        )
+    assert RetryOptions().should_retry_error(_Vendor("temporarily unavailable")) is False
+
+
+def test_a_rate_limit_status_code_is_transient() -> None:
+    error = _Vendor("slow down")
+    error.status_code = 429  # type: ignore[attr-defined]
+    assert RetryOptions().should_retry_error(error) is True
+
+
+# -- predicates and validation -----------------------------------------------
+
+
+def test_a_custom_exception_predicate_receives_the_bare_exception() -> None:
+    seen: list[BaseException] = []
+
+    def predicate(error: BaseException) -> bool:
+        seen.append(error)
+        return isinstance(error, _Vendor)
+
+    operation = _counting(1, _Vendor("retry me"))
+    result, attempts = retry_operation(
+        operation=operation,
+        retry=RetryOptions(should_retry_error=predicate, delay_seconds=lambda a: 0.0),
     )
+    assert (result, attempts) == (2, 2)
+    assert len(seen) == 1 and isinstance(seen[0], _Vendor)
 
 
-# ---------------------------------------------------------------------------
-# One policy at every boundary (coverage 3)
-# ---------------------------------------------------------------------------
-
-
-def test_the_same_policy_works_at_operation_record_and_batch_boundaries() -> None:
-    clock = _Clock()
-    policy = _policy(clock)
-    calls = {"operation": 0, "record": 0, "batch": 0}
-
-    def flaky(name: str) -> Any:
-        def inner() -> str:
-            calls[name] += 1
-            if calls[name] < 3:
-                raise ConnectionError("down")
-            return name
-
-        return inner
-
-    assert retry(flaky("operation"), policy=policy, scope="operation") == "operation"
-
-    def enrich_batch(records: list[int]) -> list[str]:
-        return [retry(flaky("record"), policy=policy, scope=f"record-{value}") for value in records]
-
-    assert retry(lambda: enrich_batch([1]), policy=policy, scope="batch") == ["record"]
-    assert calls["operation"] == 3
-    assert calls["record"] == 3
-
-
-# ---------------------------------------------------------------------------
-# Custom predicates and configuration (coverage 4)
-# ---------------------------------------------------------------------------
-
-
-def test_a_custom_predicate_extends_the_default_classifier() -> None:
-    clock = _Clock()
-    default = RetryPolicy()
-
-    def retryable(failure: FailureContext) -> bool:
-        error = failure.exception
-        return default.should_retry(failure) or (
-            isinstance(error, _Vendor) and error.code == "TEMPORARILY_BUSY"
-        )
-
-    attempts = {"n": 0}
-
-    def busy() -> str:
-        attempts["n"] += 1
-        if attempts["n"] < 3:
-            raise _Vendor("TEMPORARILY_BUSY")
-        return "ok"
-
-    assert retry(busy, policy=_policy(clock, when=retryable)) == "ok"
-    assert attempts["n"] == 3
-
-
-def test_a_replacement_classifier_overrides_the_default() -> None:
-    clock = _Clock()
-    attempts = {"n": 0}
-
-    def never_retry(failure: FailureContext) -> bool:
-        del failure
-        return False
-
-    def transient() -> None:
-        attempts["n"] += 1
-        raise ConnectionError("down")
-
+def test_max_attempts_of_one_permits_the_initial_call_without_retry() -> None:
+    operation = _counting(1, ConnectionError("down"))
     with pytest.raises(ConnectionError):
-        retry(transient, policy=_policy(clock, when=never_retry))
-    assert attempts["n"] == 1
+        retry_operation(operation=operation, retry=RetryOptions(max_attempts=1))
+    assert operation.calls["n"] == 1  # type: ignore[attr-defined]
 
 
-def test_zero_retries_disables_retrying() -> None:
-    clock = _Clock()
-    attempts = {"n": 0}
-
-    def transient() -> None:
-        attempts["n"] += 1
-        raise ConnectionError("down")
-
-    with pytest.raises(ConnectionError):
-        retry(transient, policy=_policy(clock, max_retries=0))
-    assert attempts["n"] == 1
-    assert clock.slept == []
-
-
-def test_a_failing_predicate_becomes_a_policy_error_not_a_retry() -> None:
-    clock = _Clock()
-
-    def broken(failure: FailureContext) -> bool:
+def test_a_failing_exception_predicate_is_a_policy_error() -> None:
+    def predicate(error: BaseException) -> bool:
         raise RuntimeError("predicate exploded")
 
-    with pytest.raises(RetryPolicyError, match="predicate failures are policy errors"):
-        retry(
-            lambda: (_ for _ in ()).throw(ConnectionError("down")),
-            policy=_policy(clock, when=broken),
+    with pytest.raises(RetryPolicyError, match="Error predicate failed"):
+        retry_operation(
+            operation=_counting(1, ConnectionError("down")),
+            retry=RetryOptions(should_retry_error=predicate),
         )
 
 
-def test_a_successful_return_is_accepted_unless_a_result_classifier_opts_in() -> None:
-    clock = _Clock()
-    assert retry(lambda: {"ok": False}, policy=_policy(clock)) == {"ok": False}
+def test_a_successful_return_is_accepted_unless_a_result_predicate_opts_in() -> None:
+    assert retry_operation(operation=lambda: "ok", retry=NO_DELAY) == ("ok", 1)
 
-    attempts = {"n": 0}
 
-    def returns_failure() -> dict[str, Any]:
-        attempts["n"] += 1
-        return {"ok": attempts["n"] >= 3}
+def test_a_result_predicate_receives_the_bare_result() -> None:
+    results = {"n": 0}
 
-    result = retry(
-        returns_failure,
-        policy=_policy(clock, on_result=lambda value: not value["ok"]),
+    def operation() -> str:
+        results["n"] += 1
+        return "pending" if results["n"] < 3 else "done"
+
+    value, attempts = retry_operation(
+        operation=operation,
+        retry=RetryOptions(
+            should_retry_result=lambda result: result == "pending",
+            delay_seconds=lambda a: 0.0,
+        ),
     )
-    assert result == {"ok": True}
-    assert attempts["n"] == 3
+    assert (value, attempts) == ("done", 3)
 
 
-def test_a_result_classifier_exhausting_attempts_raises_retry_error() -> None:
-    clock = _Clock()
-    with pytest.raises(RetryError, match="returned a failure result"):
-        retry(lambda: {"ok": False}, policy=_policy(clock, on_result=lambda value: True))
-
-
-def test_a_failing_result_classifier_is_a_policy_error() -> None:
-    clock = _Clock()
-
-    def broken(value: Any) -> bool:
-        raise RuntimeError("classifier exploded")
-
-    with pytest.raises(RetryPolicyError, match="policy errors"):
-        retry(lambda: "value", policy=_policy(clock, on_result=broken))
-
-
-def test_policy_configuration_is_validated() -> None:
-    with pytest.raises(ValueError, match="max_retries"):
-        RetryPolicy(max_retries=-1)
-    with pytest.raises(TypeError, match="max_retries"):
-        RetryPolicy(max_retries="three")  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="when"):
-        RetryPolicy(when="nope")  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="on_result"):
-        RetryPolicy(on_result="nope")  # type: ignore[arg-type]
-
-
-def test_max_elapsed_time_stops_further_attempts() -> None:
-    clock = _Clock()
-    attempts = {"n": 0}
-
-    def transient() -> None:
-        attempts["n"] += 1
-        raise ConnectionError("down")
-
-    with pytest.raises(ConnectionError):
-        retry(transient, policy=_policy(clock, max_retries=10, max_elapsed_seconds=3.0))
-    assert attempts["n"] < 11
-
-
-# ---------------------------------------------------------------------------
-# Nesting, budgets, and deadlines (coverage 5 and 6)
-# ---------------------------------------------------------------------------
-
-
-def test_a_nested_call_acquires_no_policy_automatically() -> None:
-    clock = _Clock()
-    inner_calls = {"n": 0}
-
-    def inner() -> None:
-        inner_calls["n"] += 1
-        raise ConnectionError("down")
-
-    def outer() -> None:
-        inner()
-
-    with pytest.raises(ConnectionError):
-        retry(outer, policy=_policy(clock))
-
-    # Only the outer boundary retried; the inner call got no policy of its own.
-    assert inner_calls["n"] == 4
-
-
-def test_nested_policies_share_one_retry_budget() -> None:
-    clock = _Clock()
-    budget = RetryBudget(remaining=2)
-    policy = _policy(clock)
-
-    def always_fails() -> None:
-        raise ConnectionError("down")
-
-    with pytest.raises(RetryBudgetExhaustedError):
-        retry(always_fails, policy=policy, scope="inner", budget=budget)
-    assert budget.remaining == 0
-
-
-def test_an_exhausted_budget_prevents_an_enclosing_policy_from_restarting() -> None:
-    clock = _Clock()
-    budget = RetryBudget(remaining=1)
-    policy = _policy(clock)
-    outer_attempts = {"n": 0}
-
-    def inner() -> None:
-        raise ConnectionError("down")
-
-    def outer() -> None:
-        outer_attempts["n"] += 1
-        retry(inner, policy=policy, scope="inner", budget=budget)
-
-    with pytest.raises(RetryBudgetExhaustedError):
-        retry(outer, policy=policy, scope="outer", budget=budget)
-    assert outer_attempts["n"] == 1
-
-
-def test_a_retry_stops_rather_than_overrunning_the_remaining_budget() -> None:
-    clock = _Clock()
-    budget = RetryBudget(deadline_seconds=0.5, shutdown_margin_seconds=0.2)
-
-    def always_fails() -> None:
-        raise ConnectionError("down")
-
-    with pytest.raises(RetryCancelled, match="durable boundary"):
-        retry(always_fails, policy=_policy(clock), budget=budget)
-    assert clock.slept == [], "no attempt started that could not fit"
-
-
-def test_a_budget_with_room_permits_the_attempt() -> None:
-    clock = _Clock()
-    budget = RetryBudget(deadline_seconds=600.0, shutdown_margin_seconds=1.0)
-    attempts = {"n": 0}
-
-    def flaky() -> str:
-        attempts["n"] += 1
-        if attempts["n"] < 2:
-            raise ConnectionError("down")
-        return "ok"
-
-    assert retry(flaky, policy=_policy(clock), budget=budget) == "ok"
-    assert attempts["n"] == 2
-
-
-def test_retry_budget_configuration_is_validated() -> None:
-    with pytest.raises(ValueError, match="remaining"):
-        RetryBudget(remaining=-1)
-    with pytest.raises(TypeError, match="remaining"):
-        RetryBudget(remaining="many")  # type: ignore[arg-type]
-
-
-def test_failure_context_exposes_scope_attempt_and_error_code() -> None:
-    seen: list[FailureContext] = []
-
-    def capture(failure: FailureContext) -> bool:
-        seen.append(failure)
-        return failure.attempt < 2
-
-    clock = _Clock()
-    with pytest.raises(_Vendor):
-        retry(
-            lambda: (_ for _ in ()).throw(_Vendor("429")),
-            policy=_policy(clock, when=capture),
-            scope="node/p1/batch-0",
+def test_an_exhausted_result_retry_raises_and_never_returns_the_value() -> None:
+    with pytest.raises(RetryResultExhaustedError) as caught:
+        retry_operation(
+            operation=lambda: {"secret": "rejected-payload"},
+            retry=RetryOptions(
+                should_retry_result=lambda result: True,
+                max_attempts=2,
+                delay_seconds=lambda a: 0.0,
+            ),
         )
-    assert [failure.attempt for failure in seen] == [1, 2]
-    assert seen[0].scope == "node/p1/batch-0"
-    assert seen[0].error_code == "429"
+    # No raw rejected result or payload appears in the exhaustion error.
+    assert "secret" not in str(caught.value)
+    assert "rejected-payload" not in str(caught.value)
+    assert isinstance(caught.value, RetryError)
+
+
+def test_a_failing_result_predicate_is_a_policy_error() -> None:
+    def predicate(result: Any) -> bool:
+        raise RuntimeError("predicate exploded")
+
+    with pytest.raises(RetryPolicyError, match="Result predicate failed"):
+        retry_operation(operation=lambda: "ok", retry=RetryOptions(should_retry_result=predicate))
+
+
+def test_options_are_validated_at_construction() -> None:
+    with pytest.raises(ValueError):
+        RetryOptions(max_attempts=0)
+    with pytest.raises(TypeError):
+        RetryOptions(max_attempts="four")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        RetryOptions(max_attempts=True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        RetryOptions(should_retry_error="always")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        RetryOptions(should_retry_result="always")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        RetryOptions(delay_seconds=1.0)  # type: ignore[arg-type]
+
+
+def test_an_invalid_delay_is_a_policy_error() -> None:
+    for bad in (-1.0, float("inf"), float("nan"), True, "soon"):
+        with pytest.raises(RetryPolicyError, match="finite and nonnegative"):
+            retry_operation(
+                operation=_counting(1, ConnectionError("down")),
+                retry=RetryOptions(delay_seconds=lambda attempt, value=bad: value),
+            )
+
+
+def test_a_failing_delay_function_is_a_policy_error() -> None:
+    def delay(attempt: int) -> float:
+        raise RuntimeError("clock exploded")
+
+    with pytest.raises(RetryPolicyError, match="delay calculation failed"):
+        retry_operation(
+            operation=_counting(1, ConnectionError("down")),
+            retry=RetryOptions(delay_seconds=delay),
+        )
+
+
+@pytest.mark.parametrize("boundary", ["stage", "step", "each", "all", "operation"])
+def test_dictionary_based_retry_configuration_is_rejected(boundary: str) -> None:
+    invalid_options: Any = {"max_attempts": 2}
+
+    def callback(value: Any, *, context: Any) -> Any:
+        return value.load()
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        return inputs.each(callback)
+
+    expected_error = ManagedInputError if boundary in ("each", "all") else TypeError
+    with pytest.raises(expected_error, match=r"retry.*RetryOptions"):
+        if boundary == "stage":
+            Stage(name="s", entries=[Step(builder)], retry=invalid_options)
+        elif boundary == "step":
+            Step(builder, retry=invalid_options)
+        elif boundary == "each":
+            Inputs().each(callback, retry=invalid_options)
+        elif boundary == "all":
+            Inputs().all(callback, retry=invalid_options)
+        else:
+            retry_operation(operation=lambda: 1, retry=invalid_options)
+
+
+def test_partial_operation_retries_with_bound_arguments() -> None:
+    calls: list[str] = []
+
+    def operation(record: str, *, model: str) -> str:
+        calls.append(record)
+        if len(calls) == 1:
+            raise ConnectionError("temporary failure")
+        return f"{model}:{record}"
+
+    result, attempts = retry_operation(
+        operation=partial(operation, "record-1", model="test-model"), retry=NO_DELAY
+    )
+    assert (result, attempts) == ("test-model:record-1", 2)
+    assert calls == ["record-1", "record-1"]
+
+
+def test_retry_operation_rejects_a_non_callable_before_attempting_it() -> None:
+    invalid_operation: Any = 42
+    with pytest.raises(TypeError, match="operation must be callable"):
+        retry_operation(operation=invalid_operation)
+
+
+def test_managed_retry_wait_responds_to_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from caravel.durability.execution import _Deadline, _InvocationControls
+
+    controls = _InvocationControls(
+        deadline=_Deadline(ExecutionBudget(seconds=30)), allowance=3, shutdown_margin=1
+    )
+    bound = controls.bind(scope="test", owner_id="worker", fence_token=None)
+    waits: list[float] = []
+
+    def cancel_during_wait(seconds: float) -> bool:
+        waits.append(seconds)
+        controls.cancel()
+        return True
+
+    def reject_blocking_sleep(seconds: float) -> None:
+        raise AssertionError("managed retry used an uninterruptible sleep")
+
+    monkeypatch.setattr(controls.cancel_event, "wait", cancel_during_wait)
+    monkeypatch.setattr("caravel.durability.execution.time.sleep", reject_blocking_sleep)
+    with pytest.raises(RetryCancelledError, match="cancelled"):
+        bound.wait(10)
+    assert waits and waits[0] <= 0.1
+
+
+def test_retry_args_keyword_is_rejected() -> None:
+    with pytest.raises(TypeError):
+        retry_operation(operation=lambda: 1, retry_args={"max_attempts": 2})  # type: ignore[call-arg]
+
+
+# -- one instance, every boundary --------------------------------------------
+
+
+def _storage(tmp_path: Path) -> Any:
+    return DurableStorage.at(tmp_path / "output")
+
+
+def test_one_options_instance_is_reused_at_stage_step_helper_and_operation(
+    tmp_path: Path,
+) -> None:
+    """The same RetryOptions object configures all four supported boundaries."""
+    shared = RetryOptions(max_attempts=3, delay_seconds=lambda attempt: 0.0)
+    attempts = {"operation": 0}
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context
+
+        def call() -> Any:
+            attempts["operation"] += 1
+            if attempts["operation"] < 2:
+                raise ConnectionError("vendor down")
+            return partition.load()
+
+        value, _ = retry_operation(operation=call, retry=shared)
+        return value
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(callback, retry=shared)
+
+    pipeline = Pipeline(
+        name="documents",
+        stages=[
+            Stage(name="prepare", retry=shared, entries=[Step(builder, retry=shared)]),
+        ],
+    )
+    result = run(
+        pipeline,
+        job_id="j1",
+        source=InMemorySource({"p1": {"id": "p1"}}),
+        storage=_storage(tmp_path),
+    )
+    assert result.status == "completed"
+    assert attempts["operation"] == 2
+
+
+def test_disabled_retry_does_not_repeat_a_failing_callback(tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context, partition
+        calls["n"] += 1
+        raise ConnectionError("vendor down")
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(callback, retry=None)
+
+    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    with pytest.raises(ConnectionError):
+        run(
+            pipeline,
+            job_id="j1",
+            source=InMemorySource({"p1": {"id": "p1"}}),
+            storage=_storage(tmp_path),
+        )
+    assert calls["n"] == 1
+
+
+def test_inner_retries_exhaust_before_an_outer_boundary_restarts(tmp_path: Path) -> None:
+    """Nesting is stage -> step -> helper, so the innermost exhausts first."""
+    calls: list[str] = []
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context, partition
+        calls.append("callback")
+        raise ConnectionError("vendor down")
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(
+            callback, retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0)
+        )
+
+    pipeline = Pipeline(
+        name="documents",
+        stages=[
+            Stage(
+                name="prepare",
+                retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0),
+                entries=[
+                    Step(
+                        builder,
+                        retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0),
+                    )
+                ],
+            )
+        ],
+    )
+    with pytest.raises(ConnectionError):
+        run(
+            pipeline,
+            job_id="j1",
+            source=InMemorySource({"p1": {"id": "p1"}}),
+            storage=_storage(tmp_path),
+        )
+    # 2 helper attempts x 2 step attempts x 2 stage attempts.
+    assert len(calls) == 8
+
+
+def test_an_operation_retry_repeats_only_the_wrapped_call(tmp_path: Path) -> None:
+    callback_calls = {"n": 0}
+    operation_calls = {"n": 0}
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context
+        callback_calls["n"] += 1
+
+        def call() -> Any:
+            operation_calls["n"] += 1
+            if operation_calls["n"] < 3:
+                raise ConnectionError("vendor down")
+            return partition.load()
+
+        value, _ = retry_operation(operation=call, retry=NO_DELAY)
+        return value
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(callback)
+
+    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    result = run(
+        pipeline,
+        job_id="j1",
+        source=InMemorySource({"p1": {"id": "p1"}}),
+        storage=_storage(tmp_path),
+    )
+    assert result.status == "completed"
+    assert callback_calls["n"] == 1
+    assert operation_calls["n"] == 3
+
+
+def test_retry_operation_works_outside_the_runner() -> None:
+    """Standalone use has its own local limits and claims no durable recovery."""
+    from caravel.retry import _active_retry_control
+
+    assert _active_retry_control.get() is None
+    operation = _counting(2, TimeoutError("slow"))
+    assert retry_operation(operation=operation, retry=NO_DELAY) == (3, 3)
+
+
+# -- shared invocation controls ----------------------------------------------
+
+
+def test_nested_retries_share_the_invocation_allowance(tmp_path: Path) -> None:
+    """Explicitly nested policies cannot multiply attempts without bound."""
+    calls = {"n": 0}
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context, partition
+
+        def call() -> Any:
+            calls["n"] += 1
+            raise ConnectionError("vendor down")
+
+        return retry_operation(
+            operation=call, retry=RetryOptions(max_attempts=50, delay_seconds=lambda a: 0.0)
+        )
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(callback)
+
+    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    with pytest.raises(RetryBudgetExhaustedError):
+        run(
+            pipeline,
+            job_id="j1",
+            source=InMemorySource({"p1": {"id": "p1"}}),
+            storage=_storage(tmp_path),
+            policy=ExecutionPolicy(max_retry_attempts=5),
+        )
+    # Five retries were charged; the initial attempt was not.
+    assert calls["n"] == 6
+
+
+def test_an_exhausted_allowance_is_terminal_for_the_enclosing_retry(tmp_path: Path) -> None:
+    """Budget exhaustion propagates through outer policies, never reclassified."""
+    calls = {"n": 0}
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context, partition
+
+        def call() -> Any:
+            calls["n"] += 1
+            raise ConnectionError("vendor down")
+
+        return retry_operation(
+            operation=call, retry=RetryOptions(max_attempts=50, delay_seconds=lambda a: 0.0)
+        )
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(
+            callback, retry=RetryOptions(max_attempts=10, delay_seconds=lambda a: 0.0)
+        )
+
+    pipeline = Pipeline(
+        name="documents",
+        stages=[
+            Stage(
+                name="prepare",
+                retry=RetryOptions(max_attempts=10, delay_seconds=lambda a: 0.0),
+                entries=[Step(builder)],
+            )
+        ],
+    )
+    with pytest.raises(RetryBudgetExhaustedError):
+        run(
+            pipeline,
+            job_id="j1",
+            source=InMemorySource({"p1": {"id": "p1"}}),
+            storage=_storage(tmp_path),
+            policy=ExecutionPolicy(max_retry_attempts=3),
+        )
+    assert calls["n"] == 4
+
+
+def test_initial_attempts_do_not_consume_the_allowance(tmp_path: Path) -> None:
+    """A zero allowance still permits every initial call across many partitions."""
+    seen: list[str] = []
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context
+        seen.append(partition.partition_id)
+        return partition.load()
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(callback, retry=NO_DELAY)
+
+    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    result = run(
+        pipeline,
+        job_id="j1",
+        source=InMemorySource({"a": {"v": 1}, "b": {"v": 2}, "c": {"v": 3}}),
+        storage=_storage(tmp_path),
+        policy=ExecutionPolicy(max_retry_attempts=0),
+    )
+    assert result.status == "completed"
+    assert sorted(seen) == ["a", "b", "c"]
+
+
+def test_a_retry_stops_rather_than_overrunning_the_invocation_deadline(
+    tmp_path: Path,
+) -> None:
+    calls = {"n": 0}
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context, partition
+
+        def call() -> Any:
+            calls["n"] += 1
+            raise ConnectionError("vendor down")
+
+        # A delay far larger than the remaining budget must not be waited out.
+        return retry_operation(
+            operation=call, retry=RetryOptions(max_attempts=5, delay_seconds=lambda a: 600.0)
+        )
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(callback)
+
+    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    with pytest.raises(RetryCancelledError):
+        run(
+            pipeline,
+            job_id="j1",
+            source=InMemorySource({"p1": {"id": "p1"}}),
+            storage=_storage(tmp_path),
+            budget=ExecutionBudget(seconds=30.0),
+        )
+    assert calls["n"] == 1
+
+
+def test_execution_policy_validates_the_allowance() -> None:
+    with pytest.raises(ValueError):
+        ExecutionPolicy(max_retry_attempts=-1)
+    with pytest.raises(TypeError):
+        ExecutionPolicy(max_retry_attempts=True)  # type: ignore[arg-type]
+    assert ExecutionPolicy().max_retry_attempts == 100
+
+
+def test_controls_are_isolated_between_invocations(tmp_path: Path) -> None:
+    """A failed invocation leaves the next one a fresh allowance and context."""
+    from caravel.retry import _active_retry_control
+
+    state = {"fail": True, "calls": 0}
+
+    def callback(partition: Any, *, context: Any) -> Any:
+        del context
+        state["calls"] = int(state["calls"]) + 1
+        if state["fail"]:
+            raise ConnectionError("vendor down")
+        return partition.load()
+
+    def builder(inputs: Any, *, context: Any) -> Any:
+        del context
+        return inputs.each(
+            callback, retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0)
+        )
+
+    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    storage = _storage(tmp_path)
+    source = InMemorySource({"p1": {"id": "p1"}})
+
+    with pytest.raises(ConnectionError):
+        run(pipeline, job_id="j1", source=source, storage=storage)
+    assert _active_retry_control.get() is None
+
+    state["fail"] = False
+    result = run(pipeline, job_id="j1", source=source, storage=storage)
+    assert result.status == "completed"
+    assert _active_retry_control.get() is None

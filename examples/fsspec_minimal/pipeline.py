@@ -43,20 +43,35 @@ def _runtime_params(context: object) -> Mapping[str, str]:
     return {}
 
 
-def bronze_collect(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+def bronze_collect_partition(partition, *, context: object) -> dict[str, Any]:
     """Add bronze fields to one execution partition's record."""
+    record: dict[str, Any] = partition.load()
     _ = context
     return {**record, "bronze": True, "doubled_value": int(record["value"]) * 2}
 
 
-def silver_transform(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+def bronze_collect(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(bronze_collect_partition)
+
+
+def silver_transform_partition(partition, *, context: object) -> dict[str, Any]:
     """Normalize one bronze record."""
+    record: dict[str, Any] = partition.load()
     _ = context
     return {**record, "normalized": float(record["doubled_value"]) / 4.0}
 
 
-def silver_finalize(dataset: Any, *, context: object) -> dict[str, Any]:
+def silver_transform(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(silver_transform_partition)
+
+
+def silver_finalize_all(partitions, *, context: object) -> dict[str, Any]:
     """Aggregate every committed partition behind an all-input barrier."""
+    dataset = partitions
     params = _runtime_params(context)
     records = {p.partition_id: p.load() for p in dataset.partitions()}
     ordered_keys = sorted(records)
@@ -71,6 +86,12 @@ def silver_finalize(dataset: Any, *, context: object) -> dict[str, Any]:
     if mode is not None:
         payload["mode"] = mode
     return payload
+
+
+def silver_finalize(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(silver_finalize_all)
 
 
 def build_fsspec_pipeline(
@@ -91,7 +112,6 @@ def build_fsspec_pipeline(
                     Step(
                         silver_finalize,
                         output=JSONDataset(name="finalize"),
-                        input_scope="all",
                     ),
                 ],
             ),

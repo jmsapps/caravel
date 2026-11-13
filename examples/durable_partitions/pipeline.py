@@ -38,7 +38,7 @@ from caravel.durability import (
     ExecutionBudget,
     InMemorySource,
 )
-from caravel.retry import RetryPolicy
+from caravel import RetryOptions
 
 PIPELINE_ID = "examples/durable-partitions"
 PUBLISH_NODE = "stage-002-entry-001"
@@ -53,26 +53,41 @@ DOCUMENTS = {
 WORK_SECONDS = 0.004
 
 
-def enrich(document: Any, *, context: Any) -> Any:
+def enrich_partition(partition, *, context: Any) -> Any:
     """Partition-scoped work: runs as soon as its own partition is ready."""
+    document: Any = partition.load()
     del context
     time.sleep(WORK_SECONDS)
     return {**document, "enriched": True}
 
 
-def publish(document: Any, *, context: Any) -> Any:
+def enrich(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(enrich_partition)
+
+
+def publish_partition(partition, *, context: Any) -> Any:
     """Destination publication is an ordinary partition-scoped step."""
+    document: Any = partition.load()
     del context
     time.sleep(WORK_SECONDS)
     return {"id": document["id"], "words": document["words"], "published": True}
 
 
-def summarize(dataset: Any, *, context: Any) -> Any:
+def publish(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(publish_partition)
+
+
+def summarize_all(partitions, *, context: Any) -> Any:
     """All-input barrier: waits for every required partition, then runs once.
 
     It receives a reader over committed references rather than a materialized
     dataset, so finalization stays bounded.
     """
+    dataset = partitions
     del context
     total = 0
     count = 0
@@ -82,10 +97,16 @@ def summarize(dataset: Any, *, context: Any) -> Any:
     return {"documents": count, "words": total}
 
 
+def summarize(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(summarize_all)
+
+
 def build_pipeline() -> Pipeline:
-    # A retry policy attached at the step boundary. Nested boundaries acquire
-    # no policy automatically.
-    vendor_retry = RetryPolicy(max_retries=3)
+    # Retry options attached at the step boundary. Nested boundaries acquire
+    # none automatically; the same instance can be reused at any boundary.
+    vendor_retry = RetryOptions(max_attempts=4)
     return Pipeline(
         name="durable-documents",
         stages=[
@@ -100,7 +121,6 @@ def build_pipeline() -> Pipeline:
                     Step(
                         fn=summarize,
                         output=JSONDataset(name="summary"),
-                        input_scope="all",
                     )
                 ],
             ),

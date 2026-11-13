@@ -46,9 +46,15 @@ def _run(pipeline: Pipeline, tmp_path: Path, **kwargs: Any) -> Any:
 def test_params_reach_the_step_context(tmp_path: Path) -> None:
     seen: list[str] = []
 
-    def capture(document: Any, *, context: Any) -> Any:
+    def capture_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         seen.append(context.params["env"])
         return document
+
+    def capture(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(capture_partition)
 
     _run(
         Pipeline(name="p", stages=[Stage(name="s", entries=[Step(capture)])]),
@@ -61,9 +67,15 @@ def test_params_reach_the_step_context(tmp_path: Path) -> None:
 def test_the_context_identifies_the_step_and_its_stage(tmp_path: Path) -> None:
     seen: list[tuple[str, str, int]] = []
 
-    def capture(document: Any, *, context: Any) -> Any:
+    def capture_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         seen.append((context.stage_name, context.step_name, context.stage_index))
         return document
+
+    def capture(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(capture_partition)
 
     _run(
         Pipeline(name="p", stages=[Stage(name="prepare", entries=[Step(capture)])]),
@@ -81,13 +93,25 @@ def test_the_context_identifies_the_step_and_its_stage(tmp_path: Path) -> None:
 def test_steps_run_in_declaration_order_within_a_partition(tmp_path: Path) -> None:
     order: list[str] = []
 
-    def first(document: Any, *, context: Any) -> Any:
+    def first_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         order.append("first")
         return document
 
-    def second(document: Any, *, context: Any) -> Any:
+    def first(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(first_partition)
+
+    def second_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         order.append("second")
         return document
+
+    def second(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(second_partition)
 
     _run(
         Pipeline(name="p", stages=[Stage(name="s", entries=[Step(first), Step(second)])]),
@@ -101,8 +125,13 @@ def test_a_step_failure_propagates_with_its_original_exception(tmp_path: Path) -
     class VendorError(RuntimeError):
         pass
 
-    def explode(document: Any, *, context: Any) -> Any:
+    def explode_partition(partition, *, context: Any) -> Any:
         raise VendorError("vendor is down")
+
+    def explode(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(explode_partition)
 
     with pytest.raises(VendorError, match="vendor is down"):
         _run(
@@ -112,12 +141,24 @@ def test_a_step_failure_propagates_with_its_original_exception(tmp_path: Path) -
 
 
 def test_a_downstream_step_receives_the_upstream_payload(tmp_path: Path) -> None:
-    def produce(document: Any, *, context: Any) -> Any:
+    def produce_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         return {"produced": document["id"]}
 
-    def consume(payload: Any, *, context: Any) -> Any:
+    def produce(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(produce_partition)
+
+    def consume_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         assert set(payload) == {"produced"}
         return {"consumed": payload["produced"]}
+
+    def consume(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(consume_partition)
 
     storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
@@ -134,8 +175,14 @@ def test_a_downstream_step_receives_the_upstream_payload(tmp_path: Path) -> None
 
 
 def test_a_declared_dataset_is_used_for_the_committed_output(tmp_path: Path) -> None:
-    def render(document: Any, *, context: Any) -> Any:
+    def render_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         return f"id={document['id']}"
+
+    def render(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(render_partition)
 
     storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
@@ -147,8 +194,14 @@ def test_a_declared_dataset_is_used_for_the_committed_output(tmp_path: Path) -> 
 
 
 def test_an_explicit_dataset_overrides_the_default(tmp_path: Path) -> None:
-    def render(document: Any, *, context: Any) -> Any:
+    def render_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         return f"id={document['id']}"
+
+    def render(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(render_partition)
 
     declared = Step(render, output=TextDataset(name="text"))
     assert isinstance(declared.dataset, TextDataset)
@@ -157,8 +210,14 @@ def test_an_explicit_dataset_overrides_the_default(tmp_path: Path) -> None:
 
 
 def test_persist_false_is_rejected_because_recovery_needs_committed_output() -> None:
-    def render(document: Any, *, context: Any) -> Any:
+    def render_partition(partition, *, context: Any) -> Any:
+        document: Any = partition.load()
         return document
+
+    def render(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(render_partition)
 
     with pytest.raises(ValueError, match="persist=False"):
         Step(render, persist=False)
@@ -167,7 +226,12 @@ def test_persist_false_is_rejected_because_recovery_needs_committed_output() -> 
 def test_a_pipeline_may_declare_its_own_source(tmp_path: Path) -> None:
     pipeline = Pipeline(
         name="p",
-        stages=[Stage(name="s", entries=[Step(lambda d, *, context: d)])],
+        stages=[
+            Stage(
+                name="s",
+                entries=[Step(lambda i, *, context: i.each(lambda p, *, context: p.load()))],
+            )
+        ],
         source=InMemorySource(DOCUMENTS),
     )
     pipeline.stages[0].entries[0].name = "identity"
@@ -180,7 +244,15 @@ def test_a_loader_is_accepted_as_a_source(tmp_path: Path) -> None:
     from caravel import CallableLoader
 
     storage = DurableStorage.at(tmp_path / "output")
-    pipeline = Pipeline(name="p", stages=[Stage(name="s", entries=[Step(lambda d, *, context: d)])])
+    pipeline = Pipeline(
+        name="p",
+        stages=[
+            Stage(
+                name="s",
+                entries=[Step(lambda i, *, context: i.each(lambda p, *, context: p.load()))],
+            )
+        ],
+    )
     pipeline.stages[0].entries[0].name = "identity"
     result = run(
         pipeline,
@@ -195,7 +267,15 @@ def test_a_loader_is_accepted_as_a_source(tmp_path: Path) -> None:
 def test_running_without_any_source_is_rejected(tmp_path: Path) -> None:
     from caravel import SourceError
 
-    pipeline = Pipeline(name="p", stages=[Stage(name="s", entries=[Step(lambda d, *, context: d)])])
+    pipeline = Pipeline(
+        name="p",
+        stages=[
+            Stage(
+                name="s",
+                entries=[Step(lambda i, *, context: i.each(lambda p, *, context: p.load()))],
+            )
+        ],
+    )
     pipeline.stages[0].entries[0].name = "identity"
     with pytest.raises(SourceError, match="No input source"):
         run(pipeline, job_id="j1", storage=DurableStorage.at(tmp_path / "output"))
@@ -210,9 +290,15 @@ def test_the_source_tag_is_stripped_before_output_is_committed(tmp_path: Path) -
     """Preparing a payload happens before the commit, so immutability is intact."""
     from caravel import SOURCE_FIELD, CallableLoader
 
-    def passthrough(record: Any, *, context: Any) -> Any:
+    def passthrough_partition(partition, *, context: Any) -> Any:
+        record: Any = partition.load()
         assert SOURCE_FIELD in record, "steps still see the tag"
         return record
+
+    def passthrough(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(passthrough_partition)
 
     storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(name="p", stages=[Stage(name="s", entries=[Step(passthrough)])])
@@ -233,7 +319,12 @@ def test_keep_source_tag_retains_it_when_asked(tmp_path: Path) -> None:
     storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
         name="p",
-        stages=[Stage(name="s", entries=[Step(lambda r, *, context: r)])],
+        stages=[
+            Stage(
+                name="s",
+                entries=[Step(lambda i, *, context: i.each(lambda p, *, context: p.load()))],
+            )
+        ],
     )
     pipeline.stages[0].entries[0].name = "passthrough"
     run(

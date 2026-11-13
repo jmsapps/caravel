@@ -100,7 +100,8 @@ def build_rag_ingestion_pipeline(
 ) -> Pipeline:
     seed = Path(input_path) if input_path is not None else _DEFAULT_INPUT
 
-    def stage_chunks(document: dict[str, Any], *, context: object) -> dict[str, Any]:
+    def stage_chunks_partition(partition, *, context: object) -> dict[str, Any]:
+        document: dict[str, Any] = partition.load()
         _ = context
         saga.record("delete_staging")
         staging = saga.root / "staging"
@@ -114,7 +115,13 @@ def build_rag_ingestion_pipeline(
             )
         return {**document, "chunk_count": len(chunks)}
 
-    def replace_index(payload: dict[str, Any], *, context: object) -> dict[str, Any]:
+    def stage_chunks(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(stage_chunks_partition)
+
+    def replace_index_partition(partition, *, context: object) -> dict[str, Any]:
+        payload: dict[str, Any] = partition.load()
         _ = context
         saga.record("restore_index")
         _replace_dir(saga.root / "index", saga.root / "index.backup")
@@ -124,14 +131,26 @@ def build_rag_ingestion_pipeline(
         )
         return {**payload, "index_recreated": True}
 
-    def promote_chunks(payload: dict[str, Any], *, context: object) -> dict[str, Any]:
+    def replace_index(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(replace_index_partition)
+
+    def promote_chunks_partition(partition, *, context: object) -> dict[str, Any]:
+        payload: dict[str, Any] = partition.load()
         _ = context
         saga.record("restore_current")
         _replace_dir(saga.root / "current", saga.root / "current.backup")
         _replace_dir(saga.root / "staging", saga.root / "current")
         return {**payload, "chunks_promoted": True}
 
-    def commit_version(payload: dict[str, Any], *, context: object) -> dict[str, Any]:
+    def promote_chunks(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(promote_chunks_partition)
+
+    def commit_version_partition(partition, *, context: object) -> dict[str, Any]:
+        payload: dict[str, Any] = partition.load()
         shutil.copy2(saga.root / "version.json", saga.root / "version.backup.json")
         saga.record("restore_version")
         _write(saga.root / "version.json", {"version": payload["version"]})
@@ -139,6 +158,11 @@ def build_rag_ingestion_pipeline(
         if isinstance(params, dict) and params.get("fail") == "true":
             raise RuntimeError("Simulated failure after chunk promotion")
         return {**payload, "status": "committed"}
+
+    def commit_version(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(commit_version_partition)
 
     entries: list[Step | Branch | Callable[..., Any]] = [
         Step(stage_chunks, JSONDataset(), name="stage_chunks"),

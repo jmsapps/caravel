@@ -3,7 +3,7 @@
 The legacy ``persist=False`` option is gone: durable recovery requires each
 step's output to be committed so a later invocation restores it instead of
 recomputing. What used to be "only the last step persists" is now expressed as
-cheap per-partition steps feeding one ``input_scope="all"`` aggregation.
+cheap per-partition steps feeding one ``inputs.all(...)`` aggregation.
 """
 
 from __future__ import annotations
@@ -35,23 +35,45 @@ PARTITIONS: dict[str, dict[str, Any]] = {
 }
 
 
-def step_1_collect(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+def step_1_collect_partition(partition, *, context: object) -> dict[str, Any]:
+    record: dict[str, Any] = partition.load()
     _ = context
     return {**record, "collected": True}
 
 
-def step_2_scale(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+def step_1_collect(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(step_1_collect_partition)
+
+
+def step_2_scale_partition(partition, *, context: object) -> dict[str, Any]:
+    record: dict[str, Any] = partition.load()
     _ = context
     return {**record, "scaled": int(record["value"]) * 10}
 
 
-def step_3_label(record: dict[str, Any], *, context: object) -> dict[str, Any]:
+def step_2_scale(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(step_2_scale_partition)
+
+
+def step_3_label_partition(partition, *, context: object) -> dict[str, Any]:
+    record: dict[str, Any] = partition.load()
     _ = context
     return {**record, "label": f"v{record['scaled']}"}
 
 
-def step_4_aggregate(dataset: Any, *, context: object) -> dict[str, Any]:
+def step_3_label(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(step_3_label_partition)
+
+
+def step_4_aggregate_all(partitions, *, context: object) -> dict[str, Any]:
     """Aggregate every committed partition behind the barrier."""
+    dataset = partitions
     _ = context
     records = {partition.partition_id: partition.load() for partition in dataset.partitions()}
     return {
@@ -60,6 +82,12 @@ def step_4_aggregate(dataset: Any, *, context: object) -> dict[str, Any]:
         "ids": sorted(records),
         "total_scaled": sum(int(record["scaled"]) for record in records.values()),
     }
+
+
+def step_4_aggregate(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(step_4_aggregate_all)
 
 
 def build_persist_only_final_pipeline() -> Pipeline:
@@ -75,7 +103,6 @@ def build_persist_only_final_pipeline() -> Pipeline:
                     Step(
                         step_4_aggregate,
                         output=JSONDataset(name="aggregate"),
-                        input_scope="all",
                     ),
                 ],
             )

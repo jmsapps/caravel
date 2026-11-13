@@ -4,21 +4,29 @@ Stages are declaration groups only. Scheduling reads the store's indexed
 eligible-work query, so one partition can cross a stage boundary while another
 is still in an earlier stage. There is no stage-wide completion check.
 
-An ``input_scope="all"`` step is a barrier: it becomes one work unit on the
-reserved aggregate partition, with one dependency edge per upstream partition.
-Its output is one stable partition for every subsequent step.
+A step whose builder declared ``inputs.all(...)`` is a barrier: it becomes one
+work unit on the reserved aggregate partition, with one dependency edge per
+upstream partition. Its output is one stable partition for every subsequent
+step. Declaration builders are compiled here, before any source discovery or
+durable mutation, so an invalid declaration fails having touched no state.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from ..branch import Branch
 from ..datasets import JSONDataset
-from ..pipeline import Pipeline, Step
-from ..plan import _normalize_route_step
-from ..plan import LogicalPlan, compile_pipeline
+from ..inputs import (
+    DeclarationContext,
+    ManagedDescriptor,
+    compile_descriptor,
+    internal_descriptor,
+)
+from ..pipeline import Pipeline, Stage, Step
+from ..plan import LogicalPlan, _normalize_route_step, compile_pipeline
+from ..retry import RetryOptions
 from .sources import AGGREGATE_PARTITION_ID, SourcePartition
 from .sqlite import SQLiteDurableStore
 from .types import (
@@ -59,11 +67,13 @@ class DurableNode:
     stage_name: str
     entry_index: int
     input_scope: InputScope
+    descriptor: ManagedDescriptor
     kind: NodeKind = "step"
     branch: Branch | None = None
     routes: tuple[tuple[str, tuple[DurableNode, ...]], ...] = ()
     merge_node_id: str | None = None
     branch_node_id: str | None = None
+    stage_retry: RetryOptions | None = None
 
     def route_chain(self, route_key: str) -> tuple[DurableNode, ...]:
         for key, chain in self.routes:
@@ -120,14 +130,36 @@ class DurablePlan:
         raise KeyError(f"Node '{node.node_id}' is not on the plan spine.")
 
 
+def _declaration_context(
+    step: Step,
+    *,
+    pipeline_name: str,
+    stage: Stage,
+    stage_index: int,
+    entry_index: int,
+    params: Mapping[str, str],
+) -> DeclarationContext:
+    """Build the read-only context a declaration builder receives."""
+    return DeclarationContext(
+        pipeline_name=pipeline_name,
+        stage_name=stage.name,
+        stage_index=stage_index,
+        step_name=step.name or "",
+        step_index=entry_index,
+        params=dict(params),
+    )
+
+
 def _compile_branch(
     branch: Branch,
     *,
+    pipeline_name: str,
+    stage: Stage,
     entry_id: str,
     stage_index: int,
-    stage_name: str,
     entry_index: int,
     index: int,
+    params: Mapping[str, str],
 ) -> tuple[DurableNode, list[DurableNode], DurableNode, int]:
     """Compile one branch into a branch node, route chains, and a merge node."""
     if not isinstance(branch.routes, dict) or not branch.routes:
@@ -145,21 +177,35 @@ def _compile_branch(
         chain: list[DurableNode] = []
         for step_number, raw in enumerate(branch.routes[route_key], start=1):
             step = _normalize_route_step(raw, branch_name=branch.name)
-            if step.input_scope == "all":
+            descriptor = compile_descriptor(
+                step.fn,
+                context=_declaration_context(
+                    step,
+                    pipeline_name=pipeline_name,
+                    stage=stage,
+                    stage_index=stage_index,
+                    entry_index=entry_index,
+                    params=params,
+                ),
+            )
+            if descriptor.kind == "all":
                 raise UnsupportedDurableDeclarationError(
                     f"Branch '{branch.name}' route '{route_key}' step "
-                    f"'{step.name}' declares input_scope='all'. A route step runs "
-                    "per partition; whole-dataset work belongs after the merge."
+                    f"'{step.name}' declares inputs.all(...). A route step runs "
+                    "per partition; place aggregation after convergence, in a step "
+                    "that follows the merge."
                 )
             node = DurableNode(
                 index=index,
                 node_id=f"{entry_id}-route-{route_number:03d}-step-{step_number:03d}",
                 step=step,
                 stage_index=stage_index,
-                stage_name=stage_name,
+                stage_name=stage.name,
                 entry_index=entry_index,
                 input_scope="partition",
+                descriptor=descriptor,
                 branch_node_id=entry_id,
+                stage_retry=stage.retry,
             )
             chain.append(node)
             route_nodes.append(node)
@@ -179,9 +225,10 @@ def _compile_branch(
             name=branch.name,
         ),
         stage_index=stage_index,
-        stage_name=stage_name,
+        stage_name=stage.name,
         entry_index=entry_index,
         input_scope="partition",
+        descriptor=internal_descriptor(_route_passthrough),
         kind="branch",
         branch=branch,
         routes=tuple(routes),
@@ -196,29 +243,39 @@ def _compile_branch(
             name=f"{branch.name}_merge",
         ),
         stage_index=stage_index,
-        stage_name=stage_name,
+        stage_name=stage.name,
         entry_index=entry_index,
         input_scope="partition",
+        descriptor=internal_descriptor(_route_passthrough),
         kind="merge",
         branch_node_id=entry_id,
     )
     return branch_node, route_nodes, merge_node, index + 1
 
 
-def _route_passthrough(payload: Any, *, context: Any) -> Any:
+def _route_passthrough(partition: Any, *, context: Any) -> Any:
     """Branch and merge nodes commit their partition's payload unchanged."""
     del context
-    return payload
+    return partition.load()
 
 
-def compile_durable_plan(pipeline: Pipeline) -> DurablePlan:
+def compile_durable_plan(
+    pipeline: Pipeline, *, params: Mapping[str, str] | None = None
+) -> DurablePlan:
     """Compile a pipeline into a durable node chain, rejecting what cannot resume.
 
-    Cross-invocation execution inside branches has no continuation or merge
-    contract, so a branch declaration is rejected on the durable path rather
-    than executed under semantics it was never given.
+    Every user-declared processor is invoked once here as a declaration builder,
+    before source discovery and before any durable mutation, and must return
+    exactly one managed descriptor. Compiled descriptors supply the per-partition
+    versus aggregate topology the scheduler already uses; nothing about a
+    callback's behavior is discovered at execution time.
+
+    Compilation has no durable state transition, so a resume simply compiles the
+    builders again and validates the resulting fingerprint before any callback,
+    source read, or mutation runs.
     """
     logical = compile_pipeline(pipeline)
+    declaration_params = dict(params or {})
     nodes: list[DurableNode] = []
     index = 0
 
@@ -234,11 +291,13 @@ def compile_durable_plan(pipeline: Pipeline) -> DurablePlan:
             if isinstance(entry, Branch):
                 branch_node, route_nodes, merge_node, index = _compile_branch(
                     entry,
+                    pipeline_name=pipeline.name,
+                    stage=stage,
                     entry_id=entry_id,
                     stage_index=stage_index,
-                    stage_name=stage.name,
                     entry_index=entry_index,
                     index=index,
+                    params=declaration_params,
                 )
                 nodes.append(branch_node)
                 nodes.extend(route_nodes)
@@ -250,7 +309,18 @@ def compile_durable_plan(pipeline: Pipeline) -> DurablePlan:
                     f"Stage '{stage.name}' entry {entry_index} is a "
                     f"{type(entry).__name__}; expected a Step or a Branch."
                 )
-            scope: InputScope = "all" if entry.input_scope == "all" else "partition"
+            descriptor = compile_descriptor(
+                entry.fn,
+                context=_declaration_context(
+                    entry,
+                    pipeline_name=pipeline.name,
+                    stage=stage,
+                    stage_index=stage_index,
+                    entry_index=entry_index,
+                    params=declaration_params,
+                ),
+            )
+            scope: InputScope = "all" if descriptor.kind == "all" else "partition"
             nodes.append(
                 DurableNode(
                     index=index,
@@ -260,6 +330,8 @@ def compile_durable_plan(pipeline: Pipeline) -> DurablePlan:
                     stage_name=stage.name,
                     entry_index=entry_index,
                     input_scope=scope,
+                    descriptor=descriptor,
+                    stage_retry=stage.retry,
                 )
             )
             index += 1
@@ -274,11 +346,11 @@ def compile_durable_plan(pipeline: Pipeline) -> DurablePlan:
 
 def declaration_fingerprint(plan: DurablePlan) -> str:
     """Return a stable fingerprint of the declaration's durable identity."""
-    parts = ["schema=1", f"pipeline={plan.pipeline_name}"]
+    parts = ["schema=2", f"pipeline={plan.pipeline_name}"]
     for node in plan.nodes:
         parts.append(
             f"{node.node_id}:{node.step.name}:{node.step.revision}:"
-            f"{node.input_scope}:{node.step.batch_size}:"
+            f"{node.descriptor.kind}:{node.input_scope}:{node.step.batch_size}:"
             f"{type(node.step.dataset).__name__}"
         )
     return "|".join(parts)

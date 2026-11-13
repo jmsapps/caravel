@@ -13,10 +13,11 @@ termination stays correct through replay.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from ..plugins.api import (
     NodeFacts,
@@ -27,7 +28,15 @@ from ..plugins.api import (
     RunOutcome,
     validate_plugins,
 )
-from ..retry import RetryBudget, RetryPolicy, retry
+from ..inputs import AggregateInput, PartitionInput
+from ..retry import (
+    DEFAULT_INVOCATION_RETRY_ALLOWANCE,
+    RetryBudgetExhaustedError,
+    RetryCancelledError,
+    RetryOptions,
+    _active_retry_control,
+    retry_operation,
+)
 from ..types import SOURCE_FIELD, Dataset, StepContext
 from .commits import BatchPublisher
 from .output import AttemptOutputStore, OutputReference
@@ -115,12 +124,23 @@ class ExecutionPolicy:
 
     workers: int = 1
     leases: LeasePolicy | None = None
+    max_retry_attempts: int = DEFAULT_INVOCATION_RETRY_ALLOWANCE
+    """The invocation-wide retry allowance shared by every explicitly enabled
+    retry boundary. Initial attempts never consume it; only retries do. It is
+    finite by default so nested policies cannot multiply attempts without
+    bound, and exhausting it is terminal for this invocation's retry chain."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.workers, int) or isinstance(self.workers, bool):
             raise TypeError("ExecutionPolicy.workers must be an integer.")
         if self.workers < 1:
             raise ValueError("ExecutionPolicy.workers must be at least 1.")
+        if not isinstance(self.max_retry_attempts, int) or isinstance(
+            self.max_retry_attempts, bool
+        ):
+            raise TypeError("ExecutionPolicy.max_retry_attempts must be an integer.")
+        if self.max_retry_attempts < 0:
+            raise ValueError("ExecutionPolicy.max_retry_attempts must not be negative.")
         if self.leases is not None and not isinstance(self.leases, LeasePolicy):
             raise TypeError("ExecutionPolicy.leases must be a LeasePolicy or None.")
         if self.workers > 1 and self.leases is None:
@@ -189,27 +209,6 @@ class CommittedPartitionView:
         return self.output_store.load(self.reference, dataset=self.dataset)
 
 
-class CommittedDatasetReader:
-    """A reader over committed partition references for an all-input step.
-
-    An all-input step receives this reader rather than an eagerly materialized
-    dataset, so whole-run work stays bounded in memory.
-    """
-
-    def __init__(self, views: Sequence[Any]) -> None:
-        self._views = tuple(views)
-
-    def partitions(self) -> Iterator[Any]:
-        return iter(self._views)
-
-    def __len__(self) -> int:
-        return len(self._views)
-
-    @property
-    def is_empty(self) -> bool:
-        return not self._views
-
-
 def _batch_id(index: int) -> str:
     return f"batch-{index:0{_BATCH_ID_WIDTH}d}"
 
@@ -233,6 +232,124 @@ class _Deadline:
             return True
         needed = float(self._budget.max_unit_seconds) + float(self._budget.shutdown_margin_seconds)
         return self.remaining > needed
+
+
+class _InvocationControls:
+    """The invocation-wide execution controls every managed retry inherits.
+
+    One instance exists per invocation. It owns the monotonic deadline, the
+    cancellation flag, and the shared retry allowance, so explicitly nested
+    retry policies cannot multiply attempts past the invocation's limits.
+    Mutable allowance accounting is synchronized, because a worker may run
+    callbacks on more than one thread. A separate process reconstructs its own
+    controls rather than sharing these.
+    """
+
+    def __init__(self, *, deadline: _Deadline, allowance: int, shutdown_margin: float) -> None:
+        self._deadline = deadline
+        self._shutdown_margin = float(shutdown_margin)
+        self._lock = threading.Lock()
+        self._remaining = allowance
+        self._cancelled = False
+        self.cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            self.cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    @property
+    def remaining_retries(self) -> int:
+        with self._lock:
+            return self._remaining
+
+    def charge(self, scope: str) -> None:
+        """Consume one shared retry attempt, or refuse the whole retry chain."""
+        with self._lock:
+            if self._remaining <= 0:
+                raise RetryBudgetExhaustedError(
+                    f"Scope '{scope}' cannot retry: this invocation's shared retry "
+                    "allowance is exhausted. Raise ExecutionPolicy.max_retry_attempts "
+                    "or reduce nested retry boundaries."
+                )
+            self._remaining -= 1
+
+    def check_live(self, scope: str) -> None:
+        if self.cancelled:
+            raise RetryCancelledError(f"Scope '{scope}' was cancelled.")
+        if self._deadline.remaining <= self._shutdown_margin:
+            raise RetryCancelledError(
+                f"Scope '{scope}' has no remaining invocation time; it stopped at a "
+                "durable boundary instead of extending past its deadline."
+            )
+
+    def fits(self, delay: float) -> bool:
+        return self._deadline.remaining > delay + self._shutdown_margin
+
+    def bind(
+        self,
+        *,
+        scope: str,
+        owner_id: str,
+        fence_token: int | None,
+        check_claim: Callable[[], None] | None = None,
+    ) -> _BoundRetryControl:
+        return _BoundRetryControl(
+            self, scope=scope, owner_id=owner_id, fence_token=fence_token, check_claim=check_claim
+        )
+
+
+class _BoundRetryControl:
+    """Invocation controls bound to one claimed callback's ownership facts.
+
+    The owner id and fence token are the ones acquired at claim time. They are
+    recorded, never re-read: a worker that has already been fenced out must not
+    be able to adopt the winner's authority by consulting the store again.
+    """
+
+    def __init__(
+        self,
+        controls: _InvocationControls,
+        *,
+        scope: str,
+        owner_id: str,
+        fence_token: int | None,
+        check_claim: Callable[[], None] | None = None,
+    ) -> None:
+        self._controls = controls
+        self._scope = scope
+        self.owner_id = owner_id
+        self.fence_token = fence_token
+        self._check_claim = check_claim
+
+    def _check_live(self) -> None:
+        self._controls.check_live(self._scope)
+        if self._check_claim is not None:
+            self._check_claim()
+
+    def before_attempt(self, attempt: int) -> None:
+        """Charge retries only; an initial attempt never consumes the allowance."""
+        self._check_live()
+        if attempt > 1:
+            self._controls.charge(self._scope)
+
+    def wait(self, seconds: float) -> None:
+        self._check_live()
+        if not self._controls.fits(seconds):
+            raise RetryCancelledError(
+                f"Scope '{self._scope}' has insufficient remaining time for another "
+                "attempt; it stopped at a durable boundary instead."
+            )
+        until = time.monotonic() + seconds
+        while (remaining := until - time.monotonic()) > 0:
+            self._controls.cancel_event.wait(min(remaining, 0.1))
+            self._check_live()
+        self._check_live()
 
 
 class DurableInvocation:
@@ -292,6 +409,12 @@ class DurableInvocation:
         self.invocation_id = uuid.uuid4().hex
         self.logger = logger if logger is not None else logging.getLogger("caravel.durable")
         self.publisher = BatchPublisher(store, output)
+        self.deadline = _Deadline(self.budget)
+        self.controls = _InvocationControls(
+            deadline=self.deadline,
+            allowance=self.policy.max_retry_attempts,
+            shutdown_margin=self.budget.shutdown_margin_seconds,
+        )
 
     # -- observers and guards ----------------------------------------------
 
@@ -364,14 +487,12 @@ class DurableInvocation:
             # first, its "all input" is the source itself: returning an empty
             # reader there would silently aggregate nothing.
             if previous is None:
-                return CommittedDatasetReader(self._source_views())
-            return CommittedDatasetReader(
-                [
-                    view
-                    for upstream in self._upstream_partitions(node)
-                    for view in self._views_for(previous, upstream)
-                ]
-            )
+                return self._source_views()
+            return [
+                view
+                for upstream in self._upstream_partitions(node)
+                for view in self._views_for(previous, upstream)
+            ]
 
         if previous is None:
             partition = self.store.load_partition(self.job_id, partition_id)
@@ -531,16 +652,51 @@ class DurableInvocation:
             return base
         return self.context_factory(base)
 
-    def _batches(self, node: DurableNode, payload: Any) -> list[tuple[str, Any]]:
-        """Split a unit's input into durable batches.
+    def _batches(
+        self, node: DurableNode, partition_id: str, resolved: Any
+    ) -> list[tuple[str, Any, int]]:
+        """Split a unit's input into durable batches of callback handles.
 
-        ``batch_size=None`` executes the selected scope as one durable unit.
-        A positive size requires input that can be read in bounded, replayable
-        pieces; anything else is rejected before the processor runs.
+        ``batch_size=None`` executes the selected scope as one durable unit. For
+        an ``each`` descriptor a positive size requires input that can be read
+        in bounded, replayable pieces; anything else is rejected before the
+        callback runs. For an ``all`` descriptor a positive size slices the
+        aggregate reader's partition *views*, never their loaded payloads, so
+        aggregating a large job stays bounded in memory.
         """
         size = node.step.batch_size
+
+        if node.input_scope == "all":
+            views: Sequence[Any] = resolved
+            if size is None:
+                batch_id = _batch_id(0)
+                return [
+                    (
+                        batch_id,
+                        AggregateInput(views, partition_id=partition_id, batch_id=batch_id),
+                        len(views),
+                    )
+                ]
+            slices = [views[start : start + size] for start in range(0, len(views), size)] or [()]
+            return [
+                (
+                    _batch_id(index),
+                    AggregateInput(part, partition_id=partition_id, batch_id=_batch_id(index)),
+                    len(part),
+                )
+                for index, part in enumerate(slices)
+            ]
+
+        payload = resolved
         if size is None:
-            return [(_batch_id(0), payload)]
+            batch_id = _batch_id(0)
+            return [
+                (
+                    batch_id,
+                    PartitionInput(partition_id=partition_id, batch_id=batch_id, payload=payload),
+                    len(payload) if isinstance(payload, list) else 1,
+                )
+            ]
         if isinstance(payload, (str, bytes)) or not isinstance(payload, Sequence):
             raise UnsupportedDurableDeclarationError(
                 f"Step '{node.step.name}' declares batch_size={size} but its input is "
@@ -548,10 +704,27 @@ class DurableInvocation:
                 "batch_size=None or supply a sequence source."
             )
         records = list(payload)
+        batched = [records[start : start + size] for start in range(0, len(records), size)] or [[]]
         return [
-            (_batch_id(start // size), records[start : start + size])
-            for start in range(0, len(records), size)
-        ] or [(_batch_id(0), [])]
+            (
+                _batch_id(index),
+                PartitionInput(partition_id=partition_id, batch_id=_batch_id(index), payload=part),
+                len(part),
+            )
+            for index, part in enumerate(batched)
+        ]
+
+    @staticmethod
+    def _with_retry(operation: Callable[[], Any], options: RetryOptions | None) -> Any:
+        """Run ``operation`` under ``options``, or once when retry is disabled.
+
+        Every supported boundary funnels through the one shared retry loop; no
+        boundary reimplements attempts, backoff, or classification.
+        """
+        if options is None:
+            return operation()
+        result, _ = retry_operation(operation=operation, retry=options)
+        return result
 
     def _execute_unit(self, unit: WorkUnitState, *, reclaim: bool = False) -> int:
         """Claim, execute, publish, and seal one partition-step pair.
@@ -577,68 +750,33 @@ class DurableInvocation:
 
         facts = self._node_facts(node, unit.key.partition_id)
         self._emit("node_started", node=facts)
-        payload = self._resolve_input(node, unit.key.partition_id)
+        resolved = self._resolve_input(node, unit.key.partition_id)
         context = self._materialize_context(self._step_context(node, unit.key.partition_id))
 
-        state = claimed
-        committed = 0
-        batches = self._batches(node, payload)
-        already = {record.batch_id for record in self.store.work_unit_batches(unit.key)}
-
         if node.kind == "branch":
-            committed = self._execute_branch(node, unit, lease, claimed, payload, context)
+            committed = self._execute_branch(node, unit, lease, claimed, resolved, context)
             self._publish(node, unit.key)
             self._emit("node_completed", node=facts)
             return committed
 
-        policy = node.step.retry if isinstance(node.step.retry, RetryPolicy) else None
-        budget = RetryBudget(
-            deadline_seconds=self.budget.seconds,
-            shutdown_margin_seconds=self.budget.shutdown_margin_seconds,
+        scope = f"{node.node_id}/{unit.key.partition_id}"
+        # Bind this callback's acquired ownership facts for the duration of the
+        # claim, so a retry_operation() written inside the callback inherits the
+        # deadline, cancellation, and shared allowance with no context argument.
+        token = _active_retry_control.set(
+            self.controls.bind(
+                scope=scope,
+                owner_id=self.worker_id,
+                fence_token=lease.fence_token,
+                check_claim=lambda: self.store.check_claim(
+                    unit.key, owner_id=self.worker_id, fence_token=claimed.fence_token
+                ),
+            )
         )
-
-        for batch_id, batch_payload in batches:
-            if batch_id in already:
-                continue
-
-            def attempt(
-                batch_id: str = batch_id,
-                batch_payload: Any = batch_payload,
-                observed: WorkUnitState = state,
-            ) -> Any:
-                # Authority is fixed at claim time. This worker presents the
-                # fence token it acquired and the generation it last observed
-                # from its own commits; it never re-reads either from the
-                # store. Refreshing them would let a worker that has already
-                # been fenced out adopt the winner's authority and commit.
-                #
-                # Idempotency does not need a re-read: publish() resolves an
-                # already-committed batch id from the manifest, so an attempt
-                # that published before failing is observed, not repeated.
-                produced = self._prepare_output(node.step.fn(batch_payload, context=context))
-                return self.publisher.publish(
-                    unit.key,
-                    owner_id=self.worker_id,
-                    fence_token=lease.fence_token,
-                    expected_generation=observed.generation,
-                    batch_id=batch_id,
-                    dataset=node.step.dataset,
-                    payload=produced,
-                    next_cursor=batch_id,
-                    record_count=(len(batch_payload) if isinstance(batch_payload, list) else 1),
-                )
-
-            if policy is None:
-                commit = attempt()
-            else:
-                commit = retry(
-                    attempt,
-                    policy=policy,
-                    scope=f"{node.node_id}/{unit.key.partition_id}/{batch_id}",
-                    budget=budget,
-                )
-            state = commit.state
-            committed += 1
+        try:
+            committed, state = self._run_batches(node, unit, lease, claimed, resolved, context)
+        finally:
+            _active_retry_control.reset(token)
 
         lease.observe(state)
         if not state.input_exhausted:
@@ -657,6 +795,69 @@ class DurableInvocation:
         self._publish(node, unit.key)
         self._emit("node_completed", node=facts)
         return committed
+
+    def _run_batches(
+        self,
+        node: DurableNode,
+        unit: WorkUnitState,
+        lease: LeaseHolder,
+        claimed: WorkUnitState,
+        resolved: Any,
+        context: Any,
+    ) -> tuple[int, WorkUnitState]:
+        """Run this unit's batches under its stage, step, and helper retries.
+
+        The three boundaries nest stage -> step -> helper, all strictly inside
+        the lease this worker already holds, so inner retries exhaust first and
+        no retry re-acquires authority or re-runs a declaration builder.
+        """
+        batches = self._batches(node, unit.key.partition_id, resolved)
+        descriptor = node.descriptor
+        progress: dict[str, Any] = {"committed": 0, "state": claimed}
+
+        def run_batch(batch_id: str, handle: Any, record_count: int) -> None:
+            def attempt() -> Any:
+                # Authority is fixed at claim time. This worker presents the
+                # fence token it acquired and the generation it last observed
+                # from its own commits; it never re-reads either from the
+                # store. Refreshing them would let a worker that has already
+                # been fenced out adopt the winner's authority and commit.
+                #
+                # Idempotency does not need a re-read: publish() resolves an
+                # already-committed batch id from the manifest, so an attempt
+                # that published before failing is observed, not repeated.
+                produced = self._prepare_output(descriptor.callback(handle, context=context))
+                observed: WorkUnitState = progress["state"]
+                return self.publisher.publish(
+                    unit.key,
+                    owner_id=self.worker_id,
+                    fence_token=lease.fence_token,
+                    expected_generation=observed.generation,
+                    batch_id=batch_id,
+                    dataset=node.step.dataset,
+                    payload=produced,
+                    next_cursor=batch_id,
+                    record_count=record_count,
+                )
+
+            commit = self._with_retry(attempt, descriptor.retry)
+            progress["state"] = commit.state
+            progress["committed"] = int(progress["committed"]) + 1
+
+        def run_all() -> None:
+            # Re-read on every entry: an outer retry must skip what an earlier
+            # pass already committed rather than republish it.
+            already = {record.batch_id for record in self.store.work_unit_batches(unit.key)}
+            for batch_id, handle, record_count in batches:
+                if batch_id in already:
+                    continue
+                run_batch(batch_id, handle, record_count)
+
+        self._with_retry(
+            lambda: self._with_retry(run_all, node.step.retry),
+            node.stage_retry,
+        )
+        return int(progress["committed"]), progress["state"]
 
     def _execute_branch(
         self,
@@ -847,6 +1048,22 @@ class DurableInvocation:
         completed.
         """
         entered: list[tuple[str, Any]] = []
+        # The invocation's execution controls are installed here, at entry, and
+        # reset unconditionally on the way out, so a failure or cancellation
+        # never leaks a deadline or a spent allowance into the next invocation.
+        self.deadline = _Deadline(self.budget)
+        self.controls = _InvocationControls(
+            deadline=self.deadline,
+            allowance=self.policy.max_retry_attempts,
+            shutdown_margin=self.budget.shutdown_margin_seconds,
+        )
+        token = _active_retry_control.set(
+            self.controls.bind(
+                scope=f"{self.job_id}/{self.invocation_id}",
+                owner_id=self.worker_id,
+                fence_token=None,
+            )
+        )
         try:
             for plugin_id, guard in self.plugin_set.guards:
                 guard.enter(self._run_facts())
@@ -857,6 +1074,8 @@ class DurableInvocation:
             self._emit("run_failed", error_type=type(error).__name__)
             self._exit_guards(entered, RunOutcome(status="failed", error_type=type(error).__name__))
             raise
+        finally:
+            _active_retry_control.reset(token)
         self._emit("run_completed")
         self._exit_guards(entered, RunOutcome(status=result.status))
         return result
@@ -893,7 +1112,7 @@ class DurableInvocation:
                 restart_safe=self.restart_safe,
             )
 
-        deadline = _Deadline(self.budget)
+        deadline = self.deadline
         committed = 0
         active_node_id: str | None = None
 
@@ -1020,7 +1239,6 @@ class DurableInvocation:
 
 
 __all__ = [
-    "CommittedDatasetReader",
     "CommittedPartitionView",
     "SourcePartitionView",
     "DurableExecutionError",

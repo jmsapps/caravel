@@ -65,12 +65,22 @@ sqlite_module._failpoint_hook = crash
 commits_module._failpoint_hook = crash
 
 
-def load(payload, *, context):
+def load_partition(partition, *, context):
+    payload = partition.load()
     return {{"loaded": payload}}
 
 
-def publish(payload, *, context):
+def load(inputs, *, context):
+    return inputs.each(load_partition)
+
+
+def publish_partition(partition, *, context):
+    payload = partition.load()
     return {{"published": payload}}
+
+
+def publish(inputs, *, context):
+    return inputs.each(publish_partition)
 
 
 pipeline = Pipeline(

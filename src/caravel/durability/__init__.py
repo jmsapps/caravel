@@ -15,7 +15,6 @@ from .feed import (
     RetentionExpiredError,
 )
 from .execution import (
-    CommittedDatasetReader,
     CommittedPartitionView,
     DurableExecutionError,
     DurableInvocation,
@@ -106,7 +105,6 @@ __all__ = [
     "BatchPublisher",
     "BatchFeed",
     "BatchRecord",
-    "CommittedDatasetReader",
     "ConcurrencyUnsupportedError",
     "CommittedPartitionView",
     "ChangeOperation",

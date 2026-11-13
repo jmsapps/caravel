@@ -8,14 +8,13 @@ from typing import Any, Iterator
 import pytest
 
 import caravel
-from caravel import JSONDataset, Pipeline, Stage, Step, TextDataset
+from caravel import AggregateInput, JSONDataset, Pipeline, Stage, Step, TextDataset
 from caravel.datasets import PartitionedJSONDataset
 from caravel.durability import (
     DurableStorage,
     AGGREGATE_PARTITION_ID,
     AttemptOutputStore,
     BatchPublisher,
-    CommittedDatasetReader,
     InMemorySource,
     SQLiteDurableStore,
     WorkUnitKey,
@@ -27,21 +26,35 @@ SUMMARIZE_NODE = "stage-002-entry-001"
 LOAD_NODE = "stage-001-entry-001"
 
 
-def load(payload: Any, *, context: Any) -> Any:
+def load_partition(partition, *, context: Any) -> Any:
+    payload: Any = partition.load()
     del context
     return {"value": payload}
 
 
-def summarize(dataset: Any, *, context: Any) -> Any:
-    """Read committed partition references without materializing the dataset."""
+def load(inputs, *, context):
+    """Declare this step's managed input."""
     del context
-    assert isinstance(dataset, CommittedDatasetReader)
+    return inputs.each(load_partition)
+
+
+def summarize_all(partitions, *, context: Any) -> Any:
+    """Read committed partition references without materializing the dataset."""
+    dataset = partitions
+    del context
+    assert isinstance(dataset, AggregateInput)
     total = 0
     seen = []
     for partition in dataset.partitions():
         seen.append(partition.partition_id)
         total += partition.load()["value"]
     return {"partitions": sorted(seen), "total": total}
+
+
+def summarize(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(summarize_all)
 
 
 @pytest.fixture()
@@ -67,7 +80,6 @@ def _barrier_pipeline(*, summary_dataset: Any = None, after: list[Step] | None =
                 Step(
                     fn=summarize,
                     output=summary_dataset or JSONDataset(name="summary"),
-                    input_scope="all",
                 )
             ],
         ),
@@ -127,10 +139,16 @@ def test_a_barrier_is_blocked_until_its_last_partition_seals(
     pipeline = _barrier_pipeline()
     source = InMemorySource({f"p{index}": index for index in range(6)})
 
-    def slow_load(payload: Any, *, context: Any) -> Any:
+    def slow_load_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         time.sleep(0.03)
         return {"value": payload}
+
+    def slow_load(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(slow_load_partition)
 
     pipeline.stages[0].entries[0] = Step(fn=slow_load, output=JSONDataset(name="load"))
 
@@ -194,11 +212,17 @@ def test_barrier_readiness_survives_a_store_reopen(tmp_path: Path) -> None:
 def test_a_failed_required_partition_keeps_the_barrier_closed(
     store: SQLiteDurableStore, output: AttemptOutputStore
 ) -> None:
-    def failing(payload: Any, *, context: Any) -> Any:
+    def failing_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         if payload == 2:
             raise RuntimeError("partition failed")
         return {"value": payload}
+
+    def failing(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(failing_partition)
 
     pipeline = _barrier_pipeline()
     pipeline.stages[0].entries[0] = Step(fn=failing, output=JSONDataset(name="load"))
@@ -219,12 +243,18 @@ def test_a_failed_unit_is_retried_by_a_later_invocation(
     """Caller-triggered invocation retry: re-invoking recovers failed work."""
     calls = {"n": 0}
 
-    def fail_once(payload: Any, *, context: Any) -> Any:
+    def fail_once_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("boom")
         return {"value": payload}
+
+    def fail_once(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(fail_once_partition)
 
     pipeline = _barrier_pipeline()
     pipeline.stages[0].entries[0] = Step(fn=fail_once, output=JSONDataset(name="load"))
@@ -247,9 +277,14 @@ def test_a_failed_unit_is_retried_by_a_later_invocation(
 def test_a_permanently_failing_step_never_completes_the_job(
     store: SQLiteDurableStore, output: AttemptOutputStore
 ) -> None:
-    def always_fails(payload: Any, *, context: Any) -> Any:
+    def always_fails_partition(partition, *, context: Any) -> Any:
         del context
         raise RuntimeError("permanent")
+
+    def always_fails(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(always_fails_partition)
 
     pipeline = _barrier_pipeline()
     pipeline.stages[0].entries[0] = Step(fn=always_fails, output=JSONDataset(name="load"))
@@ -308,9 +343,15 @@ def test_an_empty_input_without_a_barrier_completes_with_no_work(
 def test_aggregate_output_becomes_one_stable_partition_downstream(
     store: SQLiteDurableStore, output: AttemptOutputStore
 ) -> None:
-    def after_summary(payload: Any, *, context: Any) -> Any:
+    def after_summary_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         return {"final": payload["total"]}
+
+    def after_summary(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(after_summary_partition)
 
     pipeline = _barrier_pipeline(after=[Step(fn=after_summary, output=JSONDataset(name="final"))])
     result = _run(pipeline, store, output, InMemorySource({"p1": 5, "p2": 7}))
@@ -347,7 +388,8 @@ def test_the_aggregate_identity_is_stable_across_invocations(
 def test_a_barrier_works_with_every_dataset_type(
     store: SQLiteDurableStore, output: AttemptOutputStore, dataset: Any, expected: Any
 ) -> None:
-    def summarize_as(reader: Any, *, context: Any) -> Any:
+    def summarize_as_all(partitions, *, context: Any) -> Any:
+        reader = partitions
         del context
         views = list(reader.partitions())
         total = sum(view.load()["value"] for view in views)
@@ -358,13 +400,18 @@ def test_a_barrier_works_with_every_dataset_type(
             return {"all": {"total": total}}
         return {"partitions": names, "total": total}
 
+    def summarize_as(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.all(summarize_as_all)
+
     pipeline = Pipeline(
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(fn=load, output=JSONDataset(name="load"))]),
             Stage(
                 name="summary",
-                entries=[Step(fn=summarize_as, output=dataset, input_scope="all")],
+                entries=[Step(fn=summarize_as, output=dataset)],
             ),
         ],
     )
@@ -383,7 +430,8 @@ def test_a_barrier_reads_references_rather_than_a_materialized_dataset(
     """The reader exposes counts and identities without loading any payload."""
     inspected: dict[str, Any] = {}
 
-    def inspect(reader: Any, *, context: Any) -> Any:
+    def inspect_all(partitions, *, context: Any) -> Any:
+        reader = partitions
         del context
         views = list(reader.partitions())
         inspected["count"] = len(views)
@@ -391,13 +439,18 @@ def test_a_barrier_reads_references_rather_than_a_materialized_dataset(
         inspected["counts"] = [view.count for view in views]
         return {"seen": inspected["count"]}
 
+    def inspect(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.all(inspect_all)
+
     pipeline = Pipeline(
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(fn=load, output=JSONDataset(name="load"))]),
             Stage(
                 name="summary",
-                entries=[Step(fn=inspect, output=JSONDataset(name="summary"), input_scope="all")],
+                entries=[Step(fn=inspect, output=JSONDataset(name="summary"))],
             ),
         ],
     )
@@ -413,15 +466,27 @@ def test_only_an_explicit_all_scope_imposes_a_whole_run_barrier(
     """Two partition-scoped stages impose no whole-run wait."""
     order: list[str] = []
 
-    def first(payload: Any, *, context: Any) -> Any:
+    def first_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         order.append("first")
         return {"value": payload}
 
-    def second(payload: Any, *, context: Any) -> Any:
+    def first(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(first_partition)
+
+    def second_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         order.append("second")
         return payload
+
+    def second(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(second_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -434,10 +499,17 @@ def test_only_an_explicit_all_scope_imposes_a_whole_run_barrier(
     assert order == ["first", "second", "first", "second"]
 
 
-def count_partitions(dataset: Any, *, context: Any) -> Any:
+def count_partitions_all(partitions, *, context: Any) -> Any:
     """Count whatever the reader yields, source records or committed output."""
+    dataset = partitions
     del context
     return {"count": sum(1 for _ in dataset.partitions())}
+
+
+def count_partitions(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(count_partitions_all)
 
 
 def test_a_leading_all_input_step_reads_the_source_not_an_empty_reader(
@@ -457,7 +529,6 @@ def test_a_leading_all_input_step_reads_the_source_not_an_empty_reader(
                     Step(
                         fn=count_partitions,
                         output=JSONDataset(name="summary"),
-                        input_scope="all",
                     )
                 ],
             )
@@ -485,7 +556,6 @@ def test_a_leading_barrier_over_an_empty_source_still_reports_zero(
                     Step(
                         fn=count_partitions,
                         output=JSONDataset(name="summary"),
-                        input_scope="all",
                     )
                 ],
             )

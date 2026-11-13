@@ -18,16 +18,23 @@ from caravel.durability import (
     SQLiteDurableStore,
     WorkUnitKey,
 )
-from caravel.retry import RetryPolicy
+from caravel.retry import RetryOptions
 
 PIPELINE_ID = "customer-42/documents"
 JOB = "snapshot-2026-11-12-v7"
 NODE = "stage-001-entry-001"
 
 
-def publish(payload: Any, *, context: Any) -> Any:
+def publish_partition(partition, *, context: Any) -> Any:
+    payload: Any = partition.load()
     del context
     return {"published": payload}
+
+
+def publish(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(publish_partition)
 
 
 @pytest.fixture()
@@ -375,7 +382,8 @@ def test_a_step_retry_preserves_already_committed_batches(
 ) -> None:
     attempts = {"n": 0}
 
-    def flaky(records: Any, *, context: Any) -> Any:
+    def flaky_partition(partition, *, context: Any) -> Any:
+        records: Any = partition.load()
         del context
         attempts["n"] += 1
         # Fail once while processing the third batch.
@@ -383,7 +391,12 @@ def test_a_step_retry_preserves_already_committed_batches(
             raise ConnectionError("vendor down")
         return [value * 10 for value in records]
 
-    policy = RetryPolicy(jitter=lambda low, high: 0.0, sleep=lambda seconds: None)
+    def flaky(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(flaky_partition)
+
+    policy = RetryOptions(delay_seconds=lambda attempt: 0.0)
     pipeline = Pipeline(
         name="documents",
         stages=[
@@ -425,11 +438,16 @@ def test_a_step_retry_preserves_already_committed_batches(
 def test_retry_exhaustion_leaves_the_batch_cursor_uncommitted(
     store: SQLiteDurableStore, output: AttemptOutputStore
 ) -> None:
-    def always_fails(records: Any, *, context: Any) -> Any:
+    def always_fails_partition(partition, *, context: Any) -> Any:
         del context
         raise ConnectionError("vendor down")
 
-    policy = RetryPolicy(max_retries=2, jitter=lambda low, high: 0.0, sleep=lambda seconds: None)
+    def always_fails(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(always_fails_partition)
+
+    policy = RetryOptions(max_attempts=3, delay_seconds=lambda attempt: 0.0)
     pipeline = Pipeline(
         name="documents",
         stages=[
@@ -467,10 +485,15 @@ def test_a_step_without_a_policy_acquires_no_retries(
 ) -> None:
     attempts = {"n": 0}
 
-    def flaky(payload: Any, *, context: Any) -> Any:
+    def flaky_partition(partition, *, context: Any) -> Any:
         del context
         attempts["n"] += 1
         raise ConnectionError("vendor down")
+
+    def flaky(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(flaky_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -490,5 +513,5 @@ def test_a_step_without_a_policy_acquires_no_retries(
 
 
 def test_step_retry_must_be_a_retry_policy() -> None:
-    with pytest.raises(TypeError, match="RetryPolicy"):
+    with pytest.raises(TypeError, match="RetryOptions"):
         Step(fn=publish, output=JSONDataset(name="x"), retry="aggressive")

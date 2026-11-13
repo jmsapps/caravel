@@ -18,8 +18,15 @@ class _BadLoader:
     name = "bad_loader"
 
 
-def _plain_step(payload: dict[str, str], *, _context: object) -> dict[str, str]:
+def _plain_step_partition(partition, *, _context: object) -> dict[str, str]:
+    payload: dict[str, str] = partition.load()
     return payload
+
+
+def _plain_step(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(_plain_step_partition)
 
 
 def test_step_defaults_name_from_function_name() -> None:
@@ -36,8 +43,14 @@ def test_step_rejects_non_callable_fn() -> None:
 def test_step_keeps_the_processor_callable_unwrapped() -> None:
     dataset = JSONDataset(name="declared_output")
 
-    def fn(payload: dict[str, str], *, _context: object) -> dict[str, str]:
+    def fn_partition(partition, *, _context: object) -> dict[str, str]:
+        payload: dict[str, str] = partition.load()
         return payload
+
+    def fn(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(fn_partition)
 
     declared = Step(fn, output=dataset)
 

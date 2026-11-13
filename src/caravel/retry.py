@@ -1,12 +1,21 @@
-"""One retry policy and one execution mechanism, reusable at any boundary.
+"""One retry configuration class and one retry loop, reusable at any boundary.
 
-The same :class:`RetryPolicy` type and semantics apply whether a policy is
-attached declaratively to a step or invoked through the :func:`retry` callable
-around a batch, a record, or a single operation. Developers learn one contract.
+:class:`RetryOptions` is the only retry configuration surface. The same instance
+is accepted as ``retry=`` by ``Stage``, ``Step``, ``inputs.each``,
+``inputs.all``, and :func:`retry_operation`, and every one of them runs the same
+loop. There are no dictionaries, keyword bundles, decorators, or
+wrapper-specific retry APIs.
 
-A retry repeats the scope it is attached to. Nested boundaries acquire no policy
-automatically: attaching one is always explicit, because nested attempts
-multiply.
+Retry is always explicit. A boundary with ``retry=None`` does not retry, and an
+enabled boundary does not implicitly enable its nested boundaries, because
+nested attempts multiply. ``RetryOptions()`` selects the documented defaults.
+
+Inside managed execution a private control is installed in a ``ContextVar``, so
+a :func:`retry_operation` call written inside a callback inherits the
+invocation's deadline, cancellation state, ownership facts, and shared retry
+allowance without the caller passing a context argument. Outside the runner the
+same function runs with ordinary sleeping and its own local limits, and claims
+no durable recovery.
 
 Retries do not provide exactly-once effects. Every retried scope must be
 replay-safe: a timeout can occur after an external write already succeeded.
@@ -14,16 +23,18 @@ replay-safe: a timeout can occur after an external write already succeeded.
 
 from __future__ import annotations
 
+import math
 import random
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, TypeVar
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any, Callable, Protocol, TypeVar
 
 T = TypeVar("T")
 
-DEFAULT_MAX_RETRIES = 3
-MAX_BACKOFF_SECONDS = 30.0
-BASE_BACKOFF_SECONDS = 1.0
+DEFAULT_MAX_ATTEMPTS = 4
+MAX_RETRY_DELAY_SECONDS = 16
+DEFAULT_INVOCATION_RETRY_ALLOWANCE = 100
 
 
 class RetryError(Exception):
@@ -31,41 +42,22 @@ class RetryError(Exception):
 
 
 class RetryPolicyError(RetryError):
-    """Raised when a user-supplied predicate itself fails.
+    """Raised when a user-supplied predicate or delay function itself fails.
 
     A predicate failure is a policy error, never a retryable failure.
     """
 
 
+class RetryResultExhaustedError(RetryError):
+    """The final returned result was rejected by the result predicate."""
+
+
 class RetryBudgetExhaustedError(RetryError):
-    """Raised when a shared retry budget has no attempts left."""
+    """Raised when the invocation's shared retry allowance has nothing left."""
 
 
-class RetryCancelled(RetryError):
+class RetryCancelledError(RetryError):
     """Raised when a retry is abandoned because its deadline or cancellation hit."""
-
-
-@dataclass(frozen=True)
-class FailureContext:
-    """Structured facts about one failed attempt, supplied to predicates."""
-
-    exception: BaseException | None
-    attempt: int
-    scope: str
-    elapsed_seconds: float
-    result: Any = None
-    from_result: bool = False
-    """True when a result classifier flagged a returned value rather than an
-    exception being raised."""
-
-    @property
-    def error_code(self) -> str | None:
-        """An explicit error code when the exception exposes one."""
-        for attribute in ("code", "status", "status_code"):
-            value = getattr(self.exception, attribute, None)
-            if isinstance(value, (str, int)) and not isinstance(value, bool):
-                return str(value)
-        return None
 
 
 # Transient by default: connection failures, timeouts, and temporary service
@@ -93,216 +85,174 @@ _PERMANENT_TYPES: tuple[type[BaseException], ...] = (
 _RATE_LIMIT_CODES = frozenset({"429", "503", "502", "504"})
 
 
-def default_classifier(failure: FailureContext) -> bool:
+def _error_code(error: BaseException) -> str | None:
+    """An explicit error code when the exception exposes one."""
+    for attribute in ("code", "status", "status_code"):
+        value = getattr(error, attribute, None)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            return str(value)
+    return None
+
+
+def _default_should_retry_error(error: BaseException) -> bool:
     """Classify recognized transient failures, excluding permanent ones.
 
     Excluded by design: invalid input, authentication and authorization
     failures, programming errors, cancellation, and process termination.
     """
-    if failure.from_result:
-        # The caller explicitly opted into result classification, so a flagged
-        # result is retryable unless a custom condition says otherwise.
-        return True
-    error = failure.exception
-    if error is None:
-        return False
     if isinstance(error, _PERMANENT_TYPES):
         return False
     if isinstance(error, _TRANSIENT_TYPES):
         return True
-    return failure.error_code in _RATE_LIMIT_CODES
+    return _error_code(error) in _RATE_LIMIT_CODES
 
 
-@dataclass
-class RetryBudget:
-    """A retry allowance shared across nested boundaries.
+def _default_should_retry_result(result: Any) -> bool:
+    """Accept any returned value; result-based retry is opt-in."""
+    del result
+    return False
 
-    Exhausting the budget prevents an enclosing policy from restarting the
-    exhausted work.
-    """
 
-    remaining: int | None = None
-    deadline_seconds: float | None = None
-    shutdown_margin_seconds: float = 0.0
-    _started: float = field(default_factory=time.monotonic, repr=False)
-
-    def __post_init__(self) -> None:
-        if self.remaining is not None:
-            if not isinstance(self.remaining, int) or isinstance(self.remaining, bool):
-                raise TypeError("RetryBudget.remaining must be an integer or None.")
-            if self.remaining < 0:
-                raise ValueError("RetryBudget.remaining must not be negative.")
-
-    @property
-    def remaining_seconds(self) -> float:
-        if self.deadline_seconds is None:
-            return float("inf")
-        return self.deadline_seconds - (time.monotonic() - self._started)
-
-    def fits(self, delay: float) -> bool:
-        """Whether another attempt can start after waiting ``delay``."""
-        return self.remaining_seconds > delay + self.shutdown_margin_seconds
-
-    def take(self) -> None:
-        """Consume one shared retry attempt."""
-        if self.remaining is None:
-            return
-        if self.remaining <= 0:
-            raise RetryBudgetExhaustedError(
-                "The shared retry budget is exhausted; no further attempts may start."
-            )
-        self.remaining -= 1
+def compute_retry_delay(attempt: int) -> float:
+    """Capped exponential delay plus up to one second of jitter."""
+    if type(attempt) is not int or attempt < 1:
+        raise ValueError("attempt must be a positive integer.")
+    # Cap the exponent too, avoiding huge integers for large attempt counts.
+    exponential = min(2 ** min(attempt - 1, 4), MAX_RETRY_DELAY_SECONDS)
+    return float(exponential) + random.uniform(0, 1)
 
 
 @dataclass(frozen=True)
-class RetryPolicy:
-    """One retry contract, usable at any selected boundary.
+class RetryOptions:
+    """One typed retry contract, usable at every supported boundary.
 
-    ``when`` replaces or extends the default classifier. ``on_result`` is off by
-    default, so a successful return is accepted unless a caller explicitly opts
-    in for an API that returns failures instead of raising.
+    ``should_retry_error`` receives the raised exception. ``should_retry_result``
+    receives the returned value and defaults to accepting it, so a successful
+    return is accepted unless a caller explicitly opts in for an API that
+    reports failure by returning rather than raising. ``max_attempts`` counts
+    the initial call, so ``max_attempts=1`` permits that call without retry.
+    ``delay_seconds`` receives the completed attempt number and returns the
+    wait before the next one.
     """
 
-    max_retries: int = DEFAULT_MAX_RETRIES
-    when: Callable[[FailureContext], bool] = default_classifier
-    on_result: Callable[[Any], bool] | None = None
-    max_elapsed_seconds: float | None = None
-    base_seconds: float = BASE_BACKOFF_SECONDS
-    max_backoff_seconds: float = MAX_BACKOFF_SECONDS
-    jitter: Callable[[float, float], float] = random.uniform
-    sleep: Callable[[float], None] = time.sleep
-    monotonic: Callable[[], float] = time.monotonic
+    should_retry_error: Callable[[BaseException], bool] = _default_should_retry_error
+    should_retry_result: Callable[[Any], bool] = _default_should_retry_result
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    delay_seconds: Callable[[int], float] = compute_retry_delay
 
     def __post_init__(self) -> None:
-        if not isinstance(self.max_retries, int) or isinstance(self.max_retries, bool):
-            raise TypeError("RetryPolicy.max_retries must be an integer.")
-        if self.max_retries < 0:
-            raise ValueError("RetryPolicy.max_retries must not be negative.")
-        if not callable(self.when):
-            raise TypeError("RetryPolicy.when must be callable.")
-        if self.on_result is not None and not callable(self.on_result):
-            raise TypeError("RetryPolicy.on_result must be callable or None.")
-        for name in ("base_seconds", "max_backoff_seconds"):
-            value = getattr(self, name)
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"RetryPolicy.{name} must be a non-negative number.")
-
-    @property
-    def max_attempts(self) -> int:
-        """Total attempts allowed, including the initial one."""
-        return self.max_retries + 1
-
-    def backoff_seconds(self, retry_number: int) -> float:
-        """Full-jitter exponential backoff before retry ``retry_number`` (from 1).
-
-        Sampled uniformly between zero and ``min(max_backoff, base * 2^(n-1))``.
-        """
-        if retry_number < 1:
-            raise ValueError("retry_number starts at 1.")
-        ceiling = min(self.max_backoff_seconds, self.base_seconds * (2 ** (retry_number - 1)))
-        return self.jitter(0.0, ceiling)
-
-    def should_retry(self, failure: FailureContext) -> bool:
-        """Apply this policy's condition, surfacing predicate errors as policy errors."""
-        try:
-            return bool(self.when(failure))
-        except Exception as error:
-            raise RetryPolicyError(
-                f"Retry predicate for scope '{failure.scope}' raised "
-                f"{type(error).__name__}; predicate failures are policy errors."
-            ) from error
+        if not isinstance(self.max_attempts, int) or isinstance(self.max_attempts, bool):
+            raise TypeError(
+                f"RetryOptions.max_attempts must be an integer, got "
+                f"{type(self.max_attempts).__name__}."
+            )
+        if self.max_attempts < 1:
+            raise ValueError(
+                "RetryOptions.max_attempts counts the initial call and must be at least 1."
+            )
+        for name in ("should_retry_error", "should_retry_result", "delay_seconds"):
+            if not callable(getattr(self, name)):
+                raise TypeError(
+                    f"RetryOptions.{name} must be callable, got "
+                    f"{type(getattr(self, name)).__name__}."
+                )
 
 
-def retry(
-    operation: Callable[[], T],
+class _RetryControl(Protocol):
+    """The private hook managed execution installs around user callbacks."""
+
+    def before_attempt(self, attempt: int) -> None:
+        """Check deadline/cancellation/ownership and charge shared retries."""
+        ...
+
+    def wait(self, seconds: float) -> None:
+        """Wait within the active budget, or raise before it expires."""
+        ...
+
+
+_active_retry_control: ContextVar[_RetryControl | None] = ContextVar(
+    "caravel_retry_control", default=None
+)
+
+
+def retry_operation(
     *,
-    policy: RetryPolicy | None = None,
-    scope: str = "operation",
-    budget: RetryBudget | None = None,
-) -> T:
-    """Execute ``operation`` under ``policy``, repeating only that scope.
+    operation: Callable[[], T],
+    retry: RetryOptions | None = None,
+) -> tuple[T, int]:
+    """Run a callable until accepted; return its result and total attempts.
 
-    Cancellation and remaining time are checked before waiting and before each
-    new attempt. An attempt starts only when the delay plus the shutdown margin
-    fits the remaining budget.
+    Only ``operation`` repeats. Surrounding work in the enclosing callback is
+    repeated only when an explicitly enabled outer boundary later restarts it.
+    Inside managed execution the invocation's deadline, cancellation, and shared
+    retry allowance apply automatically; outside it, ordinary sleeping and these
+    local limits apply and nothing durable is claimed.
     """
-    active = policy if policy is not None else RetryPolicy()
-    started = active.monotonic()
-    attempt = 0
+    if retry is not None and not isinstance(retry, RetryOptions):
+        raise TypeError(
+            f"retry_operation.retry must be a RetryOptions or None, got {type(retry).__name__}."
+        )
+    if not callable(operation):
+        raise TypeError(f"operation must be callable, got {type(operation).__name__}.")
+    options = retry if retry is not None else RetryOptions()
+    control = _active_retry_control.get()
 
-    while True:
-        attempt += 1
-        failure: FailureContext | None = None
+    for attempt in range(1, options.max_attempts + 1):
+        if control is not None:
+            control.before_attempt(attempt)
+
         try:
             result = operation()
         except RetryError:
+            # Budget exhaustion, cancellation, and policy failures propagate
+            # through outer retries rather than being reclassified by users.
             raise
-        except BaseException as error:  # noqa: BLE001 - classification decides
-            failure = FailureContext(
-                exception=error,
-                attempt=attempt,
-                scope=scope,
-                elapsed_seconds=active.monotonic() - started,
-            )
-        else:
-            if active.on_result is None:
-                return result
+        except Exception as error:
             try:
-                failed = bool(active.on_result(result))
-            except Exception as error:
-                raise RetryPolicyError(
-                    f"Retry result classifier for scope '{scope}' raised "
-                    f"{type(error).__name__}; predicate failures are policy errors."
-                ) from error
-            if not failed:
-                return result
-            failure = FailureContext(
-                exception=None,
-                attempt=attempt,
-                scope=scope,
-                elapsed_seconds=active.monotonic() - started,
-                result=result,
-                from_result=True,
-            )
+                should_retry = options.should_retry_error(error)
+            except Exception as predicate_error:
+                raise RetryPolicyError("Error predicate failed.") from predicate_error
+            if not should_retry or attempt == options.max_attempts:
+                raise
+        else:
+            try:
+                should_retry = options.should_retry_result(result)
+            except Exception as predicate_error:
+                raise RetryPolicyError("Result predicate failed.") from predicate_error
+            if not should_retry:
+                return result, attempt
+            if attempt == options.max_attempts:
+                raise RetryResultExhaustedError(f"Result rejected after {attempt} attempts.")
 
-        if attempt >= active.max_attempts or not active.should_retry(failure):
-            _surface(failure)
+        try:
+            delay = options.delay_seconds(attempt)
+        except Exception as delay_error:
+            raise RetryPolicyError("Retry delay calculation failed.") from delay_error
+        if (
+            isinstance(delay, bool)
+            or not isinstance(delay, (int, float))
+            or not math.isfinite(delay)
+            or delay < 0
+        ):
+            raise RetryPolicyError("Retry delay must be finite and nonnegative.")
+        if control is None:
+            time.sleep(delay)
+        else:
+            control.wait(delay)
 
-        elapsed = active.monotonic() - started
-        if active.max_elapsed_seconds is not None and elapsed >= active.max_elapsed_seconds:
-            _surface(failure)
-
-        delay = active.backoff_seconds(attempt)
-        if budget is not None:
-            if not budget.fits(delay):
-                raise RetryCancelled(
-                    f"Scope '{scope}' has insufficient remaining time for another "
-                    "attempt; it stopped at a durable boundary instead."
-                )
-            budget.take()
-        active.sleep(delay)
-
-
-def _surface(failure: FailureContext) -> Any:
-    """Raise the final failure, preserving its attempt context."""
-    if failure.exception is not None:
-        raise failure.exception
-    raise RetryError(
-        f"Scope '{failure.scope}' returned a failure result after {failure.attempt} attempts."
-    )
+    raise AssertionError("Retry operation completed without a result.")
 
 
 __all__ = [
-    "BASE_BACKOFF_SECONDS",
-    "DEFAULT_MAX_RETRIES",
-    "MAX_BACKOFF_SECONDS",
-    "FailureContext",
-    "RetryBudget",
+    "DEFAULT_INVOCATION_RETRY_ALLOWANCE",
+    "DEFAULT_MAX_ATTEMPTS",
+    "MAX_RETRY_DELAY_SECONDS",
     "RetryBudgetExhaustedError",
-    "RetryCancelled",
+    "RetryCancelledError",
     "RetryError",
-    "RetryPolicy",
+    "RetryOptions",
     "RetryPolicyError",
-    "default_classifier",
-    "retry",
+    "RetryResultExhaustedError",
+    "compute_retry_delay",
+    "retry_operation",
 ]

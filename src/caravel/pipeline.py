@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 from .branch import Branch
 from .datasets import JSONDataset
-from .retry import RetryPolicy
+from .retry import RetryOptions
 from .types import Dataset, Loader, StepFn
 
 
@@ -38,23 +38,27 @@ class Step:
     ``output`` defaults to a JSON dataset named for the processor, so
     ``Step(load)`` is a complete declaration.
 
-    ``input_scope``, ``batch_size``, ``revision``, and ``retry`` configure the
-    one durable execution model. Their defaults give whole-partition recovery
-    with no retries, which is the simplest useful behavior.
+    ``fn`` is a declaration builder: it receives an ``Inputs`` builder and
+    returns exactly one descriptor from ``inputs.each(...)`` or
+    ``inputs.all(...)``. That descriptor, not a field on this class, decides
+    whether the step runs per partition or as the aggregate barrier.
 
-    ``retry`` attaches a policy at the step boundary only. Nested boundaries
-    acquire no policy automatically; use the ``retry`` utility explicitly inside
-    a processor to retry a batch, record, or single operation.
+    ``batch_size``, ``revision``, and ``retry`` configure the one durable
+    execution model. Their defaults give whole-partition recovery with no
+    retries, which is the simplest useful behavior.
+
+    ``retry`` attaches options at the step boundary only. Nested boundaries
+    acquire none automatically; pass ``retry=`` to ``inputs.each``/``inputs.all``
+    or call ``retry_operation()`` inside a callback to retry a smaller scope.
     """
 
     fn: StepFn
     output: Dataset | None = None
     persist: bool = True
     name: str | None = None
-    input_scope: str = "partition"
     batch_size: int | None = None
     revision: str = "1"
-    retry: Any = None
+    retry: RetryOptions | None = None
 
     def __post_init__(self) -> None:
         if not callable(self.fn):
@@ -84,11 +88,6 @@ class Step:
         if not isinstance(self.name, str):
             raise TypeError(f"Step.name must be str, got {type(self.name).__name__}.")
 
-        if self.input_scope not in ("partition", "all"):
-            raise ValueError(
-                f"Step.input_scope must be 'partition' or 'all', got {self.input_scope!r}."
-            )
-
         if self.batch_size is not None:
             if not isinstance(self.batch_size, int) or isinstance(self.batch_size, bool):
                 raise TypeError(
@@ -103,9 +102,9 @@ class Step:
         if not isinstance(self.revision, str) or not self.revision:
             raise ValueError("Step.revision must be a non-empty string.")
 
-        if self.retry is not None and not isinstance(self.retry, RetryPolicy):
+        if self.retry is not None and not isinstance(self.retry, RetryOptions):
             raise TypeError(
-                f"Step.retry must be a RetryPolicy or None, got {type(self.retry).__name__}."
+                f"Step.retry must be a RetryOptions or None, got {type(self.retry).__name__}."
             )
 
         self.output = _with_default_dataset_name(self.output, step_name=self.name)
@@ -120,14 +119,26 @@ class Step:
 
 @dataclass
 class Stage:
-    """Ordered stage declaration containing normalized step and/or branch entries."""
+    """Ordered stage declaration containing normalized step and/or branch entries.
+
+    ``retry`` is the outermost in-unit retry boundary: it applies to each work
+    unit declared in this stage, wrapping that unit's batch loop inside the
+    lease it already holds. It is not a stage-wide replay, because stages are
+    declaration groups with no completion barrier to restart.
+    """
 
     name: str
     entries: list[Step | Branch | Callable[..., Any]]
     stage_root: Path | str | None = None
     clean_dirs: bool = False
+    retry: RetryOptions | None = None
 
     def __post_init__(self) -> None:
+        if self.retry is not None and not isinstance(self.retry, RetryOptions):
+            raise TypeError(
+                f"Stage.retry must be a RetryOptions or None, got {type(self.retry).__name__}."
+            )
+
         if self.stage_root is not None:
             if isinstance(self.stage_root, Path):
                 pass

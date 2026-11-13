@@ -28,9 +28,15 @@ class _StubLoader:
 
 
 def _canary_pipeline(name: str = "canary_pipeline") -> Pipeline:
-    def emit(record: dict[str, object], *, context: object) -> dict[str, dict[str, object]]:
+    def emit_partition(partition, *, context: object) -> dict[str, dict[str, object]]:
+        record: dict[str, object] = partition.load()
         _ = context
         return {"canary": {**record, "secret": PAYLOAD_CANARY}}
+
+    def emit(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(emit_partition)
 
     return Pipeline(
         name=name,

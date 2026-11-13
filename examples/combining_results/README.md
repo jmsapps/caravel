@@ -1,7 +1,7 @@
 # Combining results
 
 This example transforms partitions independently, then combines every committed
-result into one summary using `input_scope="all"`. It demonstrates aggregation,
+result into one summary using `inputs.all(...)`. It demonstrates aggregation,
 not branch routing.
 
 ```bash
@@ -13,7 +13,7 @@ python -m examples.combining_results --job-id combining-demo
 flowchart LR
     A[alpha input] --> B[transform alpha]
     C[beta input] --> D[transform beta]
-    B --> E[combine_results: input_scope=all]
+    B --> E[combine_results: inputs.all]
     D --> E
     E --> F[One summary]
 ```

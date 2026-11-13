@@ -34,8 +34,9 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx:end_idx]
 
 
-def bronze_render_html(record: dict[str, Any], *, context: object) -> dict[str, str]:
+def bronze_render_html_partition(partition, *, context: object) -> dict[str, str]:
     """Render one source record into a deterministic HTML partition."""
+    record: dict[str, Any] = partition.load()
     _ = context
     item_id = str(record["id"])
     return {
@@ -48,10 +49,15 @@ def bronze_render_html(record: dict[str, Any], *, context: object) -> dict[str, 
     }
 
 
-def silver_extract_structured(
-    payload: dict[str, str], *, context: object
-) -> dict[str, dict[str, Any]]:
+def bronze_render_html(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(bronze_render_html_partition)
+
+
+def silver_extract_structured_partition(partition, *, context: object) -> dict[str, dict[str, Any]]:
     """Convert one partition's bronze HTML back into a structured record."""
+    payload: dict[str, str] = partition.load()
     _ = context
     structured: dict[str, dict[str, Any]] = {}
     for key in sorted(payload):
@@ -68,8 +74,14 @@ def silver_extract_structured(
     return structured
 
 
-def gold_partition_by_language(
-    payload: dict[str, dict[str, Any]], *, context: object
+def silver_extract_structured(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(silver_extract_structured_partition)
+
+
+def gold_partition_by_language_partition(
+    partition, *, context: object
 ) -> dict[str, dict[str, Any]]:
     """Emit path-style keys (`<lang>/<id>`) to prove nested storage keys.
 
@@ -77,6 +89,7 @@ def gold_partition_by_language(
     different namespace from execution partition identity, which the engine
     keeps stable across steps.
     """
+    payload: dict[str, dict[str, Any]] = partition.load()
     _ = context
     repartitioned: dict[str, dict[str, Any]] = {}
     for key in sorted(payload):
@@ -91,6 +104,12 @@ def gold_partition_by_language(
             "origin_partition": key,
         }
     return repartitioned
+
+
+def gold_partition_by_language(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(gold_partition_by_language_partition)
 
 
 def build_partitioned_pipeline(input_dir: Path | str | None = None) -> Pipeline:

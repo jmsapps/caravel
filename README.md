@@ -67,29 +67,40 @@ python3 -m mypy src/caravel
 
 ## Core Declaration Pattern
 
-A pipeline is a name and ordered stages. Steps are plain functions: each one
-receives **one execution partition's payload** and returns that partition's
-output.
+A pipeline is a name and ordered stages. A step's function is a **declaration
+builder**: it receives an `Inputs` builder and returns exactly one descriptor
+from `inputs.each(...)` or `inputs.all(...)`. That descriptor decides whether
+the step runs once per partition or once as an aggregate barrier. The callback
+you declare is what actually runs, and only the durable engine ever calls it.
 
 ```python
 from caravel import DurableStorage, InMemorySource, Pipeline, Stage, Step, run
 
-def load(document, *, context):
-    return {**document, "loaded": True}
+def load_document(partition, *, context):
+    return {**partition.load(), "loaded": True}
 
-def enrich(document, *, context):
-    return {**document, "enriched": True}
+def load(inputs, *, context):
+    return inputs.each(load_document)
 
-def summarize(dataset, *, context):
-    # An all-input step receives a reader over committed partitions,
+def enrich_document(partition, *, context):
+    return {**partition.load(), "enriched": True}
+
+def enrich(inputs, *, context):
+    return inputs.each(enrich_document)
+
+def summarize_documents(partitions, *, context):
+    # An all-input callback receives a reader over committed partitions,
     # never an eagerly materialized dataset.
-    return {"documents": sum(1 for _ in dataset.partitions())}
+    return {"documents": sum(1 for _ in partitions.partitions())}
+
+def summarize(inputs, *, context):
+    return inputs.all(summarize_documents)
 
 pipeline = Pipeline(
     name="documents",
     stages=[
         Stage(name="prepare", entries=[Step(load), Step(enrich)]),
-        Stage(name="summary", entries=[Step(summarize, input_scope="all")]),
+        Stage(name="summary", entries=[Step(summarize)]),
     ],
 )
 
@@ -108,8 +119,15 @@ processor. No loader stub and no dataset are required.
 
 There is one engine, reached through `run()`. There is no `durable=True` and no
 second entry point: batching, retries, storage, and concurrency all configure
-the same model. A step always receives one partition unless it declares
-`input_scope="all"`.
+the same model. A step runs once per partition unless its builder declares
+`inputs.all(...)`.
+
+Builders run at compilation, before source discovery and before any durable
+mutation. They must be deterministic and free of I/O: a builder is re-run on
+every resume, and its side effects are not replayed durably. Attempting to read
+data through the `Inputs` object raises `ManagedInputError`, as does declaring
+more than one helper, registering helpers in a loop, or returning a descriptor
+built by another declaration.
 
 ### Storage is an explicit decision
 
@@ -332,11 +350,11 @@ externally-dependent predicate cannot re-route a record after a crash.
 
 The merge is partition-scoped: each partition merges as soon as its own route
 seals. That is the right fit for per-partition routing, but it does **not**
-subsume a whole-dataset merge — for that, add an `input_scope="all"` step after
+subsume a whole-dataset merge — for that, add an `inputs.all(...)` step after
 the merge.
 
 A route step transforms one partition's payload and must preserve that
-partition's identity. Repartitioning belongs in an explicit `input_scope="all"`
+partition's identity. Repartitioning belongs in an explicit `inputs.all(...)`
 step outside the branch.
 
 ## Breaking Changes From The Single-Pass Runner
@@ -348,7 +366,7 @@ step outside the branch.
 | `Stage(stage_root=...)` | One `artifacts_root` on `DurableStorage.at`. |
 | `Stage(clean_dirs=True)` | Rejected: cleanup could delete committed output. |
 | `@step(...)` decorator | `Step(...)` is the only step configuration surface. Move the decorator's arguments into the `Step(...)` that lists the processor in a stage or branch route: `@step(output=d)` above `def load` becomes `Step(load, output=d)`. A bare callable still works wherever it wants every documented `Step` default. |
-| `Step(persist=False)` | Rejected: recovery restores committed output. Use cheap steps plus one `input_scope="all"` step. |
+| `Step(persist=False)` | Rejected: recovery restores committed output. Use cheap steps plus one `inputs.all(...)` step. |
 | `keep_source_tag` | **Still supported**, with its original default: the tag is stripped before commit unless you pass `keep_source_tag=True`. |
 | Stage-directory output layout | `storage.results(pipeline, job_id=...)` |
 | Checkpoint / ownership / lease plugins | Owned by the authoritative store. |
@@ -366,42 +384,79 @@ step outside the branch.
 
 ## Retries
 
-One `RetryPolicy` type and one `retry` utility cover every boundary: a step, a
-batch, a record, or a single operation. Nested boundaries acquire **no** policy
+One `RetryOptions` type and one `retry_operation` utility cover every boundary:
+a stage, a step, a managed helper, or a single operation. The same instance is
+accepted as `retry=` at all four, and nested boundaries acquire **no** options
 automatically, because nested attempts multiply.
 
 ```python
-from caravel import RetryPolicy, Step, retry
+from caravel import RetryOptions, Stage, Step, retry_operation
 
-default_retry = RetryPolicy()      # 3 retries, full-jitter exponential backoff
+default_retry = RetryOptions()      # 4 total attempts, capped exponential backoff
 
-def retryable(failure):
-    error = failure.exception
-    return default_retry.should_retry(failure) or (
+def retryable(error):
+    return default_retry.should_retry_error(error) or (
         isinstance(error, VendorError) and error.code == "TEMPORARILY_BUSY"
     )
 
-vendor_retry = RetryPolicy(when=retryable)
+vendor_retry = RetryOptions(should_retry_error=retryable)
 
-# Retry the whole step scope...
-Step(fn=enrich_batch, output=dataset, batch_size=100, retry=vendor_retry)
+# The same instance at every supported boundary.
+Stage(name="prepare", retry=vendor_retry, entries=[
+    Step(fn=enrich, output=dataset, batch_size=100, retry=vendor_retry),
+])
 
-# ...or just one operation inside the processor.
-def enrich_batch(records, context):
-    return [retry(lambda: enrich(record), policy=vendor_retry) for record in records]
+def enrich(inputs, *, context):
+    return inputs.each(enrich_batch, retry=vendor_retry)
+
+# ...or just one operation inside the callback. Only that call repeats.
+def enrich_batch(partition, *, context):
+    results = []
+    for record in partition.load():
+        value, attempts = retry_operation(
+            operation=lambda record=record: call_vendor(record), retry=vendor_retry
+        )
+        results.append(value)
+    return results
 ```
+
+Inside a callback, `retry_operation` inherits the invocation's deadline,
+cancellation state, ownership, and shared retry allowance automatically — there
+is no context argument to wire up. Outside the runner the same function works
+with its own local limits and claims no durable recovery.
 
 | Setting | Default |
 | --- | --- |
-| Condition | Recognized transient failures: connection failures, timeouts, rate limits, temporary service failures. |
-| Max retries | 3, so at most 4 attempts at the selected boundary. `0` disables retries. |
-| Backoff | Uniform sample between zero and `min(30s, 1s * 2^(n-1))`. |
-| Result classification | Off. A successful return is accepted unless you pass `on_result`. |
+| `should_retry_error` | Recognized transient failures: connection failures, timeouts, rate limits, temporary service failures. |
+| `should_retry_result` | Off. A successful return is accepted unless you pass a predicate. |
+| `max_attempts` | 4, counting the initial call. `1` permits the initial call without retry; `retry=None` disables the boundary. |
+| `delay_seconds` | `compute_retry_delay`: `min(2^(n-1), 16)` seconds plus up to one second of jitter, so at most 17s. |
+
+Every boundary also shares one invocation-wide allowance,
+`ExecutionPolicy(max_retry_attempts=...)`, finite at 100 by default. Initial
+attempts never consume it; only retries do, so explicitly nested policies cannot
+multiply attempts without bound. Exhausting it is terminal for that invocation's
+retry chain.
 
 Invalid input, authentication failures, programming errors, and cancellation are
 never retried, and arbitrary exception text is never classified as transient.
-Retry scope and durable recovery scope are independent: record retries run in
-memory within a batch, while the batch stays the durable commit boundary.
+`KeyboardInterrupt`, `SystemExit`, and other `BaseException` control signals
+propagate without retry.
+
+### Migrating from `RetryPolicy`
+
+This is a breaking replacement with no aliases or compatibility dispatch. Old
+API usage fails explicitly, and a job whose declaration fingerprint predates the
+descriptor model fails before any mutation; start a new `job_id`.
+
+| Removed | Replacement |
+| --- | --- |
+| `Step(input_scope="all")` | `inputs.all(callback)` returned by the step's builder |
+| processor receiving a payload | builder receiving `Inputs`, callback receiving `PartitionInput`/`AggregateInput` |
+| `RetryPolicy(max_retries=n, when=...)` | `RetryOptions(max_attempts=n + 1, should_retry_error=...)` |
+| `RetryPolicy(on_result=...)` | `RetryOptions(should_retry_result=...)` |
+| `retry(op, policy=p)` | `retry_operation(operation=op, retry=p)`, returning `(result, attempts)` |
+| `FailureContext`, `default_classifier`, `RetryBudget` | Internal. Predicates take a bare exception or result; the shared allowance is `ExecutionPolicy(max_retry_attempts=...)`. |
 
 ## Consuming committed batches
 
@@ -435,7 +490,7 @@ A runnable end-to-end example lives in [examples/durable_partitions](examples/du
 
 Start with [minimal](examples/minimal/README.md) for independent per-partition
 steps. See [combining_results](examples/combining_results/README.md) for combining
-partition outputs into one summary with `input_scope="all"`.
+partition outputs into one summary with `inputs.all(...)`.
 
 ## Concurrent workers
 

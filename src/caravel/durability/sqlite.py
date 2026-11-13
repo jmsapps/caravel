@@ -805,6 +805,16 @@ class SQLiteDurableStore:
                 f"{expiry}; writer '{owner_id}' is fenced."
             )
 
+    def check_claim(self, key: WorkUnitKey, *, owner_id: str, fence_token: int) -> None:
+        """Validate acquired authority before another callback attempt.
+
+        This read does not adopt newer authority or replace transactional checks
+        at commit. A takeover after this read is still rejected during commit.
+        """
+        with self._read() as connection:
+            row = self._require_work_unit(connection, key)
+            self._check_claim(row, owner_id=owner_id, fence_token=fence_token, key=key)
+
     @staticmethod
     def _check_generation(row: sqlite3.Row, expected: int, *, subject: str) -> int:
         current = _integer(row, "generation")

@@ -67,10 +67,11 @@ def make_branching_loader(
     )
 
 
-def bronze_normalize_json_source(
-    record: dict[str, Any], *, context: object
+def bronze_normalize_json_source_partition(
+    partition, *, context: object
 ) -> dict[str, dict[str, Any]]:
     """Normalize one JSON-sourced record. Runs only for partitions routed here."""
+    record: dict[str, Any] = partition.load()
     _ = context
     payload = record.get("content", record)
     item_id = str(payload["id"])
@@ -85,10 +86,17 @@ def bronze_normalize_json_source(
     }
 
 
-def bronze_normalize_html_source(
-    record: dict[str, Any], *, context: object
+def bronze_normalize_json_source(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(bronze_normalize_json_source_partition)
+
+
+def bronze_normalize_html_source_partition(
+    partition, *, context: object
 ) -> dict[str, dict[str, Any]]:
     """Normalize one HTML-sourced record. Runs only for partitions routed here."""
+    record: dict[str, Any] = partition.load()
     _ = context
     html = record.get("content", record)
     if not isinstance(html, str):
@@ -105,10 +113,15 @@ def bronze_normalize_html_source(
     }
 
 
-def silver_unify_records(
-    payload: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
+def bronze_normalize_html_source(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(bronze_normalize_html_source_partition)
+
+
+def silver_unify_records_partition(partition, *, context: object) -> dict[str, dict[str, Any]]:
     """Unify one partition's normalized record."""
+    payload: dict[str, dict[str, Any]] = partition.load()
     _ = context
     unified: dict[str, dict[str, Any]] = {}
     for key in sorted(payload):
@@ -121,10 +134,15 @@ def silver_unify_records(
     return unified
 
 
-def bronze_converged_records(
-    payload: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
+def silver_unify_records(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(silver_unify_records_partition)
+
+
+def bronze_converged_records_partition(partition, *, context: object) -> dict[str, dict[str, Any]]:
     """Pass one converged partition through."""
+    payload: dict[str, dict[str, Any]] = partition.load()
     _ = context
     unified: dict[str, dict[str, Any]] = {}
     for key in sorted(payload):
@@ -137,10 +155,17 @@ def bronze_converged_records(
     return unified
 
 
-def gold_partition_by_language(
-    payload: dict[str, dict[str, Any]], *, context: object
+def bronze_converged_records(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(bronze_converged_records_partition)
+
+
+def gold_partition_by_language_partition(
+    partition, *, context: object
 ) -> dict[str, dict[str, Any]]:
     """Key one partition's record by language."""
+    payload: dict[str, dict[str, Any]] = partition.load()
     _ = context
     unified: dict[str, dict[str, Any]] = {}
     for key in sorted(payload):
@@ -151,6 +176,12 @@ def gold_partition_by_language(
             else key
         ] = {**record, "unified": True}
     return unified
+
+
+def gold_partition_by_language(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(gold_partition_by_language_partition)
 
 
 def build_branching_pipeline(

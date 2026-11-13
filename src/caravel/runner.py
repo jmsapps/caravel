@@ -75,7 +75,7 @@ def run(
     resolved_source = as_source(source if source is not None else pipeline.source)
 
     invocation = DurableInvocation(
-        plan=compile_durable_plan(pipeline),
+        plan=compile_durable_plan(pipeline, params=params),
         store=storage.progress,
         output=storage.output,
         source=resolved_source,

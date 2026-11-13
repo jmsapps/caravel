@@ -26,14 +26,28 @@ JOB = "snapshot-2026-11-12-v7"
 LOAD_NODE = "stage-001-entry-001"
 
 
-def load(payload: Any, *, context: Any) -> Any:
+def load_partition(partition, *, context: Any) -> Any:
+    payload: Any = partition.load()
     del context
     return {"loaded": payload}
 
 
-def summarize(reader: Any, *, context: Any) -> Any:
+def load(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.each(load_partition)
+
+
+def summarize_all(partitions, *, context: Any) -> Any:
+    reader = partitions
     del context
     return {"count": len(list(reader.partitions()))}
+
+
+def summarize(inputs, *, context):
+    """Declare this step's managed input."""
+    del context
+    return inputs.all(summarize_all)
 
 
 @pytest.fixture()
@@ -56,7 +70,7 @@ def _pipeline(*, with_barrier: bool = False) -> Pipeline:
         stages.append(
             Stage(
                 name="summary",
-                entries=[Step(fn=summarize, output=JSONDataset(name="summary"), input_scope="all")],
+                entries=[Step(fn=summarize, output=JSONDataset(name="summary"))],
             )
         )
     return Pipeline(name="documents", stages=stages)
@@ -96,10 +110,16 @@ def test_a_moved_snapshot_pin_is_rejected_before_any_processing(
 ) -> None:
     calls: list[str] = []
 
-    def counted(payload: Any, *, context: Any) -> Any:
+    def counted_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         calls.append("called")
         return payload
+
+    def counted(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(counted_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -159,12 +179,18 @@ def test_a_partition_removed_from_the_pinned_snapshot_is_rejected(
 def test_a_snapshot_job_resumes_without_reprocessing(tmp_path: Path) -> None:
     calls: list[str] = []
 
-    def counted(payload: Any, *, context: Any) -> Any:
+    def counted_partition(partition, *, context: Any) -> Any:
+        payload: Any = partition.load()
         del context
         calls.append(str(payload))
         if len(calls) == 1:
             raise RuntimeError("stop after first")
         return {"loaded": payload}
+
+    def counted(inputs, *, context):
+        """Declare this step's managed input."""
+        del context
+        return inputs.each(counted_partition)
 
     pipeline = Pipeline(
         name="documents",
