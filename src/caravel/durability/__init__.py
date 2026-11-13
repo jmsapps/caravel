@@ -33,6 +33,12 @@ from .leases import (
     LeasePolicy,
     validate_concurrency,
 )
+from .identity import (
+    LogicalIdentityError,
+    LogicalOutputMap,
+    logical_output_id,
+    resolved_output_name,
+)
 from .scheduler import (
     DurableNode,
     DurablePlan,
@@ -106,6 +112,8 @@ __all__ = [
     "BatchFeed",
     "BatchRecord",
     "ConcurrencyUnsupportedError",
+    "LogicalIdentityError",
+    "LogicalOutputMap",
     "CommittedPartitionView",
     "ChangeOperation",
     "CommitUncertainError",
@@ -146,7 +154,9 @@ __all__ = [
     "DurableStorage",
     "LegacyStateError",
     "OutputPublisher",
+    "logical_output_id",
     "read_job_manifest",
+    "resolved_output_name",
     "validate_job_manifest",
     "JobResults",
     "SQLiteDurableStore",

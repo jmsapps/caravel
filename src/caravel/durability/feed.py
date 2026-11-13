@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..types import Dataset
+from .identity import logical_output_id
 from .output import AttemptOutputStore, OutputReference
 from .sqlite import SQLiteDurableStore
 from .types import DurabilityError, validate_counter, validate_identifier
@@ -36,12 +37,19 @@ class RetentionExpiredError(DurabilityError):
 
 @dataclass(frozen=True)
 class FeedEntry:
-    """One committed batch, as seen by a consumer."""
+    """One committed batch, as seen by a consumer.
+
+    ``logical_id`` is how a consumer addresses this output: a source
+    partition's own identity, or an all-input step's declared dataset name.
+    ``partition_id`` is the execution identity underneath it, kept for
+    diagnostics and for correlating with recovery state.
+    """
 
     position: int
     job_id: str
     node_id: str
     partition_id: str
+    logical_id: str
     batch_id: str
     reference: OutputReference
     record_count: int
@@ -89,12 +97,21 @@ class BatchFeed:
         job_id: str,
         node_id: str,
         output: AttemptOutputStore | None = None,
+        node: Any = None,
     ) -> None:
+        """``node`` is the declaration whose output this feed carries.
+
+        It is what resolves an entry's logical identity.
+        :meth:`caravel.durability.JobResults.feed` always supplies it. Without
+        it the feed reports execution identity, which is all an unnamed node
+        has; that is the low-level reading, not the supported addressing.
+        """
         self._store = store
         self.pipeline_id = validate_identifier("pipeline_id", pipeline_id)
         self.job_id = validate_identifier("job_id", job_id)
         self.node_id = validate_identifier("node_id", node_id)
         self._output = output
+        self._node = node
 
     # -- retention ---------------------------------------------------------
 
@@ -115,6 +132,11 @@ class BatchFeed:
                 "explicitly rather than silently skipped."
             )
 
+    def _logical_id(self, partition_id: str) -> str:
+        if self._node is None:
+            return partition_id
+        return logical_output_id(self._node, partition_id)
+
     # -- reading -----------------------------------------------------------
 
     def read(self, *, after_position: int = 0, limit: int = DEFAULT_PAGE_SIZE) -> FeedPage:
@@ -134,6 +156,7 @@ class BatchFeed:
                     job_id=record.key.job_id,
                     node_id=record.key.node_id,
                     partition_id=record.key.partition_id,
+                    logical_id=self._logical_id(record.key.partition_id),
                     batch_id=record.batch_id,
                     reference=OutputReference.from_json(record.output_ref),
                     record_count=record.record_count,

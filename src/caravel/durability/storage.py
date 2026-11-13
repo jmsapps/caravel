@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 from ..types import Dataset
 from .commits import BatchPublisher
 from .feed import BatchFeed
+from .identity import LogicalOutputMap
 from .output import AttemptOutputStore
 from .sqlite import SQLiteDurableStore
 from .types import WorkUnitKey, validate_identifier
@@ -163,25 +164,39 @@ class JobResults:
         )
 
     def of(self, step: str, *, dataset: Dataset | None = None) -> dict[str, Any]:
-        """Return committed output for a step, keyed by execution partition.
+        """Return committed output for a step, keyed by logical output identity.
 
-        A partition that committed one batch yields that payload directly; a
-        batched partition yields the tuple of its committed batches in order.
+        A source partition is keyed by its own identity. An all-input step's
+        output is keyed by its declared dataset name, which defaults to the
+        step name: ``inputs.all(...)`` chooses input readiness, not an output
+        name, so the private aggregate execution ID never appears here.
+
+        A unit that committed one batch yields that payload directly; a batched
+        unit yields the tuple of its committed batches in order. A partitioned
+        payload keeps the mapping the callback returned, inside its one logical
+        result.
         """
         node = self._node_for(step)
         declared = dataset if dataset is not None else node.step.dataset
         publisher = BatchPublisher(self._storage.progress, self._storage.output)
+        partition_ids = self._storage.progress.work_unit_partitions(self.job_id, node.node_id)
+        logical = LogicalOutputMap.for_node(node, partition_ids)
         collected: dict[str, Any] = {}
-        for partition_id in self._storage.progress.work_unit_partitions(self.job_id, node.node_id):
+        for partition_id in partition_ids:
             key = WorkUnitKey(self.job_id, node.node_id, partition_id)
             payloads = publisher.load_work_unit(key, dataset=declared)
             if not payloads:
                 continue
-            collected[partition_id] = payloads[0] if len(payloads) == 1 else payloads
+            collected[logical.to_logical[partition_id]] = (
+                payloads[0] if len(payloads) == 1 else payloads
+            )
         return collected
 
     def published(self, step: str, *, pipeline_id: str | None = None) -> dict[str, list[str]]:
-        """Where a step's current output is published, keyed by partition.
+        """Where a step's current output is published, keyed by logical identity.
+
+        The keys match :meth:`of`, so one addressing scheme reaches both the
+        payload and its files.
 
         Published locations are generation-specific, so this is the supported
         way to find the current files: never infer them from a directory
@@ -191,21 +206,27 @@ class JobResults:
         projection = self._storage.publisher(pipeline_id or self._plan.pipeline_name)
         if projection is None:
             return {}
+        partition_ids = self._storage.progress.work_unit_partitions(self.job_id, node.node_id)
+        logical = LogicalOutputMap.for_node(node, partition_ids)
         located: dict[str, list[str]] = {}
-        for partition_id in self._storage.progress.work_unit_partitions(self.job_id, node.node_id):
+        for partition_id in partition_ids:
             key = WorkUnitKey(self.job_id, node.node_id, partition_id)
             unit = self._storage.progress.load_work_unit(key)
             if unit is None or unit.status != "sealed":
                 continue
             job_dir = projection.layout(self.job_id).job_dir()
-            located[partition_id] = [
+            located[logical.to_logical[partition_id]] = [
                 f"{job_dir}/{item.relative}"
                 for item in projection.planned_files(node, key, unit.output_generation)
             ]
         return located
 
     def feed(self, step: str, *, pipeline_id: str | None = None) -> BatchFeed:
-        """Return the committed batch feed for a step's output node."""
+        """Return the committed batch feed for a step's output node.
+
+        The declaration travels with the feed, so entries address output by
+        logical identity rather than by execution partition.
+        """
         node = self._node_for(step)
         return BatchFeed(
             self._storage.progress,
@@ -213,6 +234,7 @@ class JobResults:
             job_id=self.job_id,
             node_id=node.node_id,
             output=self._storage.output,
+            node=node,
         )
 
 

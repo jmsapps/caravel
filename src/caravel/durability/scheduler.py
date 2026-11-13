@@ -7,7 +7,9 @@ is still in an earlier stage. There is no stage-wide completion check.
 A step whose builder declared ``inputs.all(...)`` is a barrier: it becomes one
 work unit on the reserved aggregate partition, with one dependency edge per
 upstream partition. Its output is one stable partition for every subsequent
-step. Declaration builders are compiled here, before any source discovery or
+step. That reserved partition is private scheduling state: the public name of
+what the barrier produced comes from its declaration, through
+:mod:`caravel.durability.identity`. Declaration builders are compiled here, before any source discovery or
 durable mutation, so an invalid declaration fails having touched no state.
 """
 
@@ -27,6 +29,7 @@ from ..inputs import (
 from ..pipeline import Pipeline, Stage, Step
 from ..plan import LogicalPlan, _normalize_route_step, compile_pipeline
 from ..retry import RetryOptions
+from .identity import LogicalIdentityError, resolved_output_name, validate_output_name
 from .sources import AGGREGATE_PARTITION_ID, SourcePartition
 from .sqlite import SQLiteDurableStore
 from .types import (
@@ -341,7 +344,26 @@ def compile_durable_plan(
             f"Pipeline '{pipeline.name}' declares no steps to execute."
         )
 
+    _validate_output_names(nodes)
     return DurablePlan(pipeline_name=pipeline.name, nodes=tuple(nodes), logical=logical)
+
+
+def _validate_output_names(nodes: Sequence[DurableNode]) -> None:
+    """Reject output names that cannot address published output.
+
+    A barrier's output, and everything downstream of it, is addressed by the
+    declared dataset name rather than by the reserved aggregate execution ID.
+    That name becomes a public identity, so it is validated here -- during
+    compilation, before source discovery and before any durable mutation.
+    """
+    for node in nodes:
+        try:
+            validate_output_name(
+                resolved_output_name(node),
+                what=f"Output name for step '{node.step.name or node.node_id}'",
+            )
+        except LogicalIdentityError as error:
+            raise UnsupportedDurableDeclarationError(str(error)) from error
 
 
 def declaration_fingerprint(plan: DurablePlan) -> str:
@@ -351,7 +373,9 @@ def declaration_fingerprint(plan: DurablePlan) -> str:
         parts.append(
             f"{node.node_id}:{node.step.name}:{node.step.revision}:"
             f"{node.descriptor.kind}:{node.input_scope}:{node.step.batch_size}:"
-            f"{type(node.step.dataset).__name__}"
+            f"{type(node.step.dataset).__name__}:"
+            f"{node.stage_name!r}:{resolved_output_name(node)!r}:"
+            f"{getattr(node.step.dataset, 'suffix', None)!r}"
         )
     return "|".join(parts)
 

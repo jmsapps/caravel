@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-DURABLE_SCHEMA_VERSION = 1
+DURABLE_SCHEMA_VERSION = 2
 
 MAX_IDENTIFIER_LENGTH = 512
 MAX_OPAQUE_LENGTH = 65536

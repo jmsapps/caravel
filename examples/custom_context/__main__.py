@@ -6,7 +6,7 @@ from .pipeline import run_custom_context_pipeline
 
 
 def main() -> int:
-    run_custom_context_pipeline(run_root=Path("data/output/custom_context"))
+    run_custom_context_pipeline(state_root=Path("data/custom_context_example"))
     return 0
 
 

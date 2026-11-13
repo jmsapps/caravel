@@ -63,9 +63,12 @@ _WAL_FIXED_RANGES = (
 )
 
 _SCHEMA_STATEMENTS = (
+    # logical_id is the public identity this publication was written under. It
+    # is recorded, never inferred from a path, so a consumer can resolve a
+    # manifest entry without the declaration and without parsing filenames.
     "CREATE TABLE IF NOT EXISTS publication_files ("
     "job_id TEXT NOT NULL, node_id TEXT NOT NULL, partition_id TEXT NOT NULL, "
-    "output_generation INTEGER NOT NULL, files TEXT NOT NULL, "
+    "output_generation INTEGER NOT NULL, files TEXT NOT NULL, logical_id TEXT NOT NULL, "
     "PRIMARY KEY(job_id, node_id, partition_id, output_generation))",
     "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS jobs ("
@@ -408,7 +411,11 @@ class SQLiteDurableStore:
                     raise UnsupportedStoreVersionError(
                         f"Durable store schema version '{stored}' is not supported; "
                         f"supported version is {DURABLE_SCHEMA_VERSION}. Incompatible "
-                        "stored state is never reinterpreted under a new contract."
+                        "stored state is never reinterpreted under a new contract, "
+                        "and the published tree it describes is never mixed with a "
+                        "new one. Start a new job against a fresh recovery directory "
+                        "and output root, or keep this state on the version that "
+                        "wrote it, rebuild its output there, and migrate the results."
                     )
             for statement in _SCHEMA_STATEMENTS:
                 connection.execute(statement)
@@ -1542,7 +1549,12 @@ class SQLiteDurableStore:
             return _work_unit_from_row(self._require_work_unit(connection, key))
 
     def mark_published(
-        self, key: WorkUnitKey, *, generation: int, files: Sequence[str] | None = None
+        self,
+        key: WorkUnitKey,
+        *,
+        generation: int,
+        files: Sequence[str] | None = None,
+        logical_id: str | None = None,
     ) -> bool:
         """Compare-and-set the materialized generation for a unit.
 
@@ -1552,6 +1564,10 @@ class SQLiteDurableStore:
         publisher that paused across a recomputation loses the race and learns
         about it from the return value: ``False`` means a newer generation
         exists and this publisher's physical writes are stale.
+
+        ``logical_id`` is the public identity those files were written under.
+        It is stored alongside them so manifest validation resolves an entry
+        from authoritative state alone.
         """
         validate_counter("generation", generation)
         with self._transaction() as connection:
@@ -1563,13 +1579,14 @@ class SQLiteDurableStore:
             )
             if cursor.rowcount and files is not None:
                 connection.execute(
-                    "INSERT OR REPLACE INTO publication_files VALUES (?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO publication_files VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         key.job_id,
                         key.node_id,
                         key.partition_id,
                         generation,
                         json.dumps(sorted(files)),
+                        key.partition_id if logical_id is None else logical_id,
                     ),
                 )
             return bool(cursor.rowcount)
@@ -1587,14 +1604,15 @@ class SQLiteDurableStore:
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
             if job_row is None:
-                return {"job": None, "sealed": {}}
+                return {"job": None, "sealed": {}, "files": {}, "logical": {}}
             rows = connection.execute(
                 "SELECT node_id, partition_id, output_generation FROM work_units "
                 "WHERE job_id = ? AND status = 'sealed'",
                 (job_id,),
             ).fetchall()
             file_rows = connection.execute(
-                "SELECT p.node_id, p.partition_id, p.files FROM publication_files p "
+                "SELECT p.node_id, p.partition_id, p.files, p.logical_id "
+                "FROM publication_files p "
                 "JOIN work_units w ON w.job_id = p.job_id AND w.node_id = p.node_id "
                 "AND w.partition_id = p.partition_id "
                 "AND w.output_generation = p.output_generation "
@@ -1612,6 +1630,10 @@ class SQLiteDurableStore:
             },
             "files": {
                 (_text(row, "node_id"), _text(row, "partition_id")): json.loads(_text(row, "files"))
+                for row in file_rows
+            },
+            "logical": {
+                (_text(row, "node_id"), _text(row, "partition_id")): _text(row, "logical_id")
                 for row in file_rows
             },
         }

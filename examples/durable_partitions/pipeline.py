@@ -2,7 +2,9 @@
 
 The job processes documents one partition at a time, commits each partition's
 output durably, and summarizes the whole run behind an explicit all-input
-barrier. An invocation budget forces the work across several invocations, and a
+barrier. The barrier is one work unit on a reserved aggregate partition, but
+that identity is private: its output publishes under the declared dataset name
+``summary``. An invocation budget forces the work across several invocations, and a
 consumer reads committed batches from its own durable position while production
 is still ongoing.
 
@@ -16,9 +18,9 @@ keeps reserved execution storage in ``.caravel`` beside it:
         state.sqlite3
         attempts/...                       immutable, uuid-named
       output/examples/durable-partitions/snapshot-v1/
-        001-prepare/001-enrich/doc-001.json
-        002-publish/001-publish/doc-001.json
-        003-summary/001-summarize/__all__.json
+        001-prepare/001-enrich/doc-001/doc-001.json
+        002-publish/001-publish/doc-001/doc-001.json
+        003-summary/001-summarize/summary/summary.json
         _job.json                          advisory completion snapshot
 
 Nothing here is domain specific: the "documents" are plain dictionaries.
@@ -34,14 +36,12 @@ import caravel
 from caravel import JSONDataset, Pipeline, Stage, Step
 from caravel.durability import (
     DurableStorage,
-    BatchFeed,
     ExecutionBudget,
     InMemorySource,
 )
 from caravel import RetryOptions
 
 PIPELINE_ID = "examples/durable-partitions"
-PUBLISH_NODE = "stage-002-entry-001"
 
 DOCUMENTS = {
     f"doc-{index:03d}": {"id": f"doc-{index:03d}", "words": index * 3} for index in range(1, 9)
@@ -132,19 +132,14 @@ def run_to_completion(root: Path, *, job_id: str = "snapshot-v1") -> dict[str, A
     """Invoke the job repeatedly until it completes, as a scheduler would."""
     storage = DurableStorage.at(Path(root) / "output")
     store = storage.progress
-    output = storage.output
     pipeline = build_pipeline()
 
     consumed: list[str] = []
     invocations = 0
     try:
-        feed = BatchFeed(
-            store,
-            pipeline_id=PIPELINE_ID,
-            job_id=job_id,
-            node_id=PUBLISH_NODE,
-            output=output,
-        )
+        # Reading the feed through the declaration is what makes entries
+        # address output logically rather than by execution identity.
+        feed = storage.results(pipeline, job_id=job_id).feed("publish", pipeline_id=PIPELINE_ID)
         while True:
             invocations += 1
             result = caravel.run(
@@ -161,7 +156,7 @@ def run_to_completion(root: Path, *, job_id: str = "snapshot-v1") -> dict[str, A
             # producer finishes, from its own durable position.
             page = feed.read_for("indexer")
             for entry in page.entries:
-                consumed.append(entry.partition_id)
+                consumed.append(entry.logical_id)
             if page.entries:
                 feed.acknowledge("indexer", page.next_position)
 

@@ -233,7 +233,7 @@ def test_an_invalid_delay_is_a_policy_error() -> None:
         with pytest.raises(RetryPolicyError, match="finite and nonnegative"):
             retry_operation(
                 operation=_counting(1, ConnectionError("down")),
-                retry=RetryOptions(delay_seconds=lambda attempt, value=bad: value),
+                retry=RetryOptions(delay_seconds=lambda attempt, value=bad: value),  # type: ignore
             )
 
 

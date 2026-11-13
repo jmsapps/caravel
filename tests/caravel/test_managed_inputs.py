@@ -425,11 +425,17 @@ def test_all_declares_the_aggregate_barrier(storage: Any) -> None:
     result = run(two_stage_pipeline(), job_id="all-1", source=source(), storage=storage)
     assert result.status == "completed"
 
-    summary = storage.results(two_stage_pipeline(), job_id="all-1").of("summarize")[
-        AGGREGATE_PARTITION_ID
-    ]
+    # The barrier's output is addressed by its declared name, never by the
+    # private aggregate execution ID.
+    results = storage.results(two_stage_pipeline(), job_id="all-1")
+    assert list(results.of("summarize")) == ["summarize"]
+    summary = results.of("summarize")["summarize"]
     assert summary["count"] == 2
     assert summary["ids"] == ["a", "b"]
+    # The reserved identity stays where it belongs: recovery state.
+    assert storage.progress.work_unit_partitions("all-1", "stage-002-entry-001") == (
+        AGGREGATE_PARTITION_ID,
+    )
 
 
 def test_all_callback_runs_once_after_every_upstream_commit(storage: Any) -> None:
@@ -565,9 +571,7 @@ def test_retry_operation_inside_an_all_callback(storage: Any) -> None:
     )
     run(pipeline, job_id="retry-2", source=source(), storage=storage)
 
-    assert storage.results(pipeline, job_id="retry-2").of("agg")[AGGREGATE_PARTITION_ID] == {
-        "total": 3
-    }
+    assert storage.results(pipeline, job_id="retry-2").of("agg")["agg"] == {"total": 3}
 
 
 def test_helper_retry_repeats_only_the_failed_partition(storage: Any) -> None:

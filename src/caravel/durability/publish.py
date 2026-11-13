@@ -57,11 +57,12 @@ from ..storage import (
     to_storage_string,
 )
 from .commits import BatchPublisher
+from .identity import LogicalOutputMap, logical_output_id
 from .output import AttemptOutputStore, OutputReference
 from .sqlite import SQLiteDurableStore
 from .types import WorkUnitKey
 
-PUBLICATION_SCHEMA_VERSION = 1
+PUBLICATION_SCHEMA_VERSION = 2
 JOB_MANIFEST_NAME = "_job.json"
 _STAGING_SUFFIX = ".__staging__"
 _TRASH_SUFFIX = ".__trash__"
@@ -135,7 +136,10 @@ class PublishedLayout:
         return join_path(self.job_dir(), stage, step)
 
     def partition_base(self, node: Any, partition_id: str, generation: int) -> str:
-        """Where one generation of a partition is published.
+        """Where one generation of a unit's *logical* output is published.
+
+        The directory is named by the declaration, never by the private
+        aggregate execution ID: see :mod:`caravel.durability.identity`.
 
         Each generation gets its own path, so publishing is write-once. A
         publisher that stalled across a recomputation writes its own
@@ -143,14 +147,14 @@ class PublishedLayout:
         current generation is named by the store and by the completion
         manifest, never inferred from the directory listing.
         """
-        leaf = readable_segment(partition_id)
+        leaf = readable_segment(logical_output_id(node, partition_id))
         if generation:
             leaf = f"{leaf}@g{generation}"
         return join_path(self.step_dir(node), leaf)
 
     def partition_prefix(self, node: Any, partition_id: str) -> str:
-        """The name every generation of this partition starts with."""
-        return readable_segment(partition_id)
+        """The name every generation of this unit's logical output starts with."""
+        return readable_segment(logical_output_id(node, partition_id))
 
 
 class OutputPublisher:
@@ -218,7 +222,7 @@ class OutputPublisher:
         single_batch = len(references) == 1
         layout = self.layout(key.job_id)
         directory = posixpath.basename(layout.partition_base(node, key.partition_id, generation))
-        readable = readable_segment(key.partition_id)
+        readable = readable_segment(logical_output_id(node, key.partition_id))
         step_prefix = posixpath.relpath(
             to_storage_string(layout.step_dir(node)), to_storage_string(layout.job_dir())
         )
@@ -234,7 +238,7 @@ class OutputPublisher:
                 if batch_prefix:
                     parts.append(batch_prefix)
                 if single_file:
-                    # A single-file dataset keeps the partition's own name
+                    # A single-file dataset keeps its logical output name
                     # rather than the attempt's opaque token.
                     parts.append(f"{readable}{posixpath.splitext(artifact_inner)[1]}")
                 else:
@@ -348,7 +352,10 @@ class OutputPublisher:
 
             self._promote(staging, base, planned, repair=repair)
             if self._store.mark_published(
-                key, generation=generation, files=[item.relative for item in planned]
+                key,
+                generation=generation,
+                files=[item.relative for item in planned],
+                logical_id=logical_output_id(node, key.partition_id),
             ):
                 self._sweep_superseded(node, key)
                 return [item.relative for item in planned]
@@ -526,7 +533,11 @@ class OutputPublisher:
 
         entries: list[dict[str, Any]] = []
         for node in nodes:
-            for partition_id in self._store.work_unit_partitions(job_id, node.node_id):
+            partition_ids = self._store.work_unit_partitions(job_id, node.node_id)
+            # Building the map validates that this node's units address output
+            # unambiguously before the manifest claims they do.
+            logical = LogicalOutputMap.for_node(node, partition_ids)
+            for partition_id in partition_ids:
                 key = WorkUnitKey(job_id, node.node_id, partition_id)
                 unit = self._store.load_work_unit(key)
                 if unit is None or unit.status != "sealed":
@@ -539,7 +550,9 @@ class OutputPublisher:
                         "stage": node.stage_name,
                         "step": node.step.name or node.node_id,
                         "node_id": node.node_id,
-                        "partition_id": partition_id,
+                        # Public addressing. The private execution partition ID
+                        # stays in the store, which is where recovery needs it.
+                        "output": logical.to_logical[partition_id],
                         "generation": unit.output_generation,
                         "batches": unit.batch_count,
                         "files": recorded_files[identity],
@@ -556,7 +569,7 @@ class OutputPublisher:
             "job_id": job_id,
             "job_generation": observed_generation,
             "status": job.status,
-            "outputs": sorted(entries, key=lambda item: (item["node_id"], item["partition_id"])),
+            "outputs": sorted(entries, key=lambda item: (item["node_id"], item["output"])),
         }
         path = self.layout(job_id).manifest_path()
         fs, resolved = resolve_fs(path, self._storage_options)
@@ -608,7 +621,9 @@ def validate_job_manifest(manifest: dict[str, Any], store: SQLiteDurableStore) -
 
     Returns the disagreements, empty only when the manifest describes the job
     as it is now: same pipeline identity, completed, same job generation, and
-    exactly the sealed units, generations, and recorded publication file references.
+    exactly the sealed units, generations, and recorded publication file
+    references. Entries address output by its logical name, which the store
+    recorded when it published.
     This validates metadata at the snapshot's instant, not subsequent file
     availability or integrity. Use explicit rebuilding to repair external damage.
 
@@ -643,34 +658,51 @@ def validate_job_manifest(manifest: dict[str, Any], store: SQLiteDurableStore) -
 
     sealed: dict[tuple[str, str], int] = snapshot["sealed"]
     published_files: dict[tuple[str, str], list[str]] = snapshot["files"]
+    # The logical identity recorded with each publication is what resolves a
+    # manifest entry back to its work unit. Validation therefore needs no
+    # declaration and never parses a published filename.
+    recorded_logical: dict[tuple[str, str], str] = snapshot["logical"]
+    by_logical = {
+        (node_id, logical): (node_id, partition_id)
+        for (node_id, partition_id), logical in recorded_logical.items()
+    }
+
+    def describe(unit: tuple[str, str]) -> str:
+        return f"{unit[0]}/{recorded_logical.get(unit, unit[1])}"
+
     listed: dict[tuple[str, str], Any] = {}
     for entry in manifest.get("outputs", []):
         try:
-            unit = (str(entry["node_id"]), str(entry["partition_id"]))
+            addressed = (str(entry["node_id"]), str(entry["output"]))
         except (KeyError, TypeError):
             problems.append(f"manifest entry is malformed: {entry!r}")
             continue
+        unit = by_logical.get(addressed)
+        if unit is None:
+            problems.append(
+                f"{addressed[0]}/{addressed[1]} has no recorded publication; rebuild output"
+            )
+            continue
         if unit in listed:
-            problems.append(f"{unit[0]}/{unit[1]} is listed more than once")
+            problems.append(f"{describe(unit)} is listed more than once")
         listed[unit] = entry.get("generation")
         files = entry.get("files")
-        if unit not in published_files:
-            problems.append(f"{unit[0]}/{unit[1]} has no recorded publication; rebuild output")
-        elif (
+        if (
             not isinstance(files, list)
             or any(not isinstance(path, str) for path in files)
             or sorted(files) != published_files[unit]
         ):
-            problems.append(f"{unit[0]}/{unit[1]} files disagree with committed publication")
+            problems.append(f"{describe(unit)} files disagree with committed publication")
 
+    # A listed entry resolved through a recorded publication is sealed by
+    # construction, so "listed but not sealed" cannot arise: an entry naming
+    # output with no current publication was already reported above.
     for unit in sorted(sealed.keys() - listed.keys()):
-        problems.append(f"{unit[0]}/{unit[1]} is sealed but missing from the manifest")
-    for unit in sorted(listed.keys() - sealed.keys()):
-        problems.append(f"{unit[0]}/{unit[1]} is listed but not sealed")
+        problems.append(f"{describe(unit)} is sealed but missing from the manifest")
     for unit in sorted(sealed.keys() & listed.keys()):
         if listed[unit] != sealed[unit]:
             problems.append(
-                f"{unit[0]}/{unit[1]} is generation {sealed[unit]}, manifest says {listed[unit]!r}"
+                f"{describe(unit)} is generation {sealed[unit]}, manifest says {listed[unit]!r}"
             )
     return problems
 

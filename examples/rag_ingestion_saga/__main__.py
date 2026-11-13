@@ -13,7 +13,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = Path("data/output/rag_ingestion_saga")
     run_rag_ingestion(
-        run_root=root / "pipeline",
+        state_root=root,
         workspace_root=root / "external_workspace",
         fail=not args.succeed,
     )

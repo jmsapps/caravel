@@ -250,7 +250,11 @@ batched output use the same publication contract.
 All-input steps receive a dataset reader or manifest rather than an eagerly
 materialized dataset. Optional batching bounds their work within one logical
 aggregate operation. Aggregate output becomes one stable partition for subsequent
-steps. Partition-scoped steps preserve partition identity; arbitrary repartitioning
+steps. That partition's identity is private scheduling and recovery state:
+published paths, result keys, manifest entries, and feed addresses use the step's
+declared dataset name, which defaults to the declared step name. `inputs.all(...)`
+selects input availability and readiness; it does not select an output name.
+Partition-scoped steps preserve partition identity; arbitrary repartitioning
 and partition fan-out require a separate contract.
 
 "All" means the selected snapshot or bounded incremental range, never an endless

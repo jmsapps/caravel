@@ -25,7 +25,12 @@ For large inputs, aggregate through the reader without collecting all records.
 
 Published output is under
 `data/combining_results_example/output/combining_results_example/combining-demo/`.
-The `combine` stage writes `__all__/__all__.json` containing:
+`inputs.all(...)` chooses input readiness, not an output name: the `combine`
+stage publishes under its declared dataset name, which defaults to the step
+name. With `Step(combine_results, output=JSONDataset())` that is
+`combine_results/combine_results.json`, and `results.of("combine_results")` is
+keyed by `"combine_results"`. Declaring `JSONDataset(name="summary")` would
+publish `summary/summary.json` instead. It contains:
 
 ```json
 {

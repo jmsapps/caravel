@@ -248,7 +248,7 @@ def test_the_completion_manifest_describes_published_output(tmp_path: Path) -> N
     manifest = json.loads((_job_dir(tmp_path) / JOB_MANIFEST_NAME).read_text())
     assert manifest["status"] == "completed"
     assert manifest["job_id"] == JOB
-    assert {entry["partition_id"] for entry in manifest["outputs"]} == set(DOCUMENTS)
+    assert {entry["output"] for entry in manifest["outputs"]} == set(DOCUMENTS)
     assert all(entry["step"] == "load" for entry in manifest["outputs"])
 
 
@@ -1263,9 +1263,15 @@ def test_manifest_validation_rejects_each_disagreement(
     assert any(expected in problem for problem in problems), problems
 
 
-def test_manifest_validation_rejects_an_entry_that_is_not_sealed(
+def test_manifest_validation_rejects_an_entry_with_no_recorded_publication(
     tmp_path: Path,
 ) -> None:
+    """A listed output that authoritative state never published is rejected.
+
+    Entries are resolved through the logical identity recorded with each
+    publication, so an invented name matches no unit at all rather than
+    matching one by coincidence.
+    """
     import copy
 
     from caravel.durability import read_job_manifest, validate_job_manifest
@@ -1277,9 +1283,9 @@ def test_manifest_validation_rejects_an_entry_that_is_not_sealed(
     assert manifest is not None
 
     tampered = copy.deepcopy(manifest)
-    tampered["outputs"].append({**tampered["outputs"][0], "partition_id": "never-existed"})
+    tampered["outputs"].append({**tampered["outputs"][0], "output": "never-existed"})
     problems = validate_job_manifest(tampered, storage.progress)
-    assert any("not sealed" in problem for problem in problems), problems
+    assert any("no recorded publication" in problem for problem in problems), problems
 
 
 def test_a_failed_repair_keeps_the_previous_publication(tmp_path: Path) -> None:

@@ -7,7 +7,6 @@ from pathlib import Path
 from examples.durable_partitions.pipeline import (
     DOCUMENTS,
     PIPELINE_ID,
-    PUBLISH_NODE,
     run_to_completion,
 )
 
@@ -50,5 +49,12 @@ def test_the_example_reinvokes_without_reprocessing(tmp_path: Path) -> None:
 
 
 def test_the_example_identifiers_stay_stable() -> None:
+    """The consumer addresses a declared step, and the node id behind it is stable."""
+    from caravel.durability import compile_durable_plan
+
+    from examples.durable_partitions.pipeline import build_pipeline
+
     assert PIPELINE_ID == "examples/durable-partitions"
-    assert PUBLISH_NODE == "stage-002-entry-001"
+    plan = compile_durable_plan(build_pipeline())
+    publish = next(node for node in plan.nodes if node.step.name == "publish")
+    assert publish.node_id == "stage-002-entry-001"

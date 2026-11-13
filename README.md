@@ -189,9 +189,29 @@ durable run would put them, and closing the storage never deletes them.
 ```python
 storage = DurableStorage.at("state/")
 results = storage.results(pipeline, job_id="snapshot-2026-11-12")
-results.of("enrich")        # {partition_id: payload}
+results.of("enrich")        # {logical output id: payload}
 results.feed("enrich")      # a bounded, ordered consumer feed
 ```
+
+Output is addressed by **logical identity**, never by execution identity. A
+per-partition step keys on each source partition's own id. A step declaring
+`inputs.all(...)` runs as one work unit on a reserved aggregate partition, but
+that id is private scheduling and recovery state: its output is addressed by
+the step's declared dataset name, which defaults to the declared step name.
+
+```python
+Step(summarize, output=JSONDataset(name="summary"))
+# results.of("summarize")          -> {"summary": {...}}
+# published                        -> <stage>/<step>/summary/summary.json
+
+Step(summarize)                    # no dataset name declared
+# results.of("summarize")          -> {"summarize": {...}}
+```
+
+`inputs.all(...)` chooses input availability and readiness. It does not choose
+an output name, merge payloads, or repartition: a callback returning a
+partitioned payload keeps its returned keys inside that one logical result, and
+each-mode steps downstream of a barrier publish under their own declarations.
 
 The published tree is a *projection* of committed state, never a second source
 of truth. Publication progress lives in the progress store, so the two cannot
@@ -206,9 +226,9 @@ runs.
 | --- | --- | --- |
 | Authoritative | `storage.results(...)`, `.published(step)` | Always correct. Reads through committed metadata. |
 | Progressive physical | the output tree during a run | Partitions appear as they seal. Superseded generations may still be present; never infer "current" from a directory listing. |
-| Whole-job snapshot | `_job.json` | Names the exact file for every partition at the moment it was written. **Advisory**: presence is not proof of completion. |
+| Whole-job snapshot | `_job.json` | Names the exact file for every logical output at the moment it was written. **Advisory**: presence is not proof of completion. |
 
-**Why concurrent publishers are safe.** Each generation of a partition
+**Why concurrent publishers are safe.** Each generation of a logical output
 publishes to its own write-once location (`doc-1.json`, then `doc-1@g1.json`).
 A publisher that stalls across a recomputation writes its own generation's
 files and can never overwrite a newer generation's, whenever it resumes and
@@ -333,10 +353,8 @@ inventory, and worker leases, so a plugin can no longer contradict it.
 ## Multi-Source Input And Branches
 
 `MultiSourceLoader` tags each record with `__source__` and is accepted directly
-as a `source`. The tag is preserved through commits: durable output is an
-immutable artifact, so nothing rewrites a payload before committing it.
-(The retired runner stripped the tag by default — see the breaking-change note
-below.)
+as a `source`. Source identity remains in durable lineage metadata. Payload tags
+are stripped before commit by default; pass `keep_source_tag=True` to retain them.
 
 ### Branches
 
@@ -354,15 +372,15 @@ subsume a whole-dataset merge — for that, add an `inputs.all(...)` step after
 the merge.
 
 A route step transforms one partition's payload and must preserve that
-partition's identity. Repartitioning belongs in an explicit `inputs.all(...)`
-step outside the branch.
+partition's identity. Whole-input processing belongs in an `inputs.all(...)`
+step outside the branch; returned storage keys do not create new execution partitions.
 
 ## Breaking Changes From The Single-Pass Runner
 
 | Removed | Replacement |
 | --- | --- |
 | `run(pipeline, run_root)` | `run(pipeline, job_id=..., source=..., storage=...)` |
-| `only_stage` / `only_step` | Re-invoking a job already skips committed work. Forcing one step to recompute is **designed but not implemented**; use a new `job_id` for now. |
+| `only_stage` / `only_step` | Re-invoking a job skips committed work. Use `storage.invalidate(pipeline, job_id=..., step=..., partitions=...)` for selective recomputation; dependent work is invalidated with it. |
 | `Stage(stage_root=...)` | One `artifacts_root` on `DurableStorage.at`. |
 | `Stage(clean_dirs=True)` | Rejected: cleanup could delete committed output. |
 | `@step(...)` decorator | `Step(...)` is the only step configuration surface. Move the decorator's arguments into the `Step(...)` that lists the processor in a stage or branch route: `@step(output=d)` above `def load` becomes `Step(load, output=d)`. A bare callable still works wherever it wants every documented `Step` default. |
@@ -371,6 +389,13 @@ step outside the branch.
 | Stage-directory output layout | `storage.results(pipeline, job_id=...)` |
 | Checkpoint / ownership / lease plugins | Owned by the authoritative store. |
 | `context_factory` | **Still supported**, unchanged. |
+| `__all__` as a published directory, result key, manifest identity, and feed address | The declared dataset name, defaulting to the declared step name. The reserved aggregate id is private to the progress store and attempt artifacts. |
+
+Logical output identity is a breaking change to the published layout and to the
+durable store, which is now schema version 2. A store written under version 1 is
+not opened: start a new job against a fresh recovery directory and output root,
+or keep the old state on the version that wrote it, rebuild its output there,
+and migrate the results. There is no dual-layout mode and no alias tree.
 
 ## Supported Envelope
 
@@ -465,13 +490,11 @@ them, and only then acknowledges. Acknowledging never touches producer progress,
 and one consumer's failure never blocks another.
 
 ```python
-from caravel.durability import BatchFeed
-
-feed = BatchFeed(store, pipeline_id=..., job_id=..., node_id=..., output=output)
+feed = storage.results(pipeline, job_id=...).feed("publish")
 
 page = feed.read_for("indexer", limit=100)
 for entry in page.entries:
-    destination.upsert(entry.partition_id, feed.load(entry, dataset=dataset))
+    destination.upsert(entry.logical_id, feed.load(entry, dataset=dataset))
 feed.acknowledge("indexer", page.next_position)
 ```
 
