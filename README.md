@@ -76,16 +76,23 @@ whether it runs once per partition or once as an aggregate barrier.
 from caravel import DurableStorage, InMemorySource, Pipeline, Stage, Step, run
 
 def load(inputs, *, context):
-    [partition] = inputs.partitions()
-    return {**partition.load(), "loaded": True}
+    records = {}
+    for partition in inputs.partitions():
+        records[partition.partition_id] = {**partition.load(), "loaded": True}
+    return records
 
 def enrich(inputs, *, context):
-    [partition] = inputs.partitions()
-    return {**partition.load(), "enriched": True}
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = {**record, "enriched": True}
+    return records
 
 def summarize(inputs, *, context):
     # Handles load on demand, so a barrier over a large job stays bounded.
-    return {"documents": sum(1 for _ in inputs.partitions())}
+    return {"documents": sum(len(partition.load()) for partition in inputs.partitions())}
 
 pipeline = Pipeline(
     name="documents",
@@ -445,13 +452,13 @@ Stage(name="prepare", retry=vendor_retry, entries=[
 
 # ...or just one operation inside the processor. Only that call repeats.
 def enrich(inputs, *, context):
-    [partition] = inputs.partitions()
     results = []
-    for record in partition.load():
-        value, attempts = retry_operation(
-            operation=lambda record=record: call_vendor(record), retry=vendor_retry
-        )
-        results.append(value)
+    for partition in inputs.partitions():
+        for record in partition.load():
+            value, attempts = retry_operation(
+                operation=lambda record=record: call_vendor(record), retry=vendor_retry
+            )
+            results.append(value)
     return results
 ```
 

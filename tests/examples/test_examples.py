@@ -145,6 +145,48 @@ def test_collection_examples_preserve_records_when_scope_changes(
     assert execute("partition") == execute("all")
 
 
+@pytest.mark.parametrize(
+    ("example", "step_name"),
+    [
+        ("fsspec", "bronze_collect"),
+        ("fsspec", "silver_transform"),
+        ("persist", "step_1_collect"),
+        ("persist", "step_2_scale"),
+        ("persist", "step_3_label"),
+        ("durable", "enrich"),
+        ("durable", "publish"),
+    ],
+)
+def test_remaining_collection_examples_process_multiple_inputs(
+    tmp_path: Path, example: str, step_name: str
+) -> None:
+    from caravel import run
+    from caravel.durability import InMemorySource
+    from examples.durable_partitions.pipeline import DOCUMENTS, build_pipeline
+
+    builders = {
+        "fsspec": build_fsspec_pipeline,
+        "persist": build_persist_only_final_pipeline,
+        "durable": build_pipeline,
+    }
+
+    def execute(scope: str) -> Any:
+        pipeline = builders[example]()
+        for stage in pipeline.stages:
+            for step in stage.entries:
+                if step.name == step_name:
+                    step.input_scope = scope
+        with DurableStorage.at(tmp_path / scope / "output") as storage:
+            source = InMemorySource(DOCUMENTS) if example == "durable" else pipeline.source
+            assert (
+                run(pipeline, job_id="loop", source=source, storage=storage).status == "completed"
+            )
+            final_step = pipeline.stages[-1].entries[-1]
+            return storage.results(pipeline, job_id="loop").of(final_step.name)
+
+    assert execute("all") == execute("partition")
+
+
 def test_partitioned_example_keeps_storage_keys_distinct_from_identity(
     tmp_path: Path,
 ) -> None:

@@ -69,40 +69,42 @@ def make_branching_loader(
 
 def bronze_normalize_json_source(inputs, *, context: object) -> dict[str, dict[str, Any]]:
     """Normalize one JSON-sourced record. Runs only for partitions routed here."""
-    [partition] = inputs.partitions()
-    record: dict[str, Any] = partition.load()
-    _ = context
-    payload = record.get("content", record)
-    item_id = str(payload["id"])
-    return {
-        item_id: {
+    records = {}
+    for partition in inputs.partitions():
+        record = partition.load()
+        payload = record.get("content", record)
+        item_id = str(payload["id"])
+        if item_id in records:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        records[item_id] = {
             "id": item_id,
             "lang": str(payload["language"]),
             "title": str(payload["title"]),
             "body": str(payload["body"]),
             "origin": "json",
         }
-    }
+    return records
 
 
 def bronze_normalize_html_source(inputs, *, context: object) -> dict[str, dict[str, Any]]:
     """Normalize one HTML-sourced record. Runs only for partitions routed here."""
-    [partition] = inputs.partitions()
-    record: dict[str, Any] = partition.load()
-    _ = context
-    html = record.get("content", record)
-    if not isinstance(html, str):
-        raise TypeError(f"Expected HTML text, got {type(html).__name__}.")
-    item_id = _extract_between(html, 'data-id="', '"')
-    return {
-        item_id: {
+    records = {}
+    for partition in inputs.partitions():
+        record = partition.load()
+        html = record.get("content", record)
+        if not isinstance(html, str):
+            raise TypeError(f"Expected HTML text, got {type(html).__name__}.")
+        item_id = _extract_between(html, 'data-id="', '"')
+        if item_id in records:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        records[item_id] = {
             "id": item_id,
             "lang": _extract_between(html, 'data-lang="', '"'),
             "title": _extract_between(html, "<h1>", "</h1>"),
             "body": _extract_between(html, "<p>", "</p>"),
             "origin": "html",
         }
-    }
+    return records
 
 
 def silver_unify_records(inputs, *, context: object) -> dict[str, dict[str, Any]]:

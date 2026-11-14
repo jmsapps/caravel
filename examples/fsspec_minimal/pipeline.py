@@ -45,24 +45,37 @@ def _runtime_params(context: object) -> Mapping[str, str]:
 
 def bronze_collect(inputs, *, context: object) -> dict[str, Any]:
     """Add bronze fields to one execution partition's record."""
-    [partition] = inputs.partitions()
-    record: dict[str, Any] = partition.load()
-    _ = context
-    return {**record, "bronze": True, "doubled_value": int(record["value"]) * 2}
+    records = {}
+    for partition in inputs.partitions():
+        record = partition.load()
+        records[partition.partition_id] = {
+            **record,
+            "bronze": True,
+            "doubled_value": int(record["value"]) * 2,
+        }
+    return records
 
 
 def silver_transform(inputs, *, context: object) -> dict[str, Any]:
     """Normalize one bronze record."""
-    [partition] = inputs.partitions()
-    record: dict[str, Any] = partition.load()
-    _ = context
-    return {**record, "normalized": float(record["doubled_value"]) / 4.0}
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = {**record, "normalized": float(record["doubled_value"]) / 4.0}
+    return records
 
 
 def silver_finalize(inputs, *, context: object) -> dict[str, Any]:
     """Aggregate every committed partition behind an all-input barrier."""
     params = _runtime_params(context)
-    records = {p.partition_id: p.load() for p in inputs.partitions()}
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = record
     ordered_keys = sorted(records)
     payload: dict[str, Any] = {
         "pipeline": PIPELINE_NAME,
@@ -87,11 +100,14 @@ def build_fsspec_pipeline(
     return Pipeline(
         name=PIPELINE_NAME,
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[Step(bronze_collect, output=JSONDataset())]),
+            Stage(
+                name=BRONZE_STAGE_NAME,
+                entries=[Step(bronze_collect, output=JSONDataset(), revision="2")],
+            ),
             Stage(
                 name=SILVER_STAGE_NAME,
                 entries=[
-                    Step(silver_transform, output=JSONDataset()),
+                    Step(silver_transform, output=JSONDataset(), revision="2"),
                     Step(
                         silver_finalize,
                         input_scope="all",

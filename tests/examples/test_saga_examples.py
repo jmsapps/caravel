@@ -37,6 +37,39 @@ def test_the_saga_completes_and_consumes_resources(tmp_path: Path) -> None:
     assert state["shipments"]
 
 
+def test_saga_loops_process_both_orders(tmp_path: Path) -> None:
+    from caravel import DurableStorage, run
+    from caravel.durability import InMemorySource
+    from examples.saga_rollback.pipeline import SagaTransaction, build_saga_pipeline
+
+    transaction = SagaTransaction(
+        state_path=tmp_path / "state.json", journal_path=tmp_path / "journal.json"
+    )
+    pipeline = build_saga_pipeline(transaction)
+    pipeline.stages[0].entries[0].input_scope = "all"
+    orders = {
+        "first": {"order_id": "one", "quantity": 1, "amount": 25},
+        "second": {"order_id": "two", "quantity": 1, "amount": 25},
+    }
+    with DurableStorage.at(tmp_path / "output") as storage:
+        assert (
+            run(
+                pipeline,
+                job_id="orders",
+                source=InMemorySource(orders),
+                storage=storage,
+                plugins=[transaction],
+            ).status
+            == "completed"
+        )
+        payloads = storage.results(pipeline, job_id="orders").of("finalize_order")
+        assert len(payloads) == 1
+        for payload in payloads.values():
+            assert set(payload) == set(orders)
+            assert all(order["status"] == "completed" for order in payload.values())
+    assert len(json.loads((tmp_path / "state.json").read_text())["shipments"]) == 2
+
+
 def test_a_failed_saga_compensates_in_reverse_order(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="Simulated failure"):
         _saga(tmp_path, fail=True)
@@ -56,6 +89,37 @@ def test_the_rag_ingestion_saga_completes(tmp_path: Path) -> None:
     result = run_rag_ingestion(state_root=tmp_path / "state", workspace_root=tmp_path / "workspace")
     assert result.status == "completed"
     assert (tmp_path / "workspace").exists()
+
+
+def test_rag_loops_keep_both_documents_and_chunks(tmp_path: Path) -> None:
+    from caravel import DurableStorage, run
+    from caravel.durability import InMemorySource
+    from examples.rag_ingestion_saga.pipeline import RagWorkspaceSaga, build_rag_ingestion_pipeline
+
+    saga = RagWorkspaceSaga(tmp_path / "workspace")
+    pipeline = build_rag_ingestion_pipeline(saga)
+    pipeline.stages[0].entries[0].input_scope = "all"
+    documents = {
+        "first": {"document_id": "one", "text": "one two three four five", "version": "v2"},
+        "second": {"document_id": "two", "text": "six seven", "version": "v2"},
+    }
+    with DurableStorage.at(tmp_path / "output") as storage:
+        assert (
+            run(
+                pipeline,
+                job_id="documents",
+                source=InMemorySource(documents),
+                storage=storage,
+                plugins=[saga],
+            ).status
+            == "completed"
+        )
+        for payload in storage.results(pipeline, job_id="documents").of("commit_version").values():
+            assert set(payload) == set(documents)
+            assert all(document["status"] == "committed" for document in payload.values())
+    index = json.loads((saga.root / "index" / "documents.json").read_text())
+    assert set(index["documents"]) == set(documents)
+    assert len(list((saga.root / "current").glob("chunk-*.json"))) == 3
 
 
 def test_a_failed_rag_ingestion_restores_the_workspace(tmp_path: Path) -> None:

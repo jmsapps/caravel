@@ -55,20 +55,24 @@ WORK_SECONDS = 0.004
 
 def enrich(inputs, *, context: Any) -> Any:
     """Partition-scoped work: runs as soon as its own partition is ready."""
-    [partition] = inputs.partitions()
-    document: Any = partition.load()
-    del context
-    time.sleep(WORK_SECONDS)
-    return {**document, "enriched": True}
+    documents = {}
+    for partition in inputs.partitions():
+        document = partition.load()
+        time.sleep(WORK_SECONDS)
+        documents[partition.partition_id] = {**document, "enriched": True}
+    return documents
 
 
 def publish(inputs, *, context: Any) -> Any:
     """Destination publication is an ordinary partition-scoped step."""
-    [partition] = inputs.partitions()
-    document: Any = partition.load()
-    del context
-    time.sleep(WORK_SECONDS)
-    return {"id": document["id"], "words": document["words"], "published": True}
+    documents = {}
+    for partition in inputs.partitions():
+        for key, document in partition.load().items():
+            if key in documents:
+                raise ValueError(f"Duplicate document key: {key}")
+            time.sleep(WORK_SECONDS)
+            documents[key] = {"id": document["id"], "words": document["words"], "published": True}
+    return documents
 
 
 def summarize(inputs, *, context: Any) -> Any:
@@ -81,8 +85,9 @@ def summarize(inputs, *, context: Any) -> Any:
     total = 0
     count = 0
     for partition in inputs.partitions():
-        total += partition.load()["words"]
-        count += 1
+        for document in partition.load().values():
+            total += document["words"]
+            count += 1
     return {"documents": count, "words": total}
 
 
@@ -93,10 +98,20 @@ def build_pipeline() -> Pipeline:
     return Pipeline(
         name="durable-documents",
         stages=[
-            Stage(name="prepare", entries=[Step(fn=enrich, output=JSONDataset(name="enrich"))]),
+            Stage(
+                name="prepare",
+                entries=[Step(fn=enrich, output=JSONDataset(name="enrich"), revision="2")],
+            ),
             Stage(
                 name="publish",
-                entries=[Step(fn=publish, output=JSONDataset(name="publish"), retry=vendor_retry)],
+                entries=[
+                    Step(
+                        fn=publish,
+                        output=JSONDataset(name="publish"),
+                        retry=vendor_retry,
+                        revision="2",
+                    )
+                ],
             ),
             Stage(
                 name="summary",

@@ -36,30 +36,41 @@ PARTITIONS: dict[str, dict[str, Any]] = {
 
 
 def step_1_collect(inputs, *, context: object) -> dict[str, Any]:
-    [partition] = inputs.partitions()
-    record: dict[str, Any] = partition.load()
-    _ = context
-    return {**record, "collected": True}
+    records = {}
+    for partition in inputs.partitions():
+        records[partition.partition_id] = {**partition.load(), "collected": True}
+    return records
 
 
 def step_2_scale(inputs, *, context: object) -> dict[str, Any]:
-    [partition] = inputs.partitions()
-    record: dict[str, Any] = partition.load()
-    _ = context
-    return {**record, "scaled": int(record["value"]) * 10}
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = {**record, "scaled": int(record["value"]) * 10}
+    return records
 
 
 def step_3_label(inputs, *, context: object) -> dict[str, Any]:
-    [partition] = inputs.partitions()
-    record: dict[str, Any] = partition.load()
-    _ = context
-    return {**record, "label": f"v{record['scaled']}"}
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = {**record, "label": f"v{record['scaled']}"}
+    return records
 
 
 def step_4_aggregate(inputs, *, context: object) -> dict[str, Any]:
     """Aggregate every committed partition behind the barrier."""
     _ = context
-    records = {partition.partition_id: partition.load() for partition in inputs.partitions()}
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = record
     return {
         "pipeline": PIPELINE_NAME,
         "count": len(records),
@@ -75,9 +86,9 @@ def build_persist_only_final_pipeline() -> Pipeline:
             Stage(
                 name=STAGE_NAME,
                 entries=[
-                    Step(step_1_collect, output=JSONDataset()),
-                    Step(step_2_scale, output=JSONDataset()),
-                    Step(step_3_label, output=JSONDataset()),
+                    Step(step_1_collect, output=JSONDataset(), revision="2"),
+                    Step(step_2_scale, output=JSONDataset(), revision="2"),
+                    Step(step_3_label, output=JSONDataset(), revision="2"),
                     Step(
                         step_4_aggregate,
                         input_scope="all",

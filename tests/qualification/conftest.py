@@ -261,6 +261,11 @@ def _start_azurite(state: _Emulators) -> None:
             "--blobHost",
             "0.0.0.0",
             "--inMemoryPersistence",
+            # The SDK negotiates a service API version that an Azurite release
+            # may predate, which fails every request with InvalidHeaderValue.
+            # Both ends float here, so the emulator is told to accept the
+            # version rather than pinning two moving dependencies to each other.
+            "--skipApiVersionCheck",
         ],
         capture_output=True,
         text=True,

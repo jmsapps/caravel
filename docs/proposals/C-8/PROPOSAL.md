@@ -436,11 +436,11 @@ vendor_retry = RetryOptions(should_retry_error=retryable)
 # Retry only a record operation inside the batch. The managed deadline,
 # cancellation, and shared allowance are inherited; there is no context to pass.
 def enrich(inputs, *, context):
-    [partition] = inputs.partitions()
     return [
         retry_operation(
             operation=lambda record=record: enrich_record(record), retry=vendor_retry
         )[0]
+        for partition in inputs.partitions()
         for record in partition.load()
     ]
 
@@ -448,8 +448,11 @@ record_retry_step = Step(enrich, batch_size=100)   # no outer retry enabled
 
 # Alternatively, retry the batch as a whole, using a processor without inner retries.
 def enrich_without_inner_retry(inputs, *, context):
-    [partition] = inputs.partitions()
-    return [enrich_record(record) for record in partition.load()]
+    return [
+        enrich_record(record)
+        for partition in inputs.partitions()
+        for record in partition.load()
+    ]
 
 batched_step = Step(enrich_without_inner_retry, batch_size=100, retry=vendor_retry)
 per_record_commit_step = Step(enrich_without_inner_retry, batch_size=1, retry=vendor_retry)

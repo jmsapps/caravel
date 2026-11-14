@@ -8,6 +8,7 @@ leases, so a plugin can no longer contradict it.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -269,3 +270,84 @@ def test_the_retired_capabilities_are_gone() -> None:
 
     for retired in ("CheckpointCapability", "OwnershipCapability", "CheckpointPlugin"):
         assert not hasattr(plugins, retired), f"{retired} should have been retired"
+
+
+# ---------------------------------------------------------------------------
+# Run evidence
+# ---------------------------------------------------------------------------
+
+
+def test_the_evidence_plugin_records_a_real_run(tmp_path: Path) -> None:
+    """The shipped observer must accept the facts this engine actually emits.
+
+    It validates its own payload against a field set, so a fact renamed in the
+    engine turns every run into a plugin failure. That is only caught by
+    running it, which is what this test does.
+    """
+    from caravel.plugins.run_evidence import RunEvidencePlugin, validate_run_event
+
+    evidence = RunEvidencePlugin(metadata_root=tmp_path / "metadata")
+    result = run(
+        _pipeline(),
+        job_id="j1",
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.at(tmp_path / "output"),
+        plugins=[evidence],
+    )
+    assert result.status == "completed"
+
+    events_dir = Path(evidence.events_dir(result.invocation_id))
+    written = sorted(events_dir.glob("*.json"))
+    assert written, "a completed run must leave evidence"
+
+    kinds = []
+    for path in written:
+        payload = json.loads(path.read_text())
+        # Re-validating proves the record on disk satisfies the same contract,
+        # not merely that something was written.
+        validate_run_event(payload)
+        kinds.append(payload["kind"])
+
+    assert kinds[0] == "run_started"
+    assert kinds[-1] == "run_completed"
+    assert kinds.count("node_started") == len(DOCUMENTS)
+
+    node_events = [
+        json.loads(path.read_text()) for path in written if json.loads(path.read_text())["node"]
+    ]
+    node = node_events[0]["node"]
+    assert node["partition_id"] in DOCUMENTS
+    assert node["input_scope"] == "partition"
+    assert Path(evidence.summary_path(result.invocation_id)).is_file()
+
+
+def test_the_evidence_plugin_records_an_all_scope_node(tmp_path: Path) -> None:
+    def summarize(inputs, *, context: Any) -> Any:
+        del context
+        return {"documents": sum(1 for _ in inputs.partitions())}
+
+    from caravel.plugins.run_evidence import RunEvidencePlugin
+
+    evidence = RunEvidencePlugin(metadata_root=tmp_path / "metadata")
+    pipeline = Pipeline(
+        name="documents",
+        stages=[
+            Stage(name="prepare", entries=[Step(load)]),
+            Stage(name="finish", entries=[Step(summarize, input_scope="all")]),
+        ],
+    )
+    result = run(
+        pipeline,
+        job_id="j1",
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.at(tmp_path / "output"),
+        plugins=[evidence],
+    )
+    assert result.status == "completed"
+
+    scopes = {
+        json.loads(path.read_text())["node"]["input_scope"]
+        for path in Path(evidence.events_dir(result.invocation_id)).glob("*.json")
+        if json.loads(path.read_text())["node"]
+    }
+    assert scopes == {"partition", "all"}

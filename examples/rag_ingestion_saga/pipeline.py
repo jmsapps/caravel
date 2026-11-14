@@ -101,58 +101,79 @@ def build_rag_ingestion_pipeline(
     seed = Path(input_path) if input_path is not None else _DEFAULT_INPUT
 
     def stage_chunks(inputs, *, context: object) -> dict[str, Any]:
-        [partition] = inputs.partitions()
-        document: dict[str, Any] = partition.load()
-        _ = context
+        documents = {}
         saga.record("delete_staging")
         staging = saga.root / "staging"
         shutil.rmtree(staging, ignore_errors=True)
-        words = str(document["text"]).split()
-        chunks = [words[index : index + 4] for index in range(0, len(words), 4)]
-        for index, chunk in enumerate(chunks, start=1):
-            _write(
-                staging / f"chunk-{index:03d}.json",
-                {"text": " ".join(chunk), "vector": [index, len(chunk)]},
-            )
-        return {**document, "chunk_count": len(chunks)}
+        chunk_index = 0
+        for partition in inputs.partitions():
+            document = partition.load()
+            words = str(document["text"]).split()
+            chunks = [words[index : index + 4] for index in range(0, len(words), 4)]
+            for chunk in chunks:
+                chunk_index += 1
+                _write(
+                    staging / f"chunk-{chunk_index:03d}.json",
+                    {"text": " ".join(chunk), "vector": [chunk_index, len(chunk)]},
+                )
+            documents[partition.partition_id] = {**document, "chunk_count": len(chunks)}
+        return documents
 
     def replace_index(inputs, *, context: object) -> dict[str, Any]:
-        [partition] = inputs.partitions()
-        payload: dict[str, Any] = partition.load()
-        _ = context
+        documents = {}
+        for partition in inputs.partitions():
+            for key, payload in partition.load().items():
+                if key in documents:
+                    raise ValueError(f"Duplicate document key: {key}")
+                documents[key] = {**payload, "index_recreated": True}
         saga.record("restore_index")
         _replace_dir(saga.root / "index", saga.root / "index.backup")
         _write(
             saga.root / "index" / "documents.json",
-            {"version": payload["version"], "chunks": payload["chunk_count"]},
+            {
+                "documents": {
+                    key: {"version": payload["version"], "chunks": payload["chunk_count"]}
+                    for key, payload in documents.items()
+                }
+            },
         )
-        return {**payload, "index_recreated": True}
+        return documents
 
     def promote_chunks(inputs, *, context: object) -> dict[str, Any]:
-        [partition] = inputs.partitions()
-        payload: dict[str, Any] = partition.load()
-        _ = context
+        documents = {}
+        for partition in inputs.partitions():
+            for key, payload in partition.load().items():
+                if key in documents:
+                    raise ValueError(f"Duplicate document key: {key}")
+                documents[key] = {**payload, "chunks_promoted": True}
         saga.record("restore_current")
         _replace_dir(saga.root / "current", saga.root / "current.backup")
         _replace_dir(saga.root / "staging", saga.root / "current")
-        return {**payload, "chunks_promoted": True}
+        return documents
 
     def commit_version(inputs, *, context: object) -> dict[str, Any]:
-        [partition] = inputs.partitions()
-        payload: dict[str, Any] = partition.load()
+        documents = {}
+        for partition in inputs.partitions():
+            for key, payload in partition.load().items():
+                if key in documents:
+                    raise ValueError(f"Duplicate document key: {key}")
+                documents[key] = {**payload, "status": "committed"}
         shutil.copy2(saga.root / "version.json", saga.root / "version.backup.json")
         saga.record("restore_version")
-        _write(saga.root / "version.json", {"version": payload["version"]})
+        _write(
+            saga.root / "version.json",
+            {"documents": {key: payload["version"] for key, payload in documents.items()}},
+        )
         params = getattr(context, "params", {})
         if isinstance(params, dict) and params.get("fail") == "true":
             raise RuntimeError("Simulated failure after chunk promotion")
-        return {**payload, "status": "committed"}
+        return documents
 
     entries: list[Step | Branch | Callable[..., Any]] = [
-        Step(stage_chunks, JSONDataset(), name="stage_chunks"),
-        Step(replace_index, JSONDataset(), name="replace_index"),
-        Step(promote_chunks, JSONDataset(), name="promote_chunks"),
-        Step(commit_version, JSONDataset(), name="commit_version"),
+        Step(stage_chunks, JSONDataset(), name="stage_chunks", revision="2"),
+        Step(replace_index, JSONDataset(), name="replace_index", revision="2"),
+        Step(promote_chunks, JSONDataset(), name="promote_chunks", revision="2"),
+        Step(commit_version, JSONDataset(), name="commit_version", revision="2"),
     ]
 
     # One document is one execution partition.

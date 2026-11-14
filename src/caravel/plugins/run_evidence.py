@@ -70,19 +70,20 @@ _EVENT_FIELDS = frozenset(
     }
 )
 
+# Exactly the fields of one NodeFacts record. Durable execution identifies work
+# by node and partition under a declared input scope; it has no step directory,
+# no per-node persist switch, and no route key on the fact itself.
 _NODE_FIELDS = frozenset(
     {
         "node_id",
-        "kind",
+        "partition_id",
         "stage_index",
         "stage_name",
         "entry_index",
         "name",
-        "persist",
+        "input_scope",
         "dataset_type",
         "dataset_name",
-        "step_dir",
-        "route_key",
     }
 )
 
@@ -146,10 +147,6 @@ def validate_run_event(payload: object) -> dict[str, Any]:
         if not isinstance(payload[field], str) or not payload[field]:
             raise ValueError(f"Run event {field} must be a non-empty string.")
 
-    run_root = payload["run_root"]
-    if not isinstance(run_root, str) or not run_root:
-        raise ValueError("Run event run_root must be a non-empty string.")
-
     sequence = payload["sequence"]
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
         raise ValueError("Run event sequence must be a positive integer.")
@@ -162,8 +159,9 @@ def validate_run_event(payload: object) -> dict[str, Any]:
     if node is not None:
         if not isinstance(node, dict) or set(node) != _NODE_FIELDS:
             raise ValueError("Run event node must carry exactly the node fact fields.")
-        if not isinstance(node["node_id"], str) or not node["node_id"]:
-            raise ValueError("Run event node_id must be a non-empty string.")
+        for field in ("node_id", "partition_id"):
+            if not isinstance(node[field], str) or not node[field]:
+                raise ValueError(f"Run event node {field} must be a non-empty string.")
 
     error_type = payload["error_type"]
     if error_type is not None and (not isinstance(error_type, str) or not error_type):
