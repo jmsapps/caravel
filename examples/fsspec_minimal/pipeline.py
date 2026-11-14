@@ -12,9 +12,11 @@ Set ``CARAVEL_ARTIFACTS_ROOT`` to an fsspec URL (``s3://``, ``az://``,
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TypedDict
 
 from caravel import (
+    StepContext,
+    RunResult,
     JSONDataset,
     Pipeline,
     Stage,
@@ -36,36 +38,53 @@ SILVER_FINALIZE_STEP_NAME = "silver_finalize"
 _DEFAULT_INPUT_PATH = Path(__file__).resolve().parent / "data" / "input_partitions.json"
 
 
-def _runtime_params(context: object) -> Mapping[str, str]:
-    params = getattr(context, "params", {})
-    if isinstance(params, dict):
-        return {str(key): str(value) for key, value in params.items()}
-    return {}
+def _runtime_params(context: StepContext) -> Mapping[str, str]:
+    """The run-scoped parameters this invocation was given."""
+    return context.params
 
 
-def bronze_collect(value, *, context: object) -> dict[str, Any]:
-    """Add bronze fields to one execution partition's record."""
-    records = {}
-    for _key, record in value.items():
-        records[_key] = {
-            **record,
-            "bronze": True,
-            "doubled_value": int(record["value"]) * 2,
-        }
-    return records
+class SeedRecord(TypedDict):
+    """One record as the seed dataset supplies it."""
+
+    id: str
+    value: int
 
 
-def silver_transform(value, *, context: object) -> dict[str, Any]:
-    """Normalize one bronze record."""
-    records = {}
-    for key, record in value.items():
-        if key in records:
-            raise ValueError(f"Duplicate record key: {key}")
-        records[key] = {**record, "normalized": float(record["doubled_value"]) / 4.0}
-    return records
+class BronzeRecord(SeedRecord):
+    """A seed record after the bronze step."""
+
+    bronze: bool
+    doubled_value: int
 
 
-def silver_finalize(value, *, context: object) -> dict[str, Any]:
+class SilverRecord(BronzeRecord):
+    """A bronze record after the silver step."""
+
+    normalized: float
+
+
+SeedRecords = dict[str, SeedRecord]
+BronzeRecords = dict[str, BronzeRecord]
+SilverRecords = dict[str, SilverRecord]
+
+
+def bronze_collect(value: SeedRecords, *, context: StepContext) -> BronzeRecords:
+    """Add bronze fields to every incoming record."""
+    return {
+        key: BronzeRecord(**record, bronze=True, doubled_value=int(record["value"]) * 2)
+        for key, record in value.items()
+    }
+
+
+def silver_transform(value: BronzeRecords, *, context: StepContext) -> SilverRecords:
+    """Normalize every bronze record."""
+    return {
+        key: SilverRecord(**record, normalized=float(record["doubled_value"]) / 4.0)
+        for key, record in value.items()
+    }
+
+
+def silver_finalize(value: SilverRecords, *, context: StepContext) -> dict[str, Any]:
     """Aggregate every committed partition behind an all-input barrier."""
     params = _runtime_params(context)
     records = {}
@@ -131,7 +150,7 @@ def run_fsspec_pipeline(
     artifacts_root: str | Path | None = None,
     storage_options: Mapping[str, Any] | None = None,
     params: dict[str, str] | None = None,
-) -> Any:
+) -> RunResult:
     """Run the example and return its structured status."""
     pipeline = build_fsspec_pipeline(input_path=input_path, storage_options=storage_options)
     return run(

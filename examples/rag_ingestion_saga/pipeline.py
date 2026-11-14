@@ -4,9 +4,11 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, cast
+from typing import Any, Callable, Mapping, TypedDict, cast
 
 from caravel import (
+    RunResult,
+    StepContext,
     Branch,
     CallableLoader,
     JSONDataset,
@@ -97,13 +99,52 @@ class RagWorkspaceSaga:
         (self.root / "version.backup.json").unlink(missing_ok=True)
 
 
+class Document(TypedDict):
+    """One document as the seed dataset supplies it."""
+
+    document_id: str
+    text: str
+    version: str
+
+
+class StagedDocument(Document):
+    """A document whose chunks are staged."""
+
+    chunk_count: int
+
+
+class IndexedDocument(StagedDocument):
+    """A staged document written into a fresh index."""
+
+    index_recreated: bool
+
+
+class PromotedDocument(IndexedDocument):
+    """An indexed document whose chunks are promoted."""
+
+    chunks_promoted: bool
+
+
+class CommittedDocument(PromotedDocument):
+    """A promoted document the saga committed."""
+
+    status: str
+
+
+Documents = dict[str, Document]
+StagedDocuments = dict[str, StagedDocument]
+IndexedDocuments = dict[str, IndexedDocument]
+PromotedDocuments = dict[str, PromotedDocument]
+CommittedDocuments = dict[str, CommittedDocument]
+
+
 def build_rag_ingestion_pipeline(
     saga: RagWorkspaceSaga, input_path: Path | str | None = None
 ) -> Pipeline:
     seed = Path(input_path) if input_path is not None else _DEFAULT_INPUT
 
-    def stage_chunks(value, *, context: object) -> dict[str, Any]:
-        documents = {}
+    def stage_chunks(value: Documents, *, context: StepContext) -> StagedDocuments:
+        documents: StagedDocuments = {}
         saga.record("delete_staging")
         staging = saga.root / "staging"
         shutil.rmtree(staging, ignore_errors=True)
@@ -117,15 +158,15 @@ def build_rag_ingestion_pipeline(
                     staging / f"chunk-{chunk_index:03d}.json",
                     {"text": " ".join(chunk), "vector": [chunk_index, len(chunk)]},
                 )
-            documents[_key] = {**document, "chunk_count": len(chunks)}
+            documents[_key] = StagedDocument(**document, chunk_count=len(chunks))
         return documents
 
-    def replace_index(value, *, context: object) -> dict[str, Any]:
-        documents = {}
+    def replace_index(value: StagedDocuments, *, context: StepContext) -> IndexedDocuments:
+        documents: IndexedDocuments = {}
         for key, payload in value.items():
             if key in documents:
                 raise ValueError(f"Duplicate document key: {key}")
-            documents[key] = {**payload, "index_recreated": True}
+            documents[key] = IndexedDocument(**payload, index_recreated=True)
         saga.record("restore_index")
         _replace_dir(saga.root / "index", saga.root / "index.backup")
         _write(
@@ -139,23 +180,23 @@ def build_rag_ingestion_pipeline(
         )
         return documents
 
-    def promote_chunks(value, *, context: object) -> dict[str, Any]:
-        documents = {}
+    def promote_chunks(value: IndexedDocuments, *, context: StepContext) -> PromotedDocuments:
+        documents: PromotedDocuments = {}
         for key, payload in value.items():
             if key in documents:
                 raise ValueError(f"Duplicate document key: {key}")
-            documents[key] = {**payload, "chunks_promoted": True}
+            documents[key] = PromotedDocument(**payload, chunks_promoted=True)
         saga.record("restore_current")
         _replace_dir(saga.root / "current", saga.root / "current.backup")
         _replace_dir(saga.root / "staging", saga.root / "current")
         return documents
 
-    def commit_version(value, *, context: object) -> dict[str, Any]:
-        documents = {}
+    def commit_version(value: PromotedDocuments, *, context: StepContext) -> CommittedDocuments:
+        documents: CommittedDocuments = {}
         for key, payload in value.items():
             if key in documents:
                 raise ValueError(f"Duplicate document key: {key}")
-            documents[key] = {**payload, "status": "committed"}
+            documents[key] = CommittedDocument(**payload, status="committed")
         shutil.copy2(saga.root / "version.json", saga.root / "version.backup.json")
         saga.record("restore_version")
         _write(
@@ -187,7 +228,7 @@ def build_rag_ingestion_pipeline(
 
 def run_rag_ingestion(
     *, state_root: Path | str, workspace_root: Path, fail: bool = False
-) -> Path | str:
+) -> RunResult:
     saga = RagWorkspaceSaga(workspace_root)
     return run(
         durable(build_rag_ingestion_pipeline(saga), "rag-1"),

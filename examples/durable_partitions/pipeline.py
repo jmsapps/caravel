@@ -16,17 +16,61 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, TypedDict
 
-from caravel import JSONDataset, Pipeline, RetryOptions, Stage, Step, run, CommitScope
+from caravel import (
+    CommitScope,
+    JSONDataset,
+    Pipeline,
+    RetryOptions,
+    RunResult,
+    Stage,
+    Step,
+    StepContext,
+    run,
+)
 from caravel.durability import InMemorySource
+from caravel.plugins.api import RunEvent
 
 from ..support import durable
 
 PIPELINE_NAME = "durable_demo"
 
-DOCUMENTS = {
-    f"doc-{index:03d}": {"id": f"doc-{index:03d}", "words": index * 3} for index in range(1, 9)
+
+class Document(TypedDict):
+    """One document this demo starts from."""
+
+    id: str
+    words: int
+
+
+class EnrichedDocument(Document):
+    """A document after the enrich step."""
+
+    enriched: bool
+
+
+class PublishedDocument(TypedDict):
+    """A document after the publish step."""
+
+    id: str
+    words: int
+    published: bool
+
+
+class Summary(TypedDict):
+    """The whole run, summarized."""
+
+    documents: int
+    words: int
+
+
+Documents = dict[str, Document]
+EnrichedDocuments = dict[str, EnrichedDocument]
+PublishedDocuments = dict[str, PublishedDocument]
+
+DOCUMENTS: Documents = {
+    f"doc-{index:03d}": Document(id=f"doc-{index:03d}", words=index * 3) for index in range(1, 9)
 }
 
 # Each document takes this long to process, so committed work is worth keeping.
@@ -37,7 +81,7 @@ def _log(step: str, symbol: str, message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {step:<10} {symbol} {message}", flush=True)
 
 
-def _fail_at(context: Any) -> str:
+def _fail_at(context: StepContext) -> str:
     return str(dict(context.params).get("fail_at", ""))
 
 
@@ -46,7 +90,7 @@ def _fail_at(context: Any) -> str:
 RETRYING_STEP = "publish"
 
 
-def _flaky_until(step: str, context: Any) -> int:
+def _flaky_until(step: str, context: StepContext) -> int:
     if step != RETRYING_STEP:
         return 0
     return int(dict(context.params).get("flaky_attempts", "0") or 0)
@@ -55,7 +99,7 @@ def _flaky_until(step: str, context: Any) -> int:
 _attempts: dict[str, int] = {}
 
 
-def _work(step: str, documents: dict[str, Any], context: Any) -> None:
+def _work(step: str, documents: Mapping[str, object], context: StepContext) -> None:
     """Sleep per document so the cost of recomputing is visible."""
     _log(step, "▶", f"processing {len(documents)} documents")
     for _ in documents:
@@ -73,32 +117,32 @@ def _work(step: str, documents: dict[str, Any], context: Any) -> None:
         raise RuntimeError(f"Injected failure in '{step}'")
 
 
-def enrich(value: Any, *, context: Any) -> Any:
+def enrich(value: Documents, *, context: StepContext) -> EnrichedDocuments:
     """Mark every incoming document as enriched."""
     _work("enrich", value, context)
-    result = {key: {**document, "enriched": True} for key, document in value.items()}
+    result = {key: EnrichedDocument(**document, enriched=True) for key, document in value.items()}
     _log("enrich", "✔", f"enriched {len(result)} documents")
     return result
 
 
-def publish(value: Any, *, context: Any) -> Any:
+def publish(value: EnrichedDocuments, *, context: StepContext) -> PublishedDocuments:
     """Publish every enriched document."""
     _work("publish", value, context)
     result = {
-        key: {"id": document["id"], "words": document["words"], "published": True}
+        key: PublishedDocument(id=document["id"], words=document["words"], published=True)
         for key, document in value.items()
     }
     _log("publish", "✔", f"published {len(result)} documents")
     return result
 
 
-def summarize(value: Any, *, context: Any) -> Any:
+def summarize(value: PublishedDocuments, *, context: StepContext) -> Summary:
     """Summarize the complete published set."""
     _work("summarize", value, context)
-    summary = {
-        "documents": len(value),
-        "words": sum(document["words"] for document in value.values()),
-    }
+    summary = Summary(
+        documents=len(value),
+        words=sum(document["words"] for document in value.values()),
+    )
     _log("summarize", "✔", f"{summary['documents']} documents, {summary['words']} words")
     return summary
 
@@ -116,7 +160,7 @@ class StepLogger:
     def __init__(self) -> None:
         self.started: set[str] = set()
 
-    def on_event(self, event: Any) -> None:
+    def on_event(self, event: RunEvent) -> None:
         if event.node is None:
             return
         if event.kind == "node_started":
@@ -161,7 +205,7 @@ def run_demo(
     commit_scope: CommitScope = "step",
     fail_at: str | None = None,
     flaky_attempts: int = 0,
-) -> Any:
+) -> RunResult:
     """Run the demo once.
 
     Without ``job_id`` the run keeps no recovery database and every step runs

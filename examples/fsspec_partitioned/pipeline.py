@@ -12,9 +12,11 @@ roots.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TypedDict
 
 from caravel import (
+    StepContext,
+    RunResult,
     JSONDataset,
     PartitionedJSONDataset,
     PartitionedTextDataset,
@@ -44,9 +46,41 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx : value.index(end, start_idx)]
 
 
-def bronze_render_html(value, *, context: object) -> dict[str, str]:
+class SourceRecord(TypedDict):
+    """One record as the input partitions supply it."""
+
+    id: str
+    lang: str
+    title: str
+    snippet: str
+
+
+class StructuredRecord(TypedDict):
+    """A bronze HTML partition parsed back into fields."""
+
+    id: str
+    lang: str
+    title: str
+    snippet: str
+    normalized_snippet: str
+
+
+class LanguageSummary(TypedDict):
+    """Record counts per language across the whole run."""
+
+    pipeline: str
+    total_records: int
+    counts_by_language: dict[str, int]
+
+
+SourceRecords = dict[str, SourceRecord]
+RenderedPartitions = dict[str, str]
+StructuredRecords = dict[str, StructuredRecord]
+
+
+def bronze_render_html(value: SourceRecords, *, context: StepContext) -> RenderedPartitions:
     """Render one source record into a deterministic HTML partition."""
-    rendered = {}
+    rendered: RenderedPartitions = {}
     for _key, record in value.items():
         item_id = str(record["id"])
         if item_id in rendered:
@@ -60,36 +94,36 @@ def bronze_render_html(value, *, context: object) -> dict[str, str]:
     return rendered
 
 
-def silver_extract_structured(value, *, context: object) -> dict[str, dict[str, Any]]:
-    """Convert one partition's bronze HTML back into structured records."""
-    structured: dict[str, dict[str, Any]] = {}
+def silver_extract_structured(
+    value: RenderedPartitions, *, context: StepContext
+) -> StructuredRecords:
+    """Convert every bronze HTML partition back into a structured record."""
+    structured: StructuredRecords = {}
     for key, html in sorted(value.items()):
         if key in structured:
             raise ValueError(f"Duplicate record key: {key}")
         snippet = _extract_between(html, "<p>", "</p>")
-        structured[key] = {
-            "id": _extract_between(html, "data-id='", "'"),
-            "lang": _extract_between(html, "data-lang='", "'"),
-            "title": _extract_between(html, "<h1>", "</h1>"),
-            "snippet": snippet,
-            "normalized_snippet": snippet.lower(),
-        }
+        structured[key] = StructuredRecord(
+            id=_extract_between(html, "data-id='", "'"),
+            lang=_extract_between(html, "data-lang='", "'"),
+            title=_extract_between(html, "<h1>", "</h1>"),
+            snippet=snippet,
+            normalized_snippet=snippet.lower(),
+        )
     return structured
 
 
-def gold_summarize(value, *, context: object) -> dict[str, Any]:
-    """Summarize every committed partition behind an all-input barrier."""
-    _ = context
+def gold_summarize(value: StructuredRecords, *, context: StepContext) -> LanguageSummary:
+    """Summarize every structured record by language."""
+    del context
     languages: dict[str, int] = {}
-    total = 0
     for record in value.values():
-        languages[str(record["lang"])] = languages.get(str(record["lang"]), 0) + 1
-        total += 1
-    return {
-        "pipeline": PIPELINE_NAME,
-        "total_records": total,
-        "counts_by_language": dict(sorted(languages.items())),
-    }
+        languages[record["lang"]] = languages.get(record["lang"], 0) + 1
+    return LanguageSummary(
+        pipeline=PIPELINE_NAME,
+        total_records=len(value),
+        counts_by_language=dict(sorted(languages.items())),
+    )
 
 
 def build_fsspec_partitioned_pipeline(
@@ -141,7 +175,7 @@ def run_fsspec_partitioned_pipeline(
     input_dir: Path | str | None = None,
     artifacts_root: str | Path | None = None,
     storage_options: Mapping[str, Any] | None = None,
-) -> Any:
+) -> RunResult:
     """Run the example and return its structured status."""
     pipeline = build_fsspec_partitioned_pipeline(
         input_dir=input_dir, storage_options=storage_options

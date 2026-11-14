@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from caravel import (
+    RunResult,
     JSONDataset,
     Pipeline,
     Stage,
@@ -48,15 +49,30 @@ def make_job_context(context: StepContext) -> JobContext:
     return JobContext(framework=context, job_name=context.pipeline_name.upper())
 
 
-def summarize(value, *, context: JobContext) -> dict[str, Any]:
-    """Aggregate every partition behind an explicit all-input barrier."""
-    records = dict(value)
-    return {
-        "job_name": context.job_name,
-        "count": len(records),
-        "total": sum(int(record["value"]) for record in records.values()),
-        "ids": sorted(records),
-    }
+class SeedRecord(TypedDict):
+    """One record this example starts from."""
+
+    id: str
+    value: int
+
+
+class ContextSummary(TypedDict):
+    """What the application-supplied context contributed."""
+
+    job_name: str
+    count: int
+    total: int
+    ids: list[str]
+
+
+def summarize(value: dict[str, SeedRecord], *, context: JobContext) -> ContextSummary:
+    """Aggregate every record, naming the application context that ran it."""
+    return ContextSummary(
+        job_name=context.job_name,
+        count=len(value),
+        total=sum(int(record["value"]) for record in value.values()),
+        ids=sorted(value),
+    )
 
 
 def build_custom_context_pipeline() -> Pipeline:
@@ -79,7 +95,9 @@ def build_custom_context_pipeline() -> Pipeline:
     )
 
 
-def run_custom_context_pipeline(*, state_root: Path | str, job_id: str = "custom-context-1") -> Any:
+def run_custom_context_pipeline(
+    *, state_root: Path | str, job_id: str = "custom-context-1"
+) -> RunResult:
     """Run the example with an application-supplied context factory."""
     return run(
         durable(build_custom_context_pipeline(), job_id),

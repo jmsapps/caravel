@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from caravel import CommitScope, DurabilityOptions, Pipeline
 
-SCHEMA_VERSION = "v1.0.0"
+SCHEMA_VERSION: Literal["v1.0.0"] = "v1.0.0"
 
 
 def example_data_dir(module_file: str) -> Path:

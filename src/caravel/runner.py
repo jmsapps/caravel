@@ -9,9 +9,12 @@ recomputed.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from .pipeline import Pipeline
+
+if TYPE_CHECKING:
+    from .durability.execution import RunResult
 
 
 def run(
@@ -24,7 +27,7 @@ def run(
     context_factory: Any = None,
     keep_source_tag: bool = False,
     plugins: Sequence[Any] = (),
-) -> Any:
+) -> RunResult:
     """Run ``pipeline`` and return a structured result.
 
     ``output`` is the root generated results are written under; it may be a

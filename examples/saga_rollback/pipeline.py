@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, cast
+from typing import Any, Callable, Mapping, TypedDict, cast
 
 from caravel import (
+    StepContext,
+    RunResult,
     Branch,
     CallableLoader,
     JSONDataset,
@@ -34,9 +36,9 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _params(context: object) -> Mapping[str, str]:
-    params = getattr(context, "params", {})
-    return params if isinstance(params, dict) else {}
+def _params(context: StepContext) -> Mapping[str, str]:
+    """The run-scoped parameters this invocation was given."""
+    return context.params
 
 
 @dataclass
@@ -96,13 +98,52 @@ class SagaTransaction:
         _write_json(self.state_path, state)
 
 
+class Order(TypedDict):
+    """One order as the seed dataset supplies it."""
+
+    order_id: str
+    quantity: int
+    amount: int
+
+
+class ReservedOrder(Order):
+    """An order whose inventory is reserved."""
+
+    inventory_reserved: bool
+
+
+class ChargedOrder(ReservedOrder):
+    """A reserved order whose account is charged."""
+
+    account_charged: bool
+
+
+class ShippedOrder(ChargedOrder):
+    """A charged order with a shipment created."""
+
+    shipment_id: str
+
+
+class CompletedOrder(ShippedOrder):
+    """A shipped order the saga committed."""
+
+    status: str
+
+
+Orders = dict[str, Order]
+ReservedOrders = dict[str, ReservedOrder]
+ChargedOrders = dict[str, ChargedOrder]
+ShippedOrders = dict[str, ShippedOrder]
+CompletedOrders = dict[str, CompletedOrder]
+
+
 def build_saga_pipeline(
     transaction: SagaTransaction, input_path: Path | str | None = None
 ) -> Pipeline:
     seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
 
-    def reserve_inventory(value, *, context: object) -> dict[str, Any]:
-        orders = {}
+    def reserve_inventory(value: Orders, *, context: StepContext) -> ReservedOrders:
+        orders: ReservedOrders = {}
         for _key, order in value.items():
             quantity = int(order["quantity"])
             state = transaction.state()
@@ -110,11 +151,11 @@ def build_saga_pipeline(
                 raise ValueError("Insufficient inventory")
             transaction.update_state(available_inventory=state["available_inventory"] - quantity)
             transaction.record("release_inventory", quantity=quantity)
-            orders[_key] = {**order, "inventory_reserved": True}
+            orders[_key] = ReservedOrder(**order, inventory_reserved=True)
         return orders
 
-    def charge_account(value, *, context: object) -> dict[str, Any]:
-        orders = {}
+    def charge_account(value: ReservedOrders, *, context: StepContext) -> ChargedOrders:
+        orders: ChargedOrders = {}
         for key, order in value.items():
             if key in orders:
                 raise ValueError(f"Duplicate order key: {key}")
@@ -124,11 +165,11 @@ def build_saga_pipeline(
                 raise ValueError("Insufficient account balance")
             transaction.update_state(account_balance=state["account_balance"] - amount)
             transaction.record("refund_account", amount=amount)
-            orders[key] = {**order, "account_charged": True}
+            orders[key] = ChargedOrder(**order, account_charged=True)
         return orders
 
-    def create_shipment(value, *, context: object) -> dict[str, Any]:
-        orders = {}
+    def create_shipment(value: ChargedOrders, *, context: StepContext) -> ShippedOrders:
+        orders: ShippedOrders = {}
         for key, order in value.items():
             if key in orders:
                 raise ValueError(f"Duplicate order key: {key}")
@@ -136,17 +177,17 @@ def build_saga_pipeline(
             state = transaction.state()
             transaction.update_state(shipments=[*state["shipments"], shipment_id])
             transaction.record("cancel_shipment", shipment_id=shipment_id)
-            orders[key] = {**order, "shipment_id": shipment_id}
+            orders[key] = ShippedOrder(**order, shipment_id=shipment_id)
         return orders
 
-    def finalize_order(value, *, context: object) -> dict[str, Any]:
-        orders = {}
+    def finalize_order(value: ShippedOrders, *, context: StepContext) -> CompletedOrders:
+        orders: CompletedOrders = {}
         for key, order in value.items():
             if key in orders:
                 raise ValueError(f"Duplicate order key: {key}")
             if _params(context).get("fail") == "true":
                 raise RuntimeError("Simulated failure after all reversible actions")
-            orders[key] = {**order, "status": "completed"}
+            orders[key] = CompletedOrder(**order, status="completed")
         return orders
 
     steps: list[Step | Branch | Callable[..., Any]] = [
@@ -171,7 +212,7 @@ def run_saga_pipeline(
     state_path: Path,
     journal_path: Path,
     fail: bool = False,
-) -> Any:
+) -> RunResult:
     transaction = SagaTransaction(state_path=state_path, journal_path=journal_path)
     pipeline = build_saga_pipeline(transaction)
     return run(

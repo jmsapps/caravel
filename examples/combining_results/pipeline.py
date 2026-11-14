@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from caravel import (
+    RunResult,
+    StepContext,
     JSONDataset,
     PartitionedJSONDataset,
     Pipeline,
@@ -19,29 +21,51 @@ PIPELINE_NAME = "combining_results_example"
 _DEFAULT_INPUT_PATH = Path(__file__).resolve().parent / "data" / "input_partitions.json"
 
 
-def transform(value, *, context: object) -> dict[str, Any]:
-    """Process each partition independently before combining results."""
-    records = {}
-    for _key, record in value.items():
-        records[_key] = {**record, "normalized": float(record["value"]) / 2.0}
-    return records
+class SeedRecord(TypedDict):
+    """One record as the seed dataset supplies it."""
+
+    id: str
+    value: int
 
 
-def combine_results(value, *, context: object) -> dict[str, Any]:
-    """Read every committed partition and return one combined summary."""
-    records = {}
-    for key, record in value.items():
-        if key in records:
-            raise ValueError(f"Duplicate record key: {key}")
-        records[key] = record
-    ids = sorted(records)
+class NormalizedRecord(SeedRecord):
+    """A seed record after the transform step."""
+
+    normalized: float
+
+
+class Summary(TypedDict):
+    """The combined view of every normalized record."""
+
+    pipeline: str
+    count: int
+    ids: list[str]
+    total_normalized: float
+    records: dict[str, NormalizedRecord]
+
+
+SeedRecords = dict[str, SeedRecord]
+NormalizedRecords = dict[str, NormalizedRecord]
+
+
+def transform(value: SeedRecords, *, context: StepContext) -> NormalizedRecords:
+    """Process every incoming record before combining them."""
     return {
-        "pipeline": PIPELINE_NAME,
-        "count": len(records),
-        "ids": ids,
-        "total_normalized": sum(float(records[key]["normalized"]) for key in ids),
-        "records": {key: records[key] for key in ids},
+        key: NormalizedRecord(**record, normalized=float(record["value"]) / 2.0)
+        for key, record in value.items()
     }
+
+
+def combine_results(value: NormalizedRecords, *, context: StepContext) -> Summary:
+    """Read every normalized record and return one combined summary."""
+    ids = sorted(value)
+    return Summary(
+        pipeline=PIPELINE_NAME,
+        count=len(value),
+        ids=ids,
+        total_normalized=sum(float(value[key]["normalized"]) for key in ids),
+        records={key: value[key] for key in ids},
+    )
 
 
 def build_combining_pipeline(input_path: Path | str | None = None) -> Pipeline:
@@ -61,7 +85,7 @@ def build_combining_pipeline(input_path: Path | str | None = None) -> Pipeline:
 
 def run_combining_pipeline(
     *, state_root: Path | str, job_id: str = "combining-1", input_path: Path | str | None = None
-) -> Any:
+) -> RunResult:
     return run(
         durable(build_combining_pipeline(input_path), job_id),
         output=Path(state_root) / "output",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from caravel import (
+    RunResult,
+    StepContext,
     PartitionedJSONDataset,
     PartitionedTextDataset,
     Pipeline,
@@ -35,9 +37,45 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx:end_idx]
 
 
-def bronze_render_html(value, *, context: object) -> dict[str, str]:
+class SourceRecord(TypedDict):
+    """One record as the input partitions supply it."""
+
+    id: str
+    lang: str
+    title: str
+    snippet: str
+
+
+class StructuredRecord(TypedDict):
+    """A bronze HTML partition parsed back into fields."""
+
+    id: str
+    lang: str
+    title: str
+    snippet: str
+    normalized_snippet: str
+    source_key: str
+
+
+class GoldRecord(TypedDict):
+    """A structured record keyed by language and id."""
+
+    id: str
+    lang: str
+    title: str
+    normalized_snippet: str
+    origin_partition: str
+
+
+SourceRecords = dict[str, SourceRecord]
+RenderedPartitions = dict[str, str]
+StructuredRecords = dict[str, StructuredRecord]
+GoldRecords = dict[str, GoldRecord]
+
+
+def bronze_render_html(value: SourceRecords, *, context: StepContext) -> RenderedPartitions:
     """Render one source record into a deterministic HTML partition."""
-    rendered = {}
+    rendered: RenderedPartitions = {}
     for _key, record in value.items():
         item_id = str(record["id"])
         if item_id in rendered:
@@ -51,45 +89,47 @@ def bronze_render_html(value, *, context: object) -> dict[str, str]:
     return rendered
 
 
-def silver_extract_structured(value, *, context: object) -> dict[str, dict[str, Any]]:
-    """Convert one partition's bronze HTML back into a structured record."""
-    structured: dict[str, dict[str, Any]] = {}
+def silver_extract_structured(
+    value: RenderedPartitions, *, context: StepContext
+) -> StructuredRecords:
+    """Convert every bronze HTML partition back into a structured record."""
+    structured: StructuredRecords = {}
     for key, html in sorted(value.items()):
         if key in structured:
             raise ValueError(f"Duplicate record key: {key}")
         snippet = _extract_between(html, "<p>", "</p>")
-        structured[key] = {
-            "id": _extract_between(html, "data-id='", "'"),
-            "lang": _extract_between(html, "data-lang='", "'"),
-            "title": _extract_between(html, "<h1>", "</h1>"),
-            "snippet": snippet,
-            "normalized_snippet": snippet.lower(),
-            "source_key": key,
-        }
+        structured[key] = StructuredRecord(
+            id=_extract_between(html, "data-id='", "'"),
+            lang=_extract_between(html, "data-lang='", "'"),
+            title=_extract_between(html, "<h1>", "</h1>"),
+            snippet=snippet,
+            normalized_snippet=snippet.lower(),
+            source_key=key,
+        )
     return structured
 
 
-def gold_partition_by_language(value, *, context: object) -> dict[str, dict[str, Any]]:
+def gold_partition_by_language(value: StructuredRecords, *, context: StepContext) -> GoldRecords:
     """Emit path-style keys (`<lang>/<id>`) to prove nested storage keys.
 
     These are *storage* partition keys inside one payload. They occupy a
     different namespace from execution partition identity, which the engine
     keeps stable across steps.
     """
-    repartitioned: dict[str, dict[str, Any]] = {}
+    repartitioned: GoldRecords = {}
     for key, record in sorted(value.items()):
         lang = str(record["lang"])
         item_id = str(record["id"])
         output_key = f"{lang}/{item_id}"
         if output_key in repartitioned:
             raise ValueError(f"Duplicate record key: {output_key}")
-        repartitioned[output_key] = {
-            "id": item_id,
-            "lang": lang,
-            "title": record["title"],
-            "normalized_snippet": record["normalized_snippet"],
-            "origin_partition": key,
-        }
+        repartitioned[output_key] = GoldRecord(
+            id=item_id,
+            lang=lang,
+            title=record["title"],
+            normalized_snippet=record["normalized_snippet"],
+            origin_partition=key,
+        )
     return repartitioned
 
 
@@ -127,7 +167,7 @@ def run_partitioned_pipeline(
     state_root: Path | str,
     job_id: str = "partitioned-1",
     input_dir: Path | str | None = None,
-) -> Any:
+) -> RunResult:
     """Run the partitioned example and return its structured status."""
     pipeline = build_partitioned_pipeline(input_dir=input_dir)
     return run(durable(pipeline, job_id), output=Path(state_root) / "output")

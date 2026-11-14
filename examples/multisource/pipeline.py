@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from caravel import (
+    StepContext,
+    RunResult,
     Step,
     SOURCE_FIELD,
     JSONDataset,
@@ -49,7 +51,15 @@ def make_multisource_loader(
     )
 
 
-def summarize_by_source(value, *, context: object) -> dict[str, Any]:
+class SourceSummary(TypedDict):
+    """Counts of records seen per source tag."""
+
+    pipeline: str
+    total_records: int
+    counts_by_source: dict[str, int]
+
+
+def summarize_by_source(value: dict[str, Any], *, context: StepContext) -> SourceSummary:
     """Count records by source tag behind an explicit all-input barrier.
 
     ``MultiSourceLoader`` still tags every record with ``__source__``. Durable
@@ -108,7 +118,7 @@ def run_multisource_pipeline(
     job_id: str = "multisource-1",
     source_a_dir: Path | str | None = None,
     source_b_dir: Path | str | None = None,
-) -> Any:
+) -> RunResult:
     """Run the multisource example and return its structured status."""
     pipeline = build_multisource_pipeline(source_a_dir=source_a_dir, source_b_dir=source_b_dir)
     return run(durable(pipeline, job_id), output=Path(state_root) / "output")

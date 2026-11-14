@@ -73,7 +73,7 @@ select = ["E4", "E7", "E9", "F"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src/caravel"]
+files = ["src/caravel", "examples"]
 
 # fsspec does not currently publish a py.typed marker. Remove this override
 # when its public interfaces become typed.
