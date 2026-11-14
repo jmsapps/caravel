@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any
 
 from caravel import (
-    DurableStorage,
     Branch,
     MultiSourceLoader,
     PartitionedJSONDataset,
@@ -14,6 +13,8 @@ from caravel import (
     Step,
     run,
 )
+
+from ..support import durable
 
 PIPELINE_NAME = "branching_example"
 
@@ -67,11 +68,37 @@ def make_branching_loader(
     )
 
 
-def bronze_normalize_json_source(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+def make_source_loader(
+    source_name: str,
+    *,
+    json_source_dir: Path | str | None = None,
+    html_source_dir: Path | str | None = None,
+) -> MultiSourceLoader:
+    """Build a loader over one source, tagged the same way as the pair.
+
+    A branch chooses one route for the value it receives, so each source is its
+    own job. Tagging stays identical, which is what lets the same declaration
+    serve both.
+    """
+    resolved_json = (
+        Path(json_source_dir) if json_source_dir is not None else _DEFAULT_JSON_SOURCE_DIR
+    )
+    resolved_html = (
+        Path(html_source_dir) if html_source_dir is not None else _DEFAULT_HTML_SOURCE_DIR
+    )
+    datasets = {
+        JSON_SOURCE_NAME: PartitionedJSONDataset(name=JSON_SOURCE_NAME, path=resolved_json),
+        HTML_SOURCE_NAME: PartitionedTextDataset(
+            name=HTML_SOURCE_NAME, path=resolved_html, suffix=".html"
+        ),
+    }
+    return MultiSourceLoader([datasets[source_name]])
+
+
+def bronze_normalize_json_source(value, *, context: object) -> dict[str, dict[str, Any]]:
     """Normalize one JSON-sourced record. Runs only for partitions routed here."""
     records = {}
-    for partition in inputs.partitions():
-        record = partition.load()
+    for _key, record in value.items():
         payload = record.get("content", record)
         item_id = str(payload["id"])
         if item_id in records:
@@ -86,11 +113,10 @@ def bronze_normalize_json_source(inputs, *, context: object) -> dict[str, dict[s
     return records
 
 
-def bronze_normalize_html_source(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+def bronze_normalize_html_source(value, *, context: object) -> dict[str, dict[str, Any]]:
     """Normalize one HTML-sourced record. Runs only for partitions routed here."""
     records = {}
-    for partition in inputs.partitions():
-        record = partition.load()
+    for _key, record in value.items():
         html = record.get("content", record)
         if not isinstance(html, str):
             raise TypeError(f"Expected HTML text, got {type(html).__name__}.")
@@ -107,47 +133,46 @@ def bronze_normalize_html_source(inputs, *, context: object) -> dict[str, dict[s
     return records
 
 
-def silver_unify_records(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+def silver_unify_records(value, *, context: object) -> dict[str, dict[str, Any]]:
     """Unify the available normalized records."""
     unified: dict[str, dict[str, Any]] = {}
-    for partition in inputs.partitions():
-        for key, record in sorted(partition.load().items()):
-            if key in unified:
-                raise ValueError(f"Duplicate record key: {key}")
-            unified[key] = {**record, "unified": True}
+    for key, record in sorted(value.items()):
+        if key in unified:
+            raise ValueError(f"Duplicate record key: {key}")
+        unified[key] = {**record, "unified": True}
     return unified
 
 
-def bronze_converged_records(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+def bronze_converged_records(value, *, context: object) -> dict[str, dict[str, Any]]:
     """Collect available converged records without changing their keys."""
     unified: dict[str, dict[str, Any]] = {}
-    for partition in inputs.partitions():
-        for key, record in sorted(partition.load().items()):
-            if key in unified:
-                raise ValueError(f"Duplicate record key: {key}")
-            unified[key] = {**record, "unified": True}
+    for key, record in sorted(value.items()):
+        if key in unified:
+            raise ValueError(f"Duplicate record key: {key}")
+        unified[key] = {**record, "unified": True}
     return unified
 
 
-def gold_partition_by_language(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+def gold_partition_by_language(value, *, context: object) -> dict[str, dict[str, Any]]:
     """Key available records by language, under either input scope."""
     unified: dict[str, dict[str, Any]] = {}
-    for partition in inputs.partitions():
-        for record in partition.load().values():
-            key = f"{record['lang']}/{record['id']}"
-            if key in unified:
-                raise ValueError(f"Duplicate record key: {key}")
-            unified[key] = {**record, "unified": True}
+    for record in value.values():
+        key = f"{record['lang']}/{record['id']}"
+        if key in unified:
+            raise ValueError(f"Duplicate record key: {key}")
+        unified[key] = {**record, "unified": True}
     return unified
 
 
 def build_branching_pipeline(
     *,
+    source_name: str = JSON_SOURCE_NAME,
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
 ) -> Pipeline:
-    """Build the synthetic branching pipeline declaration."""
-    loader = make_branching_loader(
+    """Build the synthetic branching pipeline declaration for one source."""
+    loader = make_source_loader(
+        source_name,
         json_source_dir=json_source_dir,
         html_source_dir=html_source_dir,
     )
@@ -188,18 +213,20 @@ def run_branching_pipeline(
     *,
     state_root: Path | str,
     job_id: str = "branching-1",
+    source_name: str = JSON_SOURCE_NAME,
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
 ) -> Any:
-    """Run the branching example and return its structured status."""
+    """Run the branching example for one source and return its result."""
     pipeline = build_branching_pipeline(
-        json_source_dir=json_source_dir, html_source_dir=html_source_dir
+        source_name=source_name,
+        json_source_dir=json_source_dir,
+        html_source_dir=html_source_dir,
     )
     return run(
-        pipeline,
-        job_id=job_id,
+        durable(pipeline, job_id),
+        output=Path(state_root) / "output" / source_name,
         source=pipeline.source,
-        storage=DurableStorage.at(Path(state_root) / "output"),
     )
 
 

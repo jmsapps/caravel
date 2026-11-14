@@ -29,8 +29,6 @@ EventKind = Literal[
     "run_started",
     "node_started",
     "node_completed",
-    "node_failed",
-    "node_skipped",
     "run_completed",
     "run_failed",
 ]
@@ -59,7 +57,7 @@ class RunFacts:
 
 @dataclass(frozen=True)
 class NodeFacts:
-    """Immutable facts describing one partition-step work unit."""
+    """Immutable facts describing one Step."""
 
     node_id: str
     partition_id: str
@@ -67,7 +65,6 @@ class NodeFacts:
     stage_name: str
     entry_index: int
     name: str
-    input_scope: str
     dataset_type: str
     dataset_name: str
 
@@ -76,7 +73,7 @@ class NodeFacts:
 class RunOutcome:
     """Terminal outcome facts handed to run guards at exit."""
 
-    status: Literal["completed", "yielded", "caught_up", "failed"]
+    status: Literal["completed", "failed"]
     error_type: str | None = None
 
 

@@ -27,7 +27,7 @@ Run the commit path with:
 python -m examples.rag_ingestion_saga --succeed
 ```
 
-Inspect `data/output/rag_ingestion_saga/external_workspace`. Pipeline step
+Inspect `examples/rag_ingestion_saga/data/external_workspace`. Pipeline step
 outputs remain under the adjacent `pipeline/` directory as execution history.
 
 This is a saga, not an ACID transaction. The local index backup demonstrates a

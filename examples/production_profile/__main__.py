@@ -8,6 +8,8 @@ from examples.fsspec_minimal.pipeline import build_fsspec_pipeline
 
 from .profile import build_production_plugins, storage_options_for_url
 
+from ..support import example_output
+
 
 def main() -> int:
     metadata_root = os.getenv("CARAVEL_METADATA_ROOT", "").strip()
@@ -25,7 +27,9 @@ def main() -> int:
         metadata_root,
         storage_options=storage_options_for_url(metadata_root),
     )
-    return make_cli(pipeline, source=pipeline.source, plugins=plugins)()
+    return make_cli(
+        pipeline, source=pipeline.source, plugins=plugins, default_output=example_output(__file__)
+    )()
 
 
 if __name__ == "__main__":

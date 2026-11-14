@@ -8,7 +8,6 @@ from typing import Any, Callable, Mapping, cast
 from caravel import (
     Branch,
     CallableLoader,
-    DurableStorage,
     JSONDataset,
     Pipeline,
     Stage,
@@ -16,6 +15,9 @@ from caravel import (
     run,
 )
 from caravel.plugins import RunFacts, RunOutcome
+
+from ..support import durable
+
 
 PIPELINE_NAME = "saga_rollback_example"
 STAGE_NAME = "fulfillment"
@@ -99,63 +101,59 @@ def build_saga_pipeline(
 ) -> Pipeline:
     seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
 
-    def reserve_inventory(inputs, *, context: object) -> dict[str, Any]:
+    def reserve_inventory(value, *, context: object) -> dict[str, Any]:
         orders = {}
-        for partition in inputs.partitions():
-            order = partition.load()
+        for _key, order in value.items():
             quantity = int(order["quantity"])
             state = transaction.state()
             if state["available_inventory"] < quantity:
                 raise ValueError("Insufficient inventory")
             transaction.update_state(available_inventory=state["available_inventory"] - quantity)
             transaction.record("release_inventory", quantity=quantity)
-            orders[partition.partition_id] = {**order, "inventory_reserved": True}
+            orders[_key] = {**order, "inventory_reserved": True}
         return orders
 
-    def charge_account(inputs, *, context: object) -> dict[str, Any]:
+    def charge_account(value, *, context: object) -> dict[str, Any]:
         orders = {}
-        for partition in inputs.partitions():
-            for key, order in partition.load().items():
-                if key in orders:
-                    raise ValueError(f"Duplicate order key: {key}")
-                amount = int(order["amount"])
-                state = transaction.state()
-                if state["account_balance"] < amount:
-                    raise ValueError("Insufficient account balance")
-                transaction.update_state(account_balance=state["account_balance"] - amount)
-                transaction.record("refund_account", amount=amount)
-                orders[key] = {**order, "account_charged": True}
+        for key, order in value.items():
+            if key in orders:
+                raise ValueError(f"Duplicate order key: {key}")
+            amount = int(order["amount"])
+            state = transaction.state()
+            if state["account_balance"] < amount:
+                raise ValueError("Insufficient account balance")
+            transaction.update_state(account_balance=state["account_balance"] - amount)
+            transaction.record("refund_account", amount=amount)
+            orders[key] = {**order, "account_charged": True}
         return orders
 
-    def create_shipment(inputs, *, context: object) -> dict[str, Any]:
+    def create_shipment(value, *, context: object) -> dict[str, Any]:
         orders = {}
-        for partition in inputs.partitions():
-            for key, order in partition.load().items():
-                if key in orders:
-                    raise ValueError(f"Duplicate order key: {key}")
-                shipment_id = f"shipment-{order['order_id']}"
-                state = transaction.state()
-                transaction.update_state(shipments=[*state["shipments"], shipment_id])
-                transaction.record("cancel_shipment", shipment_id=shipment_id)
-                orders[key] = {**order, "shipment_id": shipment_id}
+        for key, order in value.items():
+            if key in orders:
+                raise ValueError(f"Duplicate order key: {key}")
+            shipment_id = f"shipment-{order['order_id']}"
+            state = transaction.state()
+            transaction.update_state(shipments=[*state["shipments"], shipment_id])
+            transaction.record("cancel_shipment", shipment_id=shipment_id)
+            orders[key] = {**order, "shipment_id": shipment_id}
         return orders
 
-    def finalize_order(inputs, *, context: object) -> dict[str, Any]:
+    def finalize_order(value, *, context: object) -> dict[str, Any]:
         orders = {}
-        for partition in inputs.partitions():
-            for key, order in partition.load().items():
-                if key in orders:
-                    raise ValueError(f"Duplicate order key: {key}")
-                if _params(context).get("fail") == "true":
-                    raise RuntimeError("Simulated failure after all reversible actions")
-                orders[key] = {**order, "status": "completed"}
+        for key, order in value.items():
+            if key in orders:
+                raise ValueError(f"Duplicate order key: {key}")
+            if _params(context).get("fail") == "true":
+                raise RuntimeError("Simulated failure after all reversible actions")
+            orders[key] = {**order, "status": "completed"}
         return orders
 
     steps: list[Step | Branch | Callable[..., Any]] = [
-        Step(reserve_inventory, JSONDataset(), name="reserve_inventory", revision="2"),
-        Step(charge_account, JSONDataset(), name="charge_account", revision="2"),
-        Step(create_shipment, JSONDataset(), name="create_shipment", revision="2"),
-        Step(finalize_order, JSONDataset(), name="finalize_order", revision="2"),
+        Step(reserve_inventory, JSONDataset(), name="reserve_inventory"),
+        Step(charge_account, JSONDataset(), name="charge_account"),
+        Step(create_shipment, JSONDataset(), name="create_shipment"),
+        Step(finalize_order, JSONDataset(), name="finalize_order"),
     ]
 
     # One order is one execution partition: the whole document is the
@@ -177,9 +175,8 @@ def run_saga_pipeline(
     transaction = SagaTransaction(state_path=state_path, journal_path=journal_path)
     pipeline = build_saga_pipeline(transaction)
     return run(
-        pipeline,
-        job_id="saga-1",
-        storage=DurableStorage.at(Path(state_root) / "output"),
+        durable(pipeline, "saga-1"),
+        output=Path(state_root) / "output",
         params={"fail": "true"} if fail else None,
         plugins=[transaction],
     )

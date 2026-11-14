@@ -51,7 +51,6 @@ _EVENT_KINDS = frozenset(
     }
 )
 
-_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CREATED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 
 _EVENT_FIELDS = frozenset(
@@ -70,9 +69,9 @@ _EVENT_FIELDS = frozenset(
     }
 )
 
-# Exactly the fields of one NodeFacts record. Durable execution identifies work
-# by node and partition under a declared input scope; it has no step directory,
-# no per-node persist switch, and no route key on the fact itself.
+# Exactly the fields of one NodeFacts record. Durable execution identifies a
+# Step by its declared identity; a fact carries no step directory, no persist
+# switch, and no route key.
 _NODE_FIELDS = frozenset(
     {
         "node_id",
@@ -81,7 +80,6 @@ _NODE_FIELDS = frozenset(
         "stage_name",
         "entry_index",
         "name",
-        "input_scope",
         "dataset_type",
         "dataset_name",
     }
@@ -134,8 +132,8 @@ def validate_run_event(payload: object) -> dict[str, Any]:
         raise ValueError(f"Run event fields invalid; unknown={unknown} missing={missing}.")
 
     run_id = payload["run_id"]
-    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
-        raise ValueError("Run event run_id must be lowercase UUID4 hex.")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("Run event run_id must be a non-empty string.")
 
     pipeline = payload["pipeline"]
     if not isinstance(pipeline, str) or not pipeline:
@@ -323,7 +321,6 @@ class RunEvidencePlugin:
                 "entry_index": event.node.entry_index,
                 "name": event.node.name,
                 "partition_id": event.node.partition_id,
-                "input_scope": event.node.input_scope,
                 "dataset_type": event.node.dataset_type,
                 "dataset_name": event.node.dataset_name,
             }

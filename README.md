@@ -68,46 +68,34 @@ python3 -m mypy src/caravel
 ## Core Declaration Pattern
 
 A pipeline is a name and ordered stages. A step's function is **ordinary
-processing code**: it receives one `StepInputs` object and the runtime context,
-and only the durable engine ever calls it. `input_scope` on the `Step` declares
-whether it runs once per partition or once as an aggregate barrier.
+processing code**: it receives the complete value the previous step produced
+and the runtime context, and returns its own complete result.
 
 ```python
-from caravel import DurableStorage, InMemorySource, Pipeline, Stage, Step, run
+from caravel import DurabilityOptions, InMemorySource, Pipeline, Stage, Step, run
 
-def load(inputs, *, context):
-    records = {}
-    for partition in inputs.partitions():
-        records[partition.partition_id] = {**partition.load(), "loaded": True}
-    return records
+def load(value, *, context):
+    return {key: {**record, "loaded": True} for key, record in value.items()}
 
-def enrich(inputs, *, context):
-    records = {}
-    for partition in inputs.partitions():
-        for key, record in partition.load().items():
-            if key in records:
-                raise ValueError(f"Duplicate record key: {key}")
-            records[key] = {**record, "enriched": True}
-    return records
+def enrich(value, *, context):
+    return {key: {**record, "enriched": True} for key, record in value.items()}
 
-def summarize(inputs, *, context):
-    # Handles load on demand, so a barrier over a large job stays bounded.
-    return {"documents": sum(len(partition.load()) for partition in inputs.partitions())}
+def summarize(value, *, context):
+    return {"documents": len(value)}
 
 pipeline = Pipeline(
     name="documents",
     stages=[
         Stage(name="prepare", entries=[Step(load), Step(enrich)]),
-        Stage(name="summary", entries=[Step(summarize, input_scope="all")]),
+        Stage(name="summary", entries=[Step(summarize)]),
     ],
+    source=InMemorySource({"doc-1": {...}, "doc-2": {...}}),
+    durability_options=DurabilityOptions(
+        schema_version="v1.0.0", job_id="snapshot-2026-11-12", commit_scope="step"
+    ),
 )
 
-result = run(
-    pipeline,
-    job_id="snapshot-2026-11-12",
-    source=InMemorySource({"doc-1": {...}, "doc-2": {...}}),
-    storage=DurableStorage.at("state/"),
-)
+result = run(pipeline, output="data/documents/output")
 ```
 
 `Step(load)` is complete: its output defaults to a JSON dataset named for the
@@ -115,232 +103,101 @@ processor. No loader stub and no dataset are required.
 
 ### One execution model
 
-There is one engine, reached through `run()`. There is no `durable=True` and no
-second entry point: batching, retries, storage, and concurrency all configure
-the same model. A step runs once per partition unless it declares
-`input_scope="all"`.
+There is one engine, reached through `run()`. Steps run in declaration order,
+each over the complete value its predecessor returned. Iteration, batching,
+parallel calls, and API limits inside a step are ordinary code you write.
 
-Scope is compiled from the declaration, before source discovery and before any
-durable mutation. No processor runs during planning, and nothing about a
-processor's signature, name, annotations, or return value selects an execution
-mode. The same function can therefore be declared under either scope: scope
-changes readiness and which handles the processor receives, never the type of
-what it is handed.
+Nothing about a processor's signature, name, annotations, or return value
+selects an execution mode. The declaration decides what runs and in what order,
+before any processor is called.
 
-### One input interface, in every scope
+### One value per step
 
-Both scopes pass the same `StepInputs` class, yielding the same `InputPartition`
-handles:
+A processor is called `fn(value, context=...)`. The first step receives what the
+source loaded; every later step receives what the step before it returned.
+A dataset decides how that value is written and read back, so a partitioned
+dataset's value is a complete keyed mapping.
 
-| Member | Meaning |
+### Durability is a declaration
+
+`durability_options` on the `Pipeline` is what makes a run durable.
+
+| Field | Meaning |
 | --- | --- |
-| `inputs.partitions()` | a fresh iterator of handles; payloads load on demand |
-| `inputs.batch_id` | the durable batch this call commits |
-| `len(inputs)`, `inputs.is_empty` | how many handles this batch holds |
-| `partition.partition_id` | the input's declared identity |
-| `partition.batch_id`, `partition.count` | its durable batch and record count |
-| `partition.load()` | its payload, in the dataset-defined type |
+| `schema_version` | The storage format this declaration was written against. `"v1.0.0"`. |
+| `job_id` | The identity this run resumes under. You supply it; Caravel never derives one. |
+| `commit_scope` | When transactions commit: `"pipeline"` (default), `"stage"`, or `"step"`. |
 
-Under `input_scope="partition"` there is exactly one handle: the unit's own
-input, or one batch of it. Under `input_scope="all"` there is one handle per
-required upstream commit. An aggregate-derived handle carries the upstream
-step's declared output name, so the private aggregate execution ID never
-reaches a key your processor produces.
+Supplying the options adds the recovery database, executor ownership,
+snapshots, status rows, and transactions. Omitting them runs the same
+processors with the same retry controls, in memory.
 
-### Storage is an explicit decision
+```python
+Pipeline(..., durability_options=DurabilityOptions(
+    schema_version="v1.0.0", job_id="snapshot-1", commit_scope="step"
+))
+```
 
-`run()` requires `storage` and never defaults it, because durability is the one
-thing a caller must not get by accident.
+Reopening a job restores every committed step and runs only what is left. A new
+job id starts fresh, and one pipeline database holds many job ids
+independently.
 
-| Choice | Meaning |
-| --- | --- |
-| `DurableStorage.at(path)` | Authoritative state under `path`, surviving invocations. Requires an explicit `job_id`. `result.restart_safe` is `True`. |
-| `DurableStorage.at(path, artifacts_root="s3://bucket/run")` | Same, with committed artifacts in object storage. The authoritative store stays local. |
-| `DurableStorage.ephemeral()` | Explicit opt-out. Same state machine and same commit rules — only the persistence guarantee is lost. `job_id` is optional and `result.restart_safe` is `False`. |
+[`examples/durable_partitions`](examples/durable_partitions/README.md) is a
+runnable demo: it sleeps and logs per step, takes `--fail-at` to interrupt a
+run, and shows committed steps being restored on the next one.
 
 ### Reading output
 
-Two surfaces, for two jobs.
+`run()` returns a result describing what the invocation did and where each step
+wrote:
 
-**Readable files.** `DurableStorage.at(output)` publishes results named after
-the declaration. Execution is durable by default, and recovery storage lives in
-`.caravel` beside the output:
+```python
+result = run(pipeline, output="data/documents/output")
+
+result.pipeline_name    # "documents"
+result.job_id           # "snapshot-2026-11-12", or None without durability options
+result.output_root      # where generated output goes
+result.steps_executed   # steps whose processors ran
+result.steps_restored   # steps restored from committed snapshots
+result.outputs          # {step name: the directory its dataset wrote}
+
+JSONDataset().load_from(result.outputs["summarize"])
+```
+
+Generated output is written through the declared dataset, under a directory per
+stage and step. The recovery database lives in `.caravel` beside the output
+root:
 
 ```text
-data/minimal_example/
+data/documents/
 ├── .caravel/             reserved execution storage — do not write here
-│   ├── state.sqlite3     authoritative progress store
-│   └── attempts/...      immutable attempt artifacts
+│   ├── state.sqlite3     runs, stages, steps, and their snapshots
+│   └── owner.sqlite3     executor ownership
 └── output/
-    └── customer-42/documents/snapshot-2026-11-12/
-        ├── 001-prepare/001-load/doc-1/doc-1.json
-        ├── 002-publish/001-sync_index/doc-1/doc-1.json
-        └── _job.json     completion snapshot (advisory — see below)
+    ├── _001_prepare/_001_load/load.json
+    ├── _001_prepare/_002_enrich/enrich.json
+    └── _002_summary/_001_summarize/summarize.json
 ```
 
 `.caravel/` is **reserved execution storage** required for recovery: deleting it
 loses the ability to resume a job, and nothing but Caravel may write there. It
 must be a local filesystem path. Configurations where it would sit inside the
-output directory, or vice versa, are rejected — publishing or rebuilding must
-never be able to destroy authoritative state.
+output directory, or vice versa, are rejected, so writing output can never
+destroy authoritative state.
 
-A hierarchical `pipeline_id` such as `customer-42/documents` becomes nested
-directories. Each partition gets its own directory, so ownership is exact:
-`doc` and `doc.other` are different partitions and retiring one never touches
-the other. Partitioned datasets keep their internal paths, so `en/record_1`
-publishes to `en/record_1.json` rather than colliding with the French one.
+SQLite is the recovery authority. Deleting generated output costs nothing:
+reopening the job regenerates it from committed snapshots without rerunning a
+processor.
 
 ```python
-DurableStorage.at("exports/output")                                  # state beside it
-DurableStorage.at("exports/output", state="/persistent/.caravel")    # explicit
-DurableStorage.at("s3://bucket/output", state="data/docs/.caravel")  # remote output
-DurableStorage.ephemeral("exports/output")                           # results still kept
+run(pipeline, output="exports/output")                              # state beside it
+run(pipeline, output="exports/output", state="/persistent/.caravel")  # explicit
+run(pipeline, output="s3://bucket/output", state="data/docs/.caravel")  # remote output
 ```
 
-Remote output cannot host the progress store, so pass `state` explicitly for it;
-the CLI falls back to `data/<pipeline-name>/.caravel`. `ephemeral` makes only
-the *recovery* storage throwaway — published results stay at the same place a
-durable run would put them, and closing the storage never deletes them.
+Remote output cannot host the recovery database, so pass `state` explicitly for
+it; the CLI falls back to `data/<pipeline-name>/.caravel`.
 
-**Manifest-aware access**, which is the authority:
-
-```python
-storage = DurableStorage.at("state/")
-results = storage.results(pipeline, job_id="snapshot-2026-11-12")
-results.of("enrich")        # {logical output id: payload}
-results.feed("enrich")      # a bounded, ordered consumer feed
-```
-
-Output is addressed by **logical identity**, never by execution identity. A
-per-partition step keys on each source partition's own id. A step declaring
-`input_scope="all"` runs as one work unit on a reserved aggregate partition, but
-that id is private scheduling and recovery state: its output is addressed by
-the step's declared dataset name, which defaults to the declared step name.
-
-```python
-Step(summarize, input_scope="all", output=JSONDataset(name="summary"))
-# results.of("summarize")          -> {"summary": {...}}
-# published                        -> <stage>/<step>/summary/summary.json
-
-Step(summarize, input_scope="all")  # no dataset name declared
-# results.of("summarize")          -> {"summarize": {...}}
-```
-
-`input_scope="all"` chooses input availability and readiness. It does not choose
-an output name, merge payloads, or repartition: a processor returning a
-partitioned payload keeps its returned keys inside that one logical result, and
-partition-scope steps downstream of a barrier publish under their own
-declarations.
-
-The published tree is a *projection* of committed state, never a second source
-of truth. Publication progress lives in the progress store, so the two cannot
-drift; deleting the tree loses nothing, and it is rebuilt from the manifest.
-
-A partition appears as soon as it seals, so output is readable while the job
-runs.
-
-**Three reader contracts, deliberately distinct.**
-
-| Contract | Use | Guarantee |
-| --- | --- | --- |
-| Authoritative | `storage.results(...)`, `.published(step)` | Always correct. Reads through committed metadata. |
-| Progressive physical | the output tree during a run | Partitions appear as they seal. Superseded generations may still be present; never infer "current" from a directory listing. |
-| Whole-job snapshot | `_job.json` | Names the exact file for every logical output at the moment it was written. **Advisory**: presence is not proof of completion. |
-
-**Why concurrent publishers are safe.** Each generation of a logical output
-publishes to its own write-once location (`doc-1.json`, then `doc-1@g1.json`).
-A publisher that stalls across a recomputation writes its own generation's
-files and can never overwrite a newer generation's, whenever it resumes and
-however it is interrupted. Write-once holds *within* a generation too: a second
-publisher of the same generation leaves the existing files untouched rather
-than rewriting them, and an explicit rebuild swaps through a temporary name, so
-no reader ever sees a truncated file.
-
-**Retention is a policy, and generations are retained by default.** A manifest
-names specific generations, so deleting one breaks a reader holding it.
-Pruning is therefore opt-in:
-
-```python
-DurableStorage.at("exports/output")                      # retain every generation
-DurableStorage.at("exports/output", keep_superseded=1)   # keep the previous one
-DurableStorage.at("exports/output", keep_superseded=0)   # keep only the current
-```
-
-Pruning preserves the current generation and other partitions. Invalidation
-cleanup is bounded by the old generations captured in its transaction, preserving
-output published by a concurrent recomputation.
-
-**The completion marker is advisory, and the store is the authority.**
-`_job.json` is written last, only once every sealed unit is materialized, and
-withdrawn if the job generation moved while it was being written. Invalidation
-removes it on both sides of its commit. All of that is best effort: a publisher
-that dies between writing the file and re-reading the job leaves a stale marker
-behind, and no file-only protocol can prevent it.
-
-So **the marker existing never means a job completed.** Turn it into a
-metadata guarantee with `validate_job_manifest(manifest, store)`, or ask the store
-directly. Validation compares identities, generations, completeness, and recorded
-file references in one transactional snapshot. It establishes currency at that
-instant; external deletion or corruption requires `storage.rebuild_output(...)`.
-
-Stores created before publication-reference tracking reject validation for units
-without recorded file references. Run `storage.rebuild_output(...)` once to record
-their references and regenerate the marker.
-
-```python
-from caravel.durability import read_job_manifest, validate_job_manifest
-
-manifest = read_job_manifest("exports/output", "customer-42/documents", "snapshot-1")
-if manifest is not None and not validate_job_manifest(manifest, storage.progress):
-    ...   # the job is complete and this snapshot is current
-```
-
-A reader with no store access gets a consistent snapshot of some past moment.
-That is genuinely weaker, and it is the strongest thing a file-only reader can
-have.
-
-Promotion is a rename on a local filesystem. On an object store there is no
-atomic directory swap, so a reader can observe a partially promoted partition.
-
-Recomputation replaces the logical current result: `storage.invalidate(...)`
-removes the completion marker first, then commits, then clears that step's
-published output. The next run writes the new generation, and a generation
-producing fewer files leaves none of the old ones behind.
-
-To repair a published tree that was deleted or edited outside Caravel, use
-`storage.rebuild_output(pipeline, job_id=...)`. Ordinary publication will not
-do this: the store correctly believes those units are already published.
-
-## Dataset Quick Reference
-
-| Dataset                   | Typical payload                | Writes                                 |
-| ------------------------- | ------------------------------ | -------------------------------------- |
-| `JSONDataset`             | Any JSON-serializable object   | Single JSON file in step folder        |
-| `PartitionedJSONDataset`  | `dict[str, JSON-serializable]` | One JSON file per partition key        |
-| `TextDataset`             | `str`                          | Single text file (configurable suffix) |
-| `PartitionedTextDataset`  | `dict[str, str]`               | One text file per partition key        |
-| `BytesDataset`            | `bytes`                        | Single binary file                     |
-| `PartitionedBytesDataset` | `dict[str, bytes]`             | One binary file per partition key      |
-
-Partitioned datasets reject empty mappings by default. Set `allow_empty=True`
-when an empty result is valid:
-
-```python
-output = PartitionedJSONDataset(name="optional_records", allow_empty=True)
-```
-
-Dataset output directories are data-only; Caravel writes no sentinel or
-control files next to your data. An allowed empty output is simply an empty
-step directory, and on object stores without durable empty directories it
-leaves no loadable artifact — durable empty-output evidence is a
-checkpoint-plugin concern. With the default `allow_empty=False`, saving `{}`
-raises `EmptyOutputError` at the producing step before any prior output is
-touched.
-
-Partition keys may use path-style nesting like `en/record_001`; partitioned
-datasets resolve those keys into nested output directories.
-
-Dataset `path` values can be local paths or `fsspec` URLs such as:
 
 - `./examples/fsspec/data/input_partitions.json`
 - `abfs://caravel/input/input_partitions.json`
@@ -349,82 +206,60 @@ Dataset `path` values can be local paths or `fsspec` URLs such as:
 
 ## Plugins
 
-Two capabilities remain, because only these extend behaviour the engine does
-not already own.
+Two capabilities, because only these extend behaviour the engine does not
+already own.
 
 - **Observers** receive lifecycle events after committed transitions
-  (`run_started`, `node_started`, `node_completed`, `node_failed`,
-  `run_completed`, `run_failed`). Each declares `criticality` as `"required"`
-  or `"best_effort"`; a required failure fails the run, a best-effort one does
-  not. An observer can never undo what already committed.
+  (`run_started`, `node_started`, `node_completed`, `run_completed`,
+  `run_failed`). Each declares `criticality` as `"required"` or
+  `"best_effort"`; a required failure fails the run, a best-effort one does
+  not. An observer reports what committed; it never changes it.
 - **Run guards** wrap one invocation in an external precondition. They enter in
   plugin order and exit in reverse, and teardown is attempted for every guard
   whose startup completed.
 
 ```python
-run(pipeline, job_id="j1", source=..., storage=..., plugins=[MyObserver()])
+run(pipeline, output="data/documents/output", plugins=[MyObserver()])
 ```
 
-`CheckpointPlugin`, `OwnershipPlugin`, and `LeasePlugin` were **retired**: the
-authoritative progress store owns committed-output evidence, cross-run
-inventory, and worker leases, so a plugin can no longer contradict it.
+The recovery database owns progress, committed output, and executor ownership,
+so evidence is what a plugin contributes.
+
 
 ## Multi-Source Input And Branches
 
 `MultiSourceLoader` tags each record with `__source__` and is accepted directly
-as a `source`. Source identity remains in durable lineage metadata. Payload tags
-are stripped before commit by default; pass `keep_source_tag=True` to retain them.
+as a `source`. Tags are stripped before output is written by default; pass
+`keep_source_tag=True` to retain them.
 
 ### Branches
 
-A `Branch` routes each partition to one of several step chains, then merges.
+A `Branch` routes the value it receives to one of several step chains, then
+merges. Every declared route contributes its steps to the declared structure;
+the chosen route runs, and the other routes' steps are recorded as `skipped`,
+so a stage containing a branch still completes.
 
-Routing happens **at the branch**, not at discovery, so a predicate may read
-values earlier steps produced. The decision is committed per partition together
-with that route's work in a single transaction, which means the predicate is
-consulted exactly once per partition even across restarts — a flapping or
-externally-dependent predicate cannot re-route a record after a crash.
+Routing happens **at the branch**, so a predicate may read values earlier steps
+produced. The decision is committed with the branch step, which means the
+predicate is consulted exactly once per job: reopening a job reuses the route it
+already chose, and a flapping or externally-dependent predicate cannot re-route
+after a crash.
 
-The merge is partition-scoped: each partition merges as soon as its own route
-seals. That is the right fit for per-partition routing, but it does **not**
-subsume a whole-dataset merge — for that, add an `input_scope="all"` step after
-the merge.
-
-A route step transforms one partition's payload and must preserve that
-partition's identity. Whole-input processing belongs in an `input_scope="all"`
-step outside the branch; returned storage keys do not create new execution partitions.
-
-## Breaking Changes From The Single-Pass Runner
-
-| Removed | Replacement |
-| --- | --- |
-| `run(pipeline, run_root)` | `run(pipeline, job_id=..., source=..., storage=...)` |
-| `only_stage` / `only_step` | Re-invoking a job skips committed work. Use `storage.invalidate(pipeline, job_id=..., step=..., partitions=...)` for selective recomputation; dependent work is invalidated with it. |
-| `Stage(stage_root=...)` | One `artifacts_root` on `DurableStorage.at`. |
-| `Stage(clean_dirs=True)` | Rejected: cleanup could delete committed output. |
-| `@step(...)` decorator | `Step(...)` is the only step configuration surface. Move the decorator's arguments into the `Step(...)` that lists the processor in a stage or branch route: `@step(output=d)` above `def load` becomes `Step(load, output=d)`. A bare callable still works wherever it wants every documented `Step` default. |
-| `Step(persist=False)` | Rejected: recovery restores committed output. Use cheap steps plus one `input_scope="all"` step. |
-| `keep_source_tag` | **Still supported**, with its original default: the tag is stripped before commit unless you pass `keep_source_tag=True`. |
-| Stage-directory output layout | `storage.results(pipeline, job_id=...)` |
-| Checkpoint / ownership / lease plugins | Owned by the authoritative store. |
-| `context_factory` | **Still supported**, unchanged. |
-| `__all__` as a published directory, result key, manifest identity, and feed address | The declared dataset name, defaulting to the declared step name. The reserved aggregate id is private to the progress store and attempt artifacts. |
-
-Logical output identity is a breaking change to the published layout and to the
-durable store, which is now schema version 2. A store written under version 1 is
-not opened: start a new job against a fresh recovery directory and output root,
-or keep the old state on the version that wrote it, rebuild its output there,
-and migrate the results. There is no dual-layout mode and no alias tree.
+`by="source"` routes on the source tag the incoming value carries, either a
+tagged record or a mapping of records that share one tag. A callable predicate
+receives the complete value and returns a declared route key.
 
 ## Supported Envelope
 
 | Component | Supported | Not supported |
 | --- | --- | --- |
-| Authoritative progress store | SQLite on a local filesystem that survives invocations. One host, several processes. | Network filesystems, ephemeral disk, multi-host metadata. |
-| Committed artifacts | Any fsspec target, including object storage, configured independently via `artifacts_root`. | — |
-| Concurrency | Several workers on one host under an explicit `LeasePolicy`. | Multi-host workers (needs a multi-host metadata backend). |
-| Branches | Per-partition routing with partition-scoped merge, on one durable engine. | Nested branches; route steps that change partition identity. |
-| Remote artifacts | Implemented and locally qualified against an fsspec non-local store. | **Not cloud-credential verified.** No suite has run against real object storage since consolidation. |
+| Recovery database | SQLite on a local filesystem that survives invocations. | Network filesystems, ephemeral disk, multi-host metadata. |
+| Executors | One executor per recovery database, with sequential step execution. Parallel calls inside a step are your code. | Concurrent executors on one database; multi-host workers. |
+| Generated output | Any fsspec target, including object storage. | — |
+| Branches | One route per run, with the other routes' steps recorded as skipped. | Nested branches. |
+| Recovery granularity | The step. A failure inside a step repeats that step's uncommitted work. | Record- or operation-level recovery. |
+| Remote output | Implemented and locally qualified against an fsspec non-local store. | **Not cloud-credential verified.** |
+
 
 ## Retries
 
@@ -447,30 +282,27 @@ vendor_retry = RetryOptions(should_retry_error=retryable)
 
 # The same instance at every supported boundary.
 Stage(name="prepare", retry=vendor_retry, entries=[
-    Step(fn=enrich, output=dataset, batch_size=100, retry=vendor_retry),
+    Step(fn=enrich, output=dataset, retry=vendor_retry),
 ])
 
 # ...or just one operation inside the processor. Only that call repeats.
-def enrich(inputs, *, context):
+def enrich(value, *, context):
     results = []
-    for partition in inputs.partitions():
-        for record in partition.load():
-            value, attempts = retry_operation(
-                operation=lambda record=record: call_vendor(record), retry=vendor_retry
-            )
-            results.append(value)
+    for record in value.values():
+        enriched, attempts = retry_operation(
+            operation=lambda record=record: call_vendor(record), retry=vendor_retry
+        )
+        results.append(enriched)
     return results
 ```
 
-An ordinary loop iteration acquires no retry and no checkpoint of its own. In
-partition scope durable completion stays per partition or batch; in all scope a
-failed batch replays that whole batch, so successful iterations inside it may
-run again.
+An ordinary loop iteration acquires no retry of its own. Recovery granularity is
+the step, so a failed step repeats its uncommitted work and successful
+iterations inside it run again.
 
-Inside a processor, `retry_operation` inherits the invocation's deadline,
-cancellation state, ownership, and shared retry allowance automatically — there
-is no context argument to wire up. Outside the runner the same function works
-with its own local limits and claims no durable recovery.
+`retry_operation` is callable anywhere: inside a processor to retry a smaller
+scope, or in ordinary application code. Only the operation it is given
+repeats.
 
 | Setting | Default |
 | --- | --- |
@@ -479,132 +311,74 @@ with its own local limits and claims no durable recovery.
 | `max_attempts` | 4, counting the initial call. `1` permits the initial call without retry; `retry=None` disables the boundary. |
 | `delay_seconds` | `compute_retry_delay`: `min(2^(n-1), 16)` seconds plus up to one second of jitter, so at most 17s. |
 
-Every boundary also shares one invocation-wide allowance,
-`ExecutionPolicy(max_retry_attempts=...)`, finite at 100 by default. Initial
-attempts never consume it; only retries do, so explicitly nested policies cannot
-multiply attempts without bound. Exhausting it is terminal for that invocation's
-retry chain.
-
 Invalid input, authentication failures, programming errors, and cancellation are
 never retried, and arbitrary exception text is never classified as transient.
 `KeyboardInterrupt`, `SystemExit`, and other `BaseException` control signals
 propagate without retry.
 
-### Migrating from the removed declaration and retry APIs
+## Executor ownership
 
-This is a breaking replacement: the names below are absent from the package,
-with no aliases and no compatibility dispatch. A job whose persisted declaration
-fingerprint does not match the current declaration fails before any source read
-or mutation; start a new `job_id`.
+One executor runs a recovery database at a time, with sequential step
+execution. Ownership is a transaction held open on `owner.sqlite3` beside the
+database for the executor's lifetime, so the operating system answers the
+liveness question: the lock lasts exactly as long as the process holding it,
+and a crash releases it.
 
-| Removed | Replacement |
-| --- | --- |
-| `Inputs`, `inputs.each(...)`, `inputs.all(...)` | a plain processor, with scope declared as `Step(fn, input_scope=...)` |
-| `ManagedDescriptor` | `Step.input_scope` |
-| `DeclarationContext` | the processor's `context=`, plus ordinary bindings such as `functools.partial` |
-| `ManagedInputError` | none |
-| `PartitionInput`, `AggregateInput` | `StepInputs`, yielding `InputPartition` handles |
-| `inputs.each(callback, retry=...)` | `Step(fn, retry=...)`, or `retry_operation()` inside the processor |
-| `RetryPolicy(max_retries=n, when=...)` | `RetryOptions(max_attempts=n + 1, should_retry_error=...)` |
-| `RetryPolicy(on_result=...)` | `RetryOptions(should_retry_result=...)` |
-| `retry(op, policy=p)` | `retry_operation(operation=op, retry=p)`, returning `(result, attempts)` |
-| `FailureContext`, `default_classifier`, `RetryBudget` | Internal. Predicates take a bare exception or result; the shared allowance is `ExecutionPolicy(max_retry_attempts=...)`. |
+A second executor on the same database is refused immediately, naming the
+database. Two job ids of the same pipeline therefore do not execute
+concurrently. Parallel calls inside a step are ordinary code you write.
 
-## Consuming committed batches
-
-A consumer reads committed references after **its own** durable position, applies
-them, and only then acknowledges. Acknowledging never touches producer progress,
-and one consumer's failure never blocks another.
-
-```python
-feed = storage.results(pipeline, job_id=...).feed("publish")
-
-page = feed.read_for("indexer", limit=100)
-for entry in page.entries:
-    destination.upsert(entry.logical_id, feed.load(entry, dataset=dataset))
-feed.acknowledge("indexer", page.next_position)
-```
-
-A crash between application and acknowledgment replays that batch, so
-destinations must be idempotent or apply transactionally with the
-acknowledgment. The committed manifest is authoritative: missed or duplicate
-notifications cannot lose or duplicate a logical update, because consumers catch
-up by listing from their position.
-
-An empty page while production is ongoing means "no new batches yet"
-(`page.at_end` is `False`). A sealed node reports `page.node_sealed` and its
-`final_position`. Reading from below a job's retention floor raises
-`RetentionExpiredError` rather than silently skipping expired batches.
-
-A runnable end-to-end example lives in [examples/durable_partitions](examples/durable_partitions).
-
-Start with [minimal](examples/minimal/README.md) for independent per-partition
-steps. See [combining_results](examples/combining_results/README.md) for combining
-partition outputs into one summary with `input_scope="all"`.
-
-## Concurrent workers
-
-One worker is the default. Concurrent workers need an explicit lease policy:
-
-```python
-from caravel.durability import ExecutionPolicy, LeasePolicy
-
-policy = ExecutionPolicy(workers=4, leases=LeasePolicy(ttl_seconds=60, heartbeat_seconds=10))
-```
-
-Workers claim eligible partition-step pairs atomically, so exactly one of two
-racing workers wins. Each claim carries an increasing fence token, so a
-displaced worker cannot commit even if it is still running, and an expired lease
-lets another worker take the unit over. Different partitions advance
-concurrently while each partition keeps its dependency order.
-
-The supported envelope is one host with several processes, on a local
-filesystem that survives invocations. Multi-host metadata storage needs a
-separate backend implementing the same storage contract.
 
 ## Guarantees
 
-Processing is at-least-once; immutable attempt output plus conditional progress
-publication yields one authoritative committed result per batch. External
-effects inside a step still require application-level idempotency, keyed on
-something stable such as `(job_id, node_id, partition_id, batch_id)`.
+- A step's snapshot and its completion status become durable together, so a
+  completed step always has a readable result.
+- Every successful boundary writes its state under every commit scope;
+  `commit_scope` selects only when transactions commit.
+- A step retry runs in memory and writes a snapshot when its output is
+  accepted. Each attempt receives the original input, isolated from a previous
+  attempt's mutations.
+- A stage retry restarts the stage, restoring committed steps and rerunning
+  discarded work.
+- Reopening a job restores its committed steps and regenerates output deleted
+  from disk.
+- Recovery matches declared stage and step identity and order. Nothing hashes
+  processor code, and input data is never inspected.
+- Retries do not provide exactly-once external effects. SQLite governs stored
+  state; an external effect is the processor's own concern.
+
 
 ## CLI Usage
 
-`make_cli(pipeline)` drives the same single execution model.
+`make_cli(pipeline)` builds an entry point for one pipeline.
 
-- `--output PATH` — where published results go. Default:
-  `data/<pipeline-name>/output`. May be an fsspec URL.
-- `--state PATH` — the recovery directory itself. Default: `.caravel` beside
-  the output directory, or `data/<pipeline-name>/.caravel` when output is
-  remote.
-- `--ephemeral` — throwaway recovery storage; published results still go to the
-  configured output.
-- `--job-id ID` — identity of this bounded run. Required unless `--ephemeral`.
-- `--param key=value` (repeatable)
-- `--graph` — print the Mermaid graph and exit.
+```python
+from caravel import make_cli
+from .pipeline import build_pipeline
 
-```bash
-python3 -m examples.minimal --job-id nightly-2026-11-12
-
-python3 -m examples.minimal \
-  --output /exports/minimal/output \
-  --job-id nightly-2026-11-12
-
-python3 -m examples.minimal \
-  --output /exports/minimal/output \
-  --state /persistent/minimal/.caravel \
-  --job-id nightly-2026-11-12
-
-python3 -m examples.minimal --ephemeral
+cli = make_cli(build_pipeline())
+raise SystemExit(cli())
 ```
 
-The run line reports the outcome and where results landed:
+| Flag | Meaning |
+| --- | --- |
+| `--output PATH` | Where generated output goes. `make_cli(..., default_output=...)` sets the default; the examples put theirs in `examples/<name>/data/output`. May be an fsspec URL. |
+| `--state PATH` | The recovery directory. Defaults to `.caravel` beside the output root. |
+| `--job-id ID` | The identity this run resumes under. Supplying it makes the run durable. |
+| `--commit-scope SCOPE` | `pipeline`, `stage`, or `step`. Default `step`. |
+| `--param KEY=VALUE` | A run-scoped parameter, repeatable. Reaches `context.params`. |
+| `--graph` | Print the pipeline as a Mermaid graph and exit without running. |
 
-```text
-status=completed job_id=nightly-2026-11-12 batches=5 restart_safe=True
-output=data/minimal_example/output
+```console
+$ python -m examples.minimal --job-id run-1
+pipeline=minimal_example job_id=run-1 executed=2 restored=0
+output=examples/minimal/data/output
+
+$ python -m examples.minimal --job-id run-1
+pipeline=minimal_example job_id=run-1 executed=0 restored=2
+output=examples/minimal/data/output
 ```
+
 
 ## Production Status And Support Statement
 

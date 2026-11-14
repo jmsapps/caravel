@@ -8,8 +8,9 @@ from typing import Any, Callable
 from .branch import Branch
 from .datasets import JSONDataset
 from .inputs import validate_processor_signature
+from .options import DurabilityOptions
 from .retry import RetryOptions
-from .types import Dataset, InputScope, Loader, StepFn
+from .types import Dataset, Loader, StepFn
 
 
 def _callable_name(fn: Callable[..., Any]) -> str:
@@ -40,20 +41,15 @@ class Step:
     ``Step(load)`` is a complete declaration.
 
     ``fn`` is ordinary processing code. It is called during execution only,
-    never during planning, and always as ``fn(inputs, context=...)`` with one
-    :class:`~caravel.inputs.StepInputs` object.
+    never during planning, and always as ``fn(value, context=...)``: one
+    positional argument carrying the complete value the previous step produced,
+    and the keyword-only context.
 
-    ``input_scope`` declares when this step becomes ready and which input
-    partitions it receives: ``"partition"`` runs it once per partition over that
-    partition's own input, and ``"all"`` makes it the aggregate barrier over
-    every required upstream commit. It does not change what ``fn`` is handed.
+    ``persist=False`` passes the result to the next step in memory without
+    saving it.
 
-    ``batch_size``, ``revision``, and ``retry`` configure the one durable
-    execution model. Their defaults give whole-partition recovery with no
-    retries, which is the simplest useful behavior.
-
-    ``retry`` attaches options at the step boundary only, wrapping this step's
-    unfinished batch loop. Nested boundaries acquire none automatically; call
+    ``retry`` attaches options at this step's boundary, repeating the processor
+    call. Nested boundaries acquire none automatically; call
     ``retry_operation()`` inside the processor to retry a smaller scope.
     """
 
@@ -61,21 +57,11 @@ class Step:
     output: Dataset | None = None
     persist: bool = True
     name: str | None = None
-    input_scope: InputScope = "partition"
-    batch_size: int | None = None
-    revision: str = "1"
     retry: RetryOptions | None = None
 
     def __post_init__(self) -> None:
         if not callable(self.fn):
             raise TypeError(f"Step.fn must be callable, got {type(self.fn).__name__}.")
-
-        if self.input_scope not in ("partition", "all"):
-            raise ValueError(
-                f'Step.input_scope must be "partition" or "all", got '
-                f"{self.input_scope!r}. Scope is declared explicitly; it is never "
-                "inferred from the processor."
-            )
 
         if self.output is None:
             # A declaration needs no dataset: the processor's output is
@@ -88,12 +74,6 @@ class Step:
 
         if not isinstance(self.persist, bool):
             raise TypeError(f"Step.persist must be bool, got {type(self.persist).__name__}.")
-        if not self.persist:
-            raise ValueError(
-                f"Step '{self.name or _callable_name(self.fn)}' sets persist=False, but "
-                "durable execution must commit every step's output: a later invocation "
-                "restores it instead of recomputing. Remove persist=False."
-            )
 
         if self.name is None or self.name == "":
             self.name = _callable_name(self.fn)
@@ -102,20 +82,6 @@ class Step:
             raise TypeError(f"Step.name must be str, got {type(self.name).__name__}.")
 
         validate_processor_signature(self.fn, what=f"Step '{self.name}' processor")
-
-        if self.batch_size is not None:
-            if not isinstance(self.batch_size, int) or isinstance(self.batch_size, bool):
-                raise TypeError(
-                    f"Step.batch_size must be a positive integer or None, got "
-                    f"{type(self.batch_size).__name__}."
-                )
-            if self.batch_size < 1:
-                raise ValueError(
-                    f"Step.batch_size must be a positive integer, got {self.batch_size}."
-                )
-
-        if not isinstance(self.revision, str) or not self.revision:
-            raise ValueError("Step.revision must be a non-empty string.")
 
         if self.retry is not None and not isinstance(self.retry, RetryOptions):
             raise TypeError(
@@ -195,13 +161,26 @@ class Pipeline:
     ``source`` is optional on the declaration because execution supplies it.
     Anything satisfying the :class:`~caravel.types.Loader` protocol is accepted
     and adapted, so a loader remains a valid way to describe input.
+
+    ``durability_options`` makes a run durable: it names the job this run
+    resumes under and when its transactions commit. Supplying it adds the
+    recovery database, so a committed step is restored instead of recomputed.
     """
 
     name: str
     stages: list[Stage]
     source: Any = None
+    durability_options: DurabilityOptions | None = None
 
     def __post_init__(self) -> None:
+        if self.durability_options is not None and not isinstance(
+            self.durability_options, DurabilityOptions
+        ):
+            raise TypeError(
+                "Pipeline.durability_options must be a DurabilityOptions or None, got "
+                f"{type(self.durability_options).__name__}."
+            )
+
         if self.source is not None and not (
             isinstance(self.source, Loader) or hasattr(self.source, "discover")
         ):

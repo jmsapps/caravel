@@ -1,87 +1,75 @@
-"""The branching example runs on the durable engine.
-
-Routing happens at the branch boundary and is committed per partition; each
-record travels exactly one route and merges when that route seals.
-"""
+"""The branching example: one route per job, merged into one result."""
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-repo_root = Path(__file__).resolve().parents[2]
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
+import pytest
 
-from caravel import DurableStorage  # noqa: E402
-from caravel.durability import WorkUnitKey  # noqa: E402
-from examples.branching.pipeline import (  # noqa: E402
+from caravel import PartitionedJSONDataset
+from examples.branching.pipeline import (
     HTML_SOURCE_NAME,
     JSON_SOURCE_NAME,
-    build_branching_pipeline,
     run_branching_pipeline,
 )
 
-BRANCH_NODE = "stage-001-entry-001"
+
+def _gold(result):
+    return PartitionedJSONDataset().load_from(result.outputs["gold_partition_by_language"])
 
 
-def test_the_branching_example_completes(tmp_path: Path) -> None:
-    result = run_branching_pipeline(state_root=tmp_path)
-    assert result.status == "completed"
-    assert result.restart_safe is True
+@pytest.mark.parametrize(
+    "source_name, route_step",
+    [
+        (JSON_SOURCE_NAME, "bronze_normalize_json_source"),
+        (HTML_SOURCE_NAME, "bronze_normalize_html_source"),
+    ],
+)
+def test_each_source_runs_its_own_route(tmp_path: Path, source_name: str, route_step: str) -> None:
+    result = run_branching_pipeline(
+        state_root=tmp_path, source_name=source_name, job_id=f"branch-{source_name}"
+    )
+    assert route_step in result.outputs
+    assert "branch_by_source_merge" in result.outputs
+    assert _gold(result)
 
 
-def test_each_record_travels_exactly_one_route(tmp_path: Path) -> None:
-    run_branching_pipeline(state_root=tmp_path)
-    storage = DurableStorage.at(tmp_path / "output")
-    try:
-        routes: dict[str, str] = {}
-        for partition_id in storage.progress.work_unit_partitions("branching-1", BRANCH_NODE):
-            unit = storage.progress.load_work_unit(
-                WorkUnitKey("branching-1", BRANCH_NODE, partition_id)
-            )
-            assert unit is not None and unit.route_key is not None
-            routes[partition_id] = unit.route_key
+def test_both_sources_coexist_in_one_pipeline_database(tmp_path: Path) -> None:
+    import sqlite3
 
-        assert routes, "no partitions were routed"
-        assert {routes[key] for key in routes} == {JSON_SOURCE_NAME, HTML_SOURCE_NAME}
-        for partition_id, route in routes.items():
-            expected = JSON_SOURCE_NAME if partition_id.startswith("json") else HTML_SOURCE_NAME
-            assert route == expected
-    finally:
-        storage.close()
+    for source_name in (JSON_SOURCE_NAME, HTML_SOURCE_NAME):
+        run_branching_pipeline(
+            state_root=tmp_path, source_name=source_name, job_id=f"branch-{source_name}"
+        )
+
+    for source_name in (JSON_SOURCE_NAME, HTML_SOURCE_NAME):
+        database = tmp_path / "output" / ".caravel" / "state.sqlite3"
+        assert database.exists()
+        connection = sqlite3.connect(database)
+        jobs = {row[0] for row in connection.execute("SELECT job_id FROM runs")}
+        connection.close()
+        assert f"branch-{source_name}" in jobs
 
 
-def test_both_sources_converge_through_the_merge(tmp_path: Path) -> None:
-    run_branching_pipeline(state_root=tmp_path)
-    storage = DurableStorage.at(tmp_path / "output")
-    try:
-        results = storage.results(build_branching_pipeline(), job_id="branching-1")
-        gold = results.of("gold_partition_by_language")
-        keys = sorted(key for payload in gold.values() for key in payload)
-        assert keys == ["en/html-alpha", "en/json-alpha", "fr/html-beta", "fr/json-beta"]
-        origins = {record["origin"] for payload in gold.values() for record in payload.values()}
-        assert origins == {"json", "html"}
-    finally:
-        storage.close()
+def test_the_unchosen_route_is_recorded_as_skipped(tmp_path: Path) -> None:
+    import sqlite3
+
+    run_branching_pipeline(state_root=tmp_path, source_name=JSON_SOURCE_NAME, job_id="branch-json")
+    connection = sqlite3.connect(tmp_path / "output" / ".caravel" / "state.sqlite3")
+    statuses = dict(connection.execute("SELECT step_name, status FROM steps"))
+    connection.close()
+
+    assert statuses["bronze_normalize_json_source"] == "completed"
+    assert statuses["bronze_normalize_html_source"] == "skipped"
 
 
-def test_the_source_tag_does_not_reach_committed_output(tmp_path: Path) -> None:
-    from caravel import SOURCE_FIELD
-
-    run_branching_pipeline(state_root=tmp_path)
-    storage = DurableStorage.at(tmp_path / "output")
-    try:
-        results = storage.results(build_branching_pipeline(), job_id="branching-1")
-        for payload in results.of("gold_partition_by_language").values():
-            for record in payload.values():
-                assert SOURCE_FIELD not in record
-    finally:
-        storage.close()
-
-
-def test_reinvoking_the_branching_example_reprocesses_nothing(tmp_path: Path) -> None:
-    assert run_branching_pipeline(state_root=tmp_path).status == "completed"
-    again = run_branching_pipeline(state_root=tmp_path)
-    assert again.status == "completed"
-    assert again.committed_batches == 0
+def test_reopening_a_source_job_restores_its_steps(tmp_path: Path) -> None:
+    first = run_branching_pipeline(
+        state_root=tmp_path, source_name=JSON_SOURCE_NAME, job_id="branch-json"
+    )
+    second = run_branching_pipeline(
+        state_root=tmp_path, source_name=JSON_SOURCE_NAME, job_id="branch-json"
+    )
+    assert first.steps_executed > 0
+    assert second.steps_executed == 0
+    assert second.steps_restored == first.steps_executed

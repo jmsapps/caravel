@@ -28,10 +28,9 @@ class _StubLoader:
 
 
 def _canary_pipeline(name: str = "canary_pipeline") -> Pipeline:
-    def emit(inputs, *, context: object) -> dict[str, dict[str, object]]:
-        [partition] = inputs.partitions()
-        record: dict[str, object] = partition.load()
+    def emit(value, *, context: object) -> dict[str, dict[str, object]]:
         _ = context
+        record: dict[str, object] = dict(next(iter(value.values())))
         return {"canary": {**record, "secret": PAYLOAD_CANARY}}
 
     return Pipeline(
@@ -48,15 +47,16 @@ def _canary_pipeline(name: str = "canary_pipeline") -> Pipeline:
 def test_framework_logs_contain_no_payload_or_param_values(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from caravel import DurableStorage, InMemorySource
+    from caravel import DurabilityOptions, InMemorySource
     from caravel.runner import run
 
+    pipeline = _canary_pipeline()
+    pipeline.durability_options = DurabilityOptions(schema_version="v1.0.0", job_id="canary")
     with caplog.at_level(logging.DEBUG):
         run(
-            _canary_pipeline(),
-            job_id="canary",
+            pipeline,
             source=InMemorySource({"p1": {"secret": PAYLOAD_CANARY}}),
-            storage=DurableStorage.at(tmp_path / "output"),
+            output=tmp_path / "output",
             params={"api_key": PARAM_CANARY},
         )
 
@@ -108,22 +108,21 @@ def test_cli_param_errors_do_not_echo_values() -> None:
 def test_committed_artifacts_contain_only_payload_files(tmp_path: Path) -> None:
     """Durable artifact locations hold payload data and nothing else.
 
-    The legacy stage-directory layout is gone with the legacy runner. What must
-    still hold is that Caravel never writes metadata, cursors, or identifiers
-    alongside a committed payload: authoritative state lives in the store.
+    Caravel writes payload files and nothing else beside generated output:
+    authoritative state lives in the recovery database.
     """
-    from caravel import DurableStorage, InMemorySource
+    from caravel import DurabilityOptions, InMemorySource
     from caravel.runner import run
 
-    storage = DurableStorage.at(tmp_path / "output")
-    run(
-        _canary_pipeline(),
-        job_id="layout",
+    pipeline = _canary_pipeline()
+    pipeline.durability_options = DurabilityOptions(schema_version="v1.0.0", job_id="layout")
+    result = run(
+        pipeline,
         source=InMemorySource({"p1": {"value": 1}}),
-        storage=storage,
+        output=tmp_path / "output",
     )
 
-    artifacts = Path(str(storage.output.root))
+    artifacts = Path(str(result.output_root))
     written = sorted(path for path in artifacts.rglob("*") if path.is_file())
     assert written, "the run committed no artifacts"
     assert all(path.suffix == ".json" for path in written), (

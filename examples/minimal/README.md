@@ -8,7 +8,8 @@ source .venv/bin/activate
 python -m examples.minimal --job-id minimal-demo
 ```
 
-Published output is under `data/minimal_example/output/minimal_example/minimal-demo/`.
+Generated output is under `examples/minimal/data/output/`, with the recovery
+database in `examples/minimal/data/.caravel/`.
 The silver step produces separate `alpha/alpha.json` and `beta/beta.json` files,
 with normalized values `1.0` and `3.0`. Recovery storage is the sibling `.caravel/`.
 Processors iterate the available input handles and return records keyed by their

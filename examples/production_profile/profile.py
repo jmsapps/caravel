@@ -1,11 +1,11 @@
 """The production profile for durable execution.
 
-Consolidation moved most of what used to be a plugin into the engine. The
-authoritative progress store now owns committed-output evidence, cross-run
-inventory, and worker leases, so a production profile is two decisions:
+The recovery database owns committed output and run state, so a production
+profile is three decisions:
 
-1. where durable state and artifacts live, and
-2. which observers record lifecycle evidence.
+1. where generated output goes,
+2. the durability options the job runs under, and
+3. which observers record lifecycle evidence.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from caravel import DurableStorage, ExecutionPolicy, LeasePolicy
+from caravel import DurabilityOptions, CommitScope
 from caravel.plugins.run_evidence import RunEvidencePlugin
 from caravel.storage import join_path
 
@@ -66,21 +66,27 @@ def _azure_storage_options_from_env() -> dict[str, str] | None:
     return options or None
 
 
-def build_production_storage(
-    state_root: str | Path,
-    *,
-    storage_options: Mapping[str, Any] | None = None,
-) -> DurableStorage:
-    """Durable storage for a production job.
+def build_production_output(state_root: str | Path) -> Path:
+    """Where a production job writes its generated output.
 
-    ``state_root`` must be a local filesystem path that survives invocations.
-    The authoritative store is not supported on network filesystems or
-    ephemeral disk; artifact storage is configured separately and may be remote.
+    The recovery database lives in ``.caravel`` beside this root, on a local
+    filesystem path that survives invocations.
     """
     root = str(state_root).strip()
     if not root:
         raise ValueError("state_root must be a non-empty path")
-    return DurableStorage.at(root, storage_options=storage_options)
+    return Path(root) / "output"
+
+
+def build_production_durability(
+    job_id: str, *, commit_scope: CommitScope = "step"
+) -> DurabilityOptions:
+    """Durability options for a production job.
+
+    ``commit_scope="step"`` commits each successful Step, so an interrupted run
+    resumes with the most committed progress available.
+    """
+    return DurabilityOptions(schema_version="v1.0.0", job_id=job_id, commit_scope=commit_scope)
 
 
 def build_production_plugins(
@@ -90,8 +96,8 @@ def build_production_plugins(
 ) -> list[object]:
     """Build the explicit observer composition used for qualification.
 
-    Checkpoint, ownership, and lease plugins are gone: the durable store
-    provides all three, and a plugin can no longer contradict it.
+    The recovery database owns progress and ownership, so evidence is what a
+    plugin contributes.
     """
     root = str(metadata_root).strip()
     if not root:
@@ -103,12 +109,3 @@ def build_production_plugins(
             storage_options=storage_options,
         )
     ]
-
-
-def build_production_policy(*, workers: int = 1) -> ExecutionPolicy:
-    """Concurrency policy. More than one worker requires fenced leases."""
-    if workers == 1:
-        return ExecutionPolicy()
-    return ExecutionPolicy(
-        workers=workers, leases=LeasePolicy(ttl_seconds=60, heartbeat_seconds=10)
-    )

@@ -94,7 +94,7 @@ python3 -m examples.fsspec_partitioned --run-root data/fsspec_partitioned_exampl
 ## Expected Behaviors
 
 - Without stage overrides, outputs are written under:
-  `data/output/fsspec_partitioned_example/_NNN_stage/...`
+  `examples/fsspec_partitioned/data/output/_NNN_stage/...`
   or under `--run-root/<pipeline>/_NNN_stage/...` when provided.
 - With stage overrides, each stage writes directly under its configured stage
   root and keeps deterministic step folder naming under that base.

@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any
 
 from caravel import (
-    DurableStorage,
     Step,
     SOURCE_FIELD,
     JSONDataset,
@@ -14,6 +13,8 @@ from caravel import (
     Stage,
     run,
 )
+
+from ..support import durable
 
 PIPELINE_NAME = "multisource_example"
 STAGE_NAME = "silver"
@@ -48,7 +49,7 @@ def make_multisource_loader(
     )
 
 
-def summarize_by_source(inputs, *, context: object) -> dict[str, Any]:
+def summarize_by_source(value, *, context: object) -> dict[str, Any]:
     """Count records by source tag behind an explicit all-input barrier.
 
     ``MultiSourceLoader`` still tags every record with ``__source__``. Durable
@@ -59,22 +60,16 @@ def summarize_by_source(inputs, *, context: object) -> dict[str, Any]:
     _ = context
     counts_by_source: dict[str, int] = {SOURCE_A_NAME: 0, SOURCE_B_NAME: 0}
 
-    for partition in inputs.partitions():
-        record = partition.load()
+    for _key, record in value.items():
         if not isinstance(record, dict):
             raise TypeError(
-                f"Expected dict record for partition '{partition.partition_id}', "
-                f"got {type(record).__name__}."
+                f"Expected dict record for partition '{_key}', got {type(record).__name__}."
             )
         if SOURCE_FIELD not in record:
-            raise KeyError(
-                f"Partition '{partition.partition_id}' is missing source tag '{SOURCE_FIELD}'."
-            )
+            raise KeyError(f"Partition '{_key}' is missing source tag '{SOURCE_FIELD}'.")
         source_name = str(record[SOURCE_FIELD])
         if source_name not in counts_by_source:
-            raise ValueError(
-                f"Unexpected source tag '{source_name}' for partition '{partition.partition_id}'."
-            )
+            raise ValueError(f"Unexpected source tag '{source_name}' for partition '{_key}'.")
         counts_by_source[source_name] += 1
 
     return {
@@ -98,7 +93,6 @@ def build_multisource_pipeline(
                 entries=[
                     Step(
                         summarize_by_source,
-                        input_scope="all",
                         output=JSONDataset(name="summary"),
                     )
                 ],
@@ -117,7 +111,7 @@ def run_multisource_pipeline(
 ) -> Any:
     """Run the multisource example and return its structured status."""
     pipeline = build_multisource_pipeline(source_a_dir=source_a_dir, source_b_dir=source_b_dir)
-    return run(pipeline, job_id=job_id, storage=DurableStorage.at(Path(state_root) / "output"))
+    return run(durable(pipeline, job_id), output=Path(state_root) / "output")
 
 
 __all__ = [

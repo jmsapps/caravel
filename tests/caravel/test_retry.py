@@ -9,10 +9,8 @@ from typing import Any
 import pytest
 
 from caravel import (
-    DurableStorage,
+    DurabilityOptions,
     Pipeline,
-    RetryBudgetExhaustedError,
-    RetryCancelledError,
     RetryError,
     RetryOptions,
     RetryPolicyError,
@@ -23,7 +21,7 @@ from caravel import (
     retry_operation,
     run,
 )
-from caravel.durability import ExecutionBudget, ExecutionPolicy, InMemorySource
+from caravel.durability import InMemorySource
 from caravel.retry import DEFAULT_MAX_ATTEMPTS, MAX_RETRY_DELAY_SECONDS
 
 NO_DELAY = RetryOptions(delay_seconds=lambda attempt: 0.0)
@@ -286,30 +284,6 @@ def test_retry_operation_rejects_a_non_callable_before_attempting_it() -> None:
         retry_operation(operation=invalid_operation)
 
 
-def test_managed_retry_wait_responds_to_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
-    from caravel.durability.execution import _Deadline, _InvocationControls
-
-    controls = _InvocationControls(
-        deadline=_Deadline(ExecutionBudget(seconds=30)), allowance=3, shutdown_margin=1
-    )
-    bound = controls.bind(scope="test", owner_id="worker", fence_token=None)
-    waits: list[float] = []
-
-    def cancel_during_wait(seconds: float) -> bool:
-        waits.append(seconds)
-        controls.cancel()
-        return True
-
-    def reject_blocking_sleep(seconds: float) -> None:
-        raise AssertionError("managed retry used an uninterruptible sleep")
-
-    monkeypatch.setattr(controls.cancel_event, "wait", cancel_during_wait)
-    monkeypatch.setattr("caravel.durability.execution.time.sleep", reject_blocking_sleep)
-    with pytest.raises(RetryCancelledError, match="cancelled"):
-        bound.wait(10)
-    assert waits and waits[0] <= 0.1
-
-
 def test_retry_args_keyword_is_rejected() -> None:
     with pytest.raises(TypeError):
         retry_operation(operation=lambda: 1, retry_args={"max_attempts": 2})  # type: ignore[call-arg]
@@ -317,321 +291,115 @@ def test_retry_args_keyword_is_rejected() -> None:
 
 # -- one instance, every boundary --------------------------------------------
 
-
-def _storage(tmp_path: Path) -> Any:
-    return DurableStorage.at(tmp_path / "output")
+# --- retries through the engine ------------------------------------------
 
 
-def test_one_options_instance_is_reused_at_stage_step_and_operation(
-    tmp_path: Path,
-) -> None:
-    """The same RetryOptions object configures every supported boundary."""
-    shared = RetryOptions(max_attempts=3, delay_seconds=lambda attempt: 0.0)
-    attempts = {"operation": 0}
-
-    def processor(inputs: Any, *, context: Any) -> Any:
-        del context
-        [partition] = inputs.partitions()
-
-        def call() -> Any:
-            attempts["operation"] += 1
-            if attempts["operation"] < 2:
-                raise ConnectionError("vendor down")
-            return partition.load()
-
-        value, _ = retry_operation(operation=call, retry=shared)
-        return value
-
-    pipeline = Pipeline(
-        name="documents",
-        stages=[
-            Stage(name="prepare", retry=shared, entries=[Step(processor, retry=shared)]),
-        ],
+def _pipeline(step, *, job_id="retry-1", stage_retry=None, source=None):
+    return Pipeline(
+        name="retry_example",
+        stages=[Stage(name="only", entries=[step], retry=stage_retry)],
+        source=source or InMemorySource({"a": 1}),
+        durability_options=DurabilityOptions(
+            schema_version="v1.0.0", job_id=job_id, commit_scope="step"
+        ),
     )
-    result = run(
-        pipeline,
-        job_id="j1",
-        source=InMemorySource({"p1": {"id": "p1"}}),
-        storage=_storage(tmp_path),
-    )
-    assert result.status == "completed"
-    assert attempts["operation"] == 2
 
 
-def test_disabled_retry_does_not_repeat_a_failing_processor(tmp_path: Path) -> None:
-    calls = {"n": 0}
-
-    def processor(inputs: Any, *, context: Any) -> Any:
-        del context, inputs
-        calls["n"] += 1
-        raise ConnectionError("vendor down")
-
-    pipeline = Pipeline(
-        name="documents",
-        stages=[Stage(name="prepare", entries=[Step(processor, retry=None)])],
-    )
-    with pytest.raises(ConnectionError):
-        run(
-            pipeline,
-            job_id="j1",
-            source=InMemorySource({"p1": {"id": "p1"}}),
-            storage=_storage(tmp_path),
-        )
-    assert calls["n"] == 1
+NO_DELAY = RetryOptions(max_attempts=4, delay_seconds=lambda attempt: 0.0)
 
 
-def test_inner_retries_exhaust_before_an_outer_boundary_restarts(tmp_path: Path) -> None:
-    """Nesting is stage -> step -> operation, so the innermost exhausts first."""
+def test_a_step_retry_repeats_the_processor(tmp_path: Path) -> None:
+    attempts: list[int] = []
+
+    def flaky(value: Any, *, context: Any) -> Any:
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise ConnectionError("transient")
+        return {"attempts": len(attempts)}
+
+    run(_pipeline(Step(flaky, retry=NO_DELAY)), output=tmp_path / "output")
+    assert len(attempts) == 2
+
+
+def test_a_stage_retry_repeats_every_unfinished_step(tmp_path: Path) -> None:
     calls: list[str] = []
+    failed: list[int] = []
 
-    def processor(inputs: Any, *, context: Any) -> Any:
-        del context, inputs
-
-        def call() -> Any:
-            calls.append("operation")
-            raise ConnectionError("vendor down")
-
-        return retry_operation(
-            operation=call, retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0)
-        )
-
-    pipeline = Pipeline(
-        name="documents",
-        stages=[
-            Stage(
-                name="prepare",
-                retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0),
-                entries=[
-                    Step(
-                        processor,
-                        retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0),
-                    )
-                ],
-            )
-        ],
-    )
-    with pytest.raises(ConnectionError):
-        run(
-            pipeline,
-            job_id="j1",
-            source=InMemorySource({"p1": {"id": "p1"}}),
-            storage=_storage(tmp_path),
-        )
-    # 2 operation attempts x 2 step attempts x 2 stage attempts.
-    assert len(calls) == 8
-
-
-def test_an_operation_retry_repeats_only_the_wrapped_call(tmp_path: Path) -> None:
-    callback_calls = {"n": 0}
-    operation_calls = {"n": 0}
-
-    def builder(inputs: Any, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        del context
-        callback_calls["n"] += 1
-
-        def call() -> Any:
-            operation_calls["n"] += 1
-            if operation_calls["n"] < 3:
-                raise ConnectionError("vendor down")
-            return partition.load()
-
-        value, _ = retry_operation(operation=call, retry=NO_DELAY)
+    def first(value: Any, *, context: Any) -> Any:
+        calls.append("first")
         return value
 
-    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
-    result = run(
-        pipeline,
-        job_id="j1",
-        source=InMemorySource({"p1": {"id": "p1"}}),
-        storage=_storage(tmp_path),
-    )
-    assert result.status == "completed"
-    assert callback_calls["n"] == 1
-    assert operation_calls["n"] == 3
-
-
-def test_retry_operation_works_outside_the_runner() -> None:
-    """Standalone use has its own local limits and claims no durable recovery."""
-    from caravel.retry import _active_retry_control
-
-    assert _active_retry_control.get() is None
-    operation = _counting(2, TimeoutError("slow"))
-    assert retry_operation(operation=operation, retry=NO_DELAY) == (3, 3)
-
-
-# -- shared invocation controls ----------------------------------------------
-
-
-def test_nested_retries_share_the_invocation_allowance(tmp_path: Path) -> None:
-    """Explicitly nested policies cannot multiply attempts without bound."""
-    calls = {"n": 0}
-
-    def builder(inputs: Any, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        del context, partition
-
-        def call() -> Any:
-            calls["n"] += 1
-            raise ConnectionError("vendor down")
-
-        return retry_operation(
-            operation=call, retry=RetryOptions(max_attempts=50, delay_seconds=lambda a: 0.0)
-        )
-
-    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
-    with pytest.raises(RetryBudgetExhaustedError):
-        run(
-            pipeline,
-            job_id="j1",
-            source=InMemorySource({"p1": {"id": "p1"}}),
-            storage=_storage(tmp_path),
-            policy=ExecutionPolicy(max_retry_attempts=5),
-        )
-    # Five retries were charged; the initial attempt was not.
-    assert calls["n"] == 6
-
-
-def test_an_exhausted_allowance_is_terminal_for_the_enclosing_retry(tmp_path: Path) -> None:
-    """Budget exhaustion propagates through outer policies, never reclassified."""
-    calls = {"n": 0}
-
-    def processor(inputs: Any, *, context: Any) -> Any:
-        del context, inputs
-
-        def call() -> Any:
-            calls["n"] += 1
-            raise ConnectionError("vendor down")
-
-        return retry_operation(
-            operation=call, retry=RetryOptions(max_attempts=50, delay_seconds=lambda a: 0.0)
-        )
+    def second(value: Any, *, context: Any) -> Any:
+        calls.append("second")
+        if not failed:
+            failed.append(1)
+            raise ConnectionError("transient")
+        return value
 
     pipeline = Pipeline(
-        name="documents",
+        name="retry_stage",
         stages=[
             Stage(
-                name="prepare",
-                retry=RetryOptions(max_attempts=10, delay_seconds=lambda a: 0.0),
-                entries=[
-                    Step(
-                        processor,
-                        retry=RetryOptions(max_attempts=10, delay_seconds=lambda a: 0.0),
-                    )
-                ],
+                name="only",
+                entries=[Step(first, name="first"), Step(second, name="second")],
+                retry=NO_DELAY,
             )
         ],
+        source=InMemorySource({"a": 1}),
+        durability_options=DurabilityOptions(
+            schema_version="v1.0.0", job_id="retry-stage", commit_scope="pipeline"
+        ),
     )
-    with pytest.raises(RetryBudgetExhaustedError):
-        run(
-            pipeline,
-            job_id="j1",
-            source=InMemorySource({"p1": {"id": "p1"}}),
-            storage=_storage(tmp_path),
-            policy=ExecutionPolicy(max_retry_attempts=3),
-        )
-    assert calls["n"] == 4
+    run(pipeline, output=tmp_path / "output")
+    assert calls == ["first", "second", "first", "second"]
 
 
-def test_initial_attempts_do_not_consume_the_allowance(tmp_path: Path) -> None:
-    """A zero allowance still permits every initial call across many partitions."""
-    seen: list[str] = []
+def test_the_same_options_drive_retry_operation_inside_a_processor(tmp_path: Path) -> None:
+    attempts: list[int] = []
 
-    def processor(inputs: Any, *, context: Any) -> Any:
-        del context
-        [partition] = inputs.partitions()
-        seen.append(partition.partition_id)
-        return partition.load()
+    def inner() -> str:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise ConnectionError("transient")
+        return "done"
 
-    pipeline = Pipeline(
-        name="documents",
-        stages=[Stage(name="prepare", entries=[Step(processor, retry=NO_DELAY)])],
-    )
-    result = run(
-        pipeline,
-        job_id="j1",
-        source=InMemorySource({"a": {"v": 1}, "b": {"v": 2}, "c": {"v": 3}}),
-        storage=_storage(tmp_path),
-        policy=ExecutionPolicy(max_retry_attempts=0),
-    )
-    assert result.status == "completed"
-    assert sorted(seen) == ["a", "b", "c"]
+    def processor(value: Any, *, context: Any) -> Any:
+        result, count = retry_operation(operation=inner, retry=NO_DELAY)
+        return {"result": result, "attempts": count}
+
+    run(_pipeline(Step(processor)), output=tmp_path / "output")
+    assert len(attempts) == 3
 
 
-def test_a_retry_stops_rather_than_overrunning_the_invocation_deadline(
-    tmp_path: Path,
-) -> None:
-    calls = {"n": 0}
+def test_an_exhausted_step_retry_surfaces_the_last_failure(tmp_path: Path) -> None:
+    attempts: list[int] = []
 
-    def builder(inputs: Any, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        del context, partition
+    def always_failing(value: Any, *, context: Any) -> Any:
+        attempts.append(1)
+        raise ConnectionError("still transient")
 
-        def call() -> Any:
-            calls["n"] += 1
-            raise ConnectionError("vendor down")
-
-        # A delay far larger than the remaining budget must not be waited out.
-        return retry_operation(
-            operation=call, retry=RetryOptions(max_attempts=5, delay_seconds=lambda a: 600.0)
-        )
-
-    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
-    with pytest.raises(RetryCancelledError):
-        run(
-            pipeline,
-            job_id="j1",
-            source=InMemorySource({"p1": {"id": "p1"}}),
-            storage=_storage(tmp_path),
-            budget=ExecutionBudget(seconds=30.0),
-        )
-    assert calls["n"] == 1
+    options = RetryOptions(max_attempts=3, delay_seconds=lambda attempt: 0.0)
+    with pytest.raises(ConnectionError, match="still transient"):
+        run(_pipeline(Step(always_failing, retry=options)), output=tmp_path / "output")
+    assert len(attempts) == 3
 
 
-def test_execution_policy_validates_the_allowance() -> None:
-    with pytest.raises(ValueError):
-        ExecutionPolicy(max_retry_attempts=-1)
-    with pytest.raises(TypeError):
-        ExecutionPolicy(max_retry_attempts=True)  # type: ignore[arg-type]
-    assert ExecutionPolicy().max_retry_attempts == 100
+def test_a_retried_step_commits_only_its_accepted_output(tmp_path: Path) -> None:
+    import sqlite3
 
+    attempts: list[int] = []
 
-def test_controls_are_isolated_between_invocations(tmp_path: Path) -> None:
-    """A failed invocation leaves the next one a fresh allowance and context."""
-    from caravel.retry import _active_retry_control
+    def flaky(value: Any, *, context: Any) -> Any:
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise ConnectionError("transient")
+        return {"attempts": len(attempts)}
 
-    state = {"fail": True, "calls": 0}
+    run(_pipeline(Step(flaky, name="flaky", retry=NO_DELAY)), output=tmp_path / "output")
 
-    def processor(inputs: Any, *, context: Any) -> Any:
-        del context
-        [partition] = inputs.partitions()
-        state["calls"] = int(state["calls"]) + 1
-        if state["fail"]:
-            raise ConnectionError("vendor down")
-        return partition.load()
-
-    pipeline = Pipeline(
-        name="documents",
-        stages=[
-            Stage(
-                name="prepare",
-                entries=[
-                    Step(
-                        processor,
-                        retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0),
-                    )
-                ],
-            )
-        ],
-    )
-    storage = _storage(tmp_path)
-    source = InMemorySource({"p1": {"id": "p1"}})
-
-    with pytest.raises(ConnectionError):
-        run(pipeline, job_id="j1", source=source, storage=storage)
-    assert _active_retry_control.get() is None
-
-    state["fail"] = False
-    result = run(pipeline, job_id="j1", source=source, storage=storage)
-    assert result.status == "completed"
-    assert _active_retry_control.get() is None
+    connection = sqlite3.connect(tmp_path / ".caravel" / "state.sqlite3")
+    snapshot = connection.execute(
+        "SELECT snapshot FROM steps WHERE step_name = 'flaky'"
+    ).fetchone()[0]
+    connection.close()
+    assert b'"attempts": 2' in snapshot

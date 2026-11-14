@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from caravel import DurableStorage, InMemorySource, Pipeline, Stage, Step, run
+from caravel import DurabilityOptions, InMemorySource, Pipeline, Stage, Step, run
 from caravel.plugins import (
     PluginFailureError,
     RunEvent,
@@ -26,14 +26,21 @@ from caravel.plugins import (
 DOCUMENTS = {"doc-1": {"id": "doc-1"}, "doc-2": {"id": "doc-2"}}
 
 
-def load(inputs, *, context: Any) -> Any:
-    [partition] = inputs.partitions()
-    document: Any = partition.load()
-    return document
+def load(value, *, context: Any) -> Any:
+    documents: Any = dict(value)
+    return documents
+
+
+def summarize(value, *, context: Any) -> Any:
+    return {"documents": len(value)}
 
 
 def _pipeline() -> Pipeline:
-    return Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(load)])])
+    return Pipeline(
+        name="documents",
+        stages=[Stage(name="prepare", entries=[Step(load)])],
+        durability_options=DurabilityOptions(schema_version="v1.0.0", job_id="j1"),
+    )
 
 
 class Recorder:
@@ -83,36 +90,32 @@ class Guard:
 
 def test_an_observer_sees_the_run_and_work_unit_lifecycle(tmp_path: Path) -> None:
     recorder = Recorder()
-    result = run(
+    run(
         _pipeline(),
-        job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path / "output"),
+        output=tmp_path / "output",
         plugins=[recorder],
     )
-    assert result.status == "completed"
 
     kinds = [event.kind for event in recorder.events]
     assert kinds[0] == "run_started"
     assert kinds[-1] == "run_completed"
-    assert kinds.count("node_started") == len(DOCUMENTS)
-    assert kinds.count("node_completed") == len(DOCUMENTS)
+    assert kinds.count("node_started") == 1
+    assert kinds.count("node_completed") == 1
 
 
 def test_event_facts_describe_the_durable_work_unit(tmp_path: Path) -> None:
     recorder = Recorder()
     run(
         _pipeline(),
-        job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path / "output"),
+        output=tmp_path / "output",
         plugins=[recorder],
     )
     completed = [e for e in recorder.events if e.kind == "node_completed"]
     node = completed[0].node
     assert node is not None
-    assert node.partition_id in DOCUMENTS
-    assert node.input_scope == "partition"
+    assert node.node_id == "stage-001-entry-001"
     assert node.dataset_type == "JSONDataset"
     assert node.name == "load"
 
@@ -127,10 +130,11 @@ def test_an_ephemeral_run_tells_observers_it_is_not_restart_safe(
     tmp_path: Path,
 ) -> None:
     recorder = Recorder()
+    in_memory = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(load)])])
     run(
-        _pipeline(),
+        in_memory,
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.ephemeral(tmp_path / "output"),
+        output=tmp_path / "output",
         plugins=[recorder],
     )
     assert all(event.run.restart_safe is False for event in recorder.events)
@@ -140,9 +144,8 @@ def test_a_required_observer_failure_fails_the_run(tmp_path: Path) -> None:
     with pytest.raises(PluginFailureError, match="Required observer"):
         run(
             _pipeline(),
-            job_id="j1",
             source=InMemorySource(DOCUMENTS),
-            storage=DurableStorage.at(tmp_path / "output"),
+            output=tmp_path / "output",
             plugins=[Exploder("required")],
         )
 
@@ -150,29 +153,25 @@ def test_a_required_observer_failure_fails_the_run(tmp_path: Path) -> None:
 def test_a_best_effort_observer_failure_does_not_fail_the_run(
     tmp_path: Path,
 ) -> None:
-    result = run(
+    run(
         _pipeline(),
-        job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path / "output"),
+        output=tmp_path / "output",
         plugins=[Exploder("best_effort")],
     )
-    assert result.status == "completed"
 
 
 def test_committed_work_survives_a_required_observer_failure(tmp_path: Path) -> None:
     """An observer cannot undo what already committed."""
-    storage = DurableStorage.at(tmp_path / "output")
     pipeline = _pipeline()
     with pytest.raises(PluginFailureError):
         run(
             pipeline,
-            job_id="j1",
             source=InMemorySource(DOCUMENTS),
-            storage=storage,
+            output=tmp_path / "output",
             plugins=[Exploder("required")],
         )
-    assert len(storage.results(pipeline, job_id="j1").of("load")) >= 1
+    assert (tmp_path / "output").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +183,8 @@ def test_guards_enter_in_order_and_exit_in_reverse(tmp_path: Path) -> None:
     log: list[str] = []
     run(
         _pipeline(),
-        job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path / "output"),
+        output=tmp_path / "output",
         plugins=[Guard("outer", log), Guard("inner", log)],
     )
     assert log == [
@@ -200,17 +198,15 @@ def test_guards_enter_in_order_and_exit_in_reverse(tmp_path: Path) -> None:
 def test_a_failing_run_still_exits_its_guards(tmp_path: Path) -> None:
     log: list[str] = []
 
-    def explode(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
+    def explode(value, *, context: Any) -> Any:
         raise RuntimeError("step failed")
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(explode)])])
     with pytest.raises(RuntimeError, match="step failed"):
         run(
             pipeline,
-            job_id="j1",
             source=InMemorySource(DOCUMENTS),
-            storage=DurableStorage.at(tmp_path / "output"),
+            output=tmp_path / "output",
             plugins=[Guard("outer", log)],
         )
     assert log == ["enter:outer", "exit:outer:failed"]
@@ -221,9 +217,8 @@ def test_teardown_is_attempted_for_every_entered_guard(tmp_path: Path) -> None:
     with pytest.raises(PluginFailureError, match="teardown failed"):
         run(
             _pipeline(),
-            job_id="j1",
             source=InMemorySource(DOCUMENTS),
-            storage=DurableStorage.at(tmp_path / "output"),
+            output=tmp_path / "output",
             plugins=[Guard("outer", log), Guard("inner", log, fail_exit=True)],
         )
     # The outer guard still got its exit despite the inner one failing.
@@ -289,14 +284,12 @@ def test_the_evidence_plugin_records_a_real_run(tmp_path: Path) -> None:
     evidence = RunEvidencePlugin(metadata_root=tmp_path / "metadata")
     result = run(
         _pipeline(),
-        job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path / "output"),
+        output=tmp_path / "output",
         plugins=[evidence],
     )
-    assert result.status == "completed"
 
-    events_dir = Path(evidence.events_dir(result.invocation_id))
+    events_dir = Path(evidence.events_dir(result.job_id))
     written = sorted(events_dir.glob("*.json"))
     assert written, "a completed run must leave evidence"
 
@@ -310,22 +303,17 @@ def test_the_evidence_plugin_records_a_real_run(tmp_path: Path) -> None:
 
     assert kinds[0] == "run_started"
     assert kinds[-1] == "run_completed"
-    assert kinds.count("node_started") == len(DOCUMENTS)
+    assert kinds.count("node_started") == 1
 
     node_events = [
         json.loads(path.read_text()) for path in written if json.loads(path.read_text())["node"]
     ]
     node = node_events[0]["node"]
-    assert node["partition_id"] in DOCUMENTS
-    assert node["input_scope"] == "partition"
-    assert Path(evidence.summary_path(result.invocation_id)).is_file()
+    assert node["node_id"] == "stage-001-entry-001"
+    assert Path(evidence.summary_path(result.job_id)).is_file()
 
 
-def test_the_evidence_plugin_records_an_all_scope_node(tmp_path: Path) -> None:
-    def summarize(inputs, *, context: Any) -> Any:
-        del context
-        return {"documents": sum(1 for _ in inputs.partitions())}
-
+def test_the_evidence_plugin_records_every_declared_node(tmp_path: Path) -> None:
     from caravel.plugins.run_evidence import RunEvidencePlugin
 
     evidence = RunEvidencePlugin(metadata_root=tmp_path / "metadata")
@@ -333,21 +321,20 @@ def test_the_evidence_plugin_records_an_all_scope_node(tmp_path: Path) -> None:
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, input_scope="all")]),
+            Stage(name="finish", entries=[Step(summarize)]),
         ],
+        durability_options=DurabilityOptions(schema_version="v1.0.0", job_id="j1"),
     )
     result = run(
         pipeline,
-        job_id="j1",
         source=InMemorySource(DOCUMENTS),
-        storage=DurableStorage.at(tmp_path / "output"),
+        output=tmp_path / "output",
         plugins=[evidence],
     )
-    assert result.status == "completed"
 
-    scopes = {
-        json.loads(path.read_text())["node"]["input_scope"]
-        for path in Path(evidence.events_dir(result.invocation_id)).glob("*.json")
+    names = {
+        json.loads(path.read_text())["node"]["name"]
+        for path in Path(evidence.events_dir(result.job_id)).glob("*.json")
         if json.loads(path.read_text())["node"]
     }
-    assert scopes == {"partition", "all"}
+    assert names == {"load", "summarize"}

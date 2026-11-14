@@ -22,6 +22,12 @@ from .storage import (
 from .types import CheckpointIntegrityError, EmptyOutputError
 
 
+def _json_utf8_codec() -> Any:
+    from .durability.codecs import JSON_UTF8_CODEC
+
+    return JSON_UTF8_CODEC
+
+
 @runtime_checkable
 class ValidatedDataset(Protocol):
     """Internal structural contract for datasets that pre-validate payloads.
@@ -234,6 +240,10 @@ class JSONDataset:
         fs, output_path = resolve_fs(output_file, self.storage_options)
         return bool(fs.exists(output_path))
 
+    def snapshot_codec(self) -> Any:
+        """Snapshots of this dataset's payloads are stored as UTF-8 JSON."""
+        return _json_utf8_codec()
+
     def describe(self) -> dict[str, Any]:
         return {
             "dataset": self.__class__.__name__,
@@ -325,6 +335,10 @@ class PartitionedJSONDataset:
     def exists(self, dest: Path | str) -> bool:
         return partitioned_output_exists(dest, ".json", self.storage_options)
 
+    def snapshot_codec(self) -> Any:
+        """Snapshots of this dataset's payloads are stored as UTF-8 JSON."""
+        return _json_utf8_codec()
+
     def describe(self) -> dict[str, Any]:
         return {
             "dataset": self.__class__.__name__,
@@ -402,6 +416,10 @@ class TextDataset:
         output_file = single_output_path(dest, self.suffix)
         fs, output_path = resolve_fs(output_file, self.storage_options)
         return bool(fs.exists(output_path))
+
+    def snapshot_codec(self) -> Any:
+        """Snapshots of this dataset's payloads are stored as UTF-8 JSON."""
+        return _json_utf8_codec()
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -494,6 +512,10 @@ class PartitionedTextDataset:
 
     def exists(self, dest: Path | str) -> bool:
         return partitioned_output_exists(dest, self.suffix, self.storage_options)
+
+    def snapshot_codec(self) -> Any:
+        """Snapshots of this dataset's payloads are stored as UTF-8 JSON."""
+        return _json_utf8_codec()
 
     def describe(self) -> dict[str, Any]:
         return {

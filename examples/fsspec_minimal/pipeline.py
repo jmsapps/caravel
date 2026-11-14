@@ -11,12 +11,10 @@ Set ``CARAVEL_ARTIFACTS_ROOT`` to an fsspec URL (``s3://``, ``az://``,
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Mapping
 
 from caravel import (
-    DurableStorage,
     JSONDataset,
     Pipeline,
     Stage,
@@ -24,6 +22,8 @@ from caravel import (
     dataset_as_loader,
     run,
 )
+
+from ..support import durable
 
 PIPELINE_NAME = "fsspec_minimal_example"
 BRONZE_STAGE_NAME = "bronze"
@@ -43,12 +43,11 @@ def _runtime_params(context: object) -> Mapping[str, str]:
     return {}
 
 
-def bronze_collect(inputs, *, context: object) -> dict[str, Any]:
+def bronze_collect(value, *, context: object) -> dict[str, Any]:
     """Add bronze fields to one execution partition's record."""
     records = {}
-    for partition in inputs.partitions():
-        record = partition.load()
-        records[partition.partition_id] = {
+    for _key, record in value.items():
+        records[_key] = {
             **record,
             "bronze": True,
             "doubled_value": int(record["value"]) * 2,
@@ -56,26 +55,24 @@ def bronze_collect(inputs, *, context: object) -> dict[str, Any]:
     return records
 
 
-def silver_transform(inputs, *, context: object) -> dict[str, Any]:
+def silver_transform(value, *, context: object) -> dict[str, Any]:
     """Normalize one bronze record."""
     records = {}
-    for partition in inputs.partitions():
-        for key, record in partition.load().items():
-            if key in records:
-                raise ValueError(f"Duplicate record key: {key}")
-            records[key] = {**record, "normalized": float(record["doubled_value"]) / 4.0}
+    for key, record in value.items():
+        if key in records:
+            raise ValueError(f"Duplicate record key: {key}")
+        records[key] = {**record, "normalized": float(record["doubled_value"]) / 4.0}
     return records
 
 
-def silver_finalize(inputs, *, context: object) -> dict[str, Any]:
+def silver_finalize(value, *, context: object) -> dict[str, Any]:
     """Aggregate every committed partition behind an all-input barrier."""
     params = _runtime_params(context)
     records = {}
-    for partition in inputs.partitions():
-        for key, record in partition.load().items():
-            if key in records:
-                raise ValueError(f"Duplicate record key: {key}")
-            records[key] = record
+    for key, record in value.items():
+        if key in records:
+            raise ValueError(f"Duplicate record key: {key}")
+        records[key] = record
     ordered_keys = sorted(records)
     payload: dict[str, Any] = {
         "pipeline": PIPELINE_NAME,
@@ -102,15 +99,14 @@ def build_fsspec_pipeline(
         stages=[
             Stage(
                 name=BRONZE_STAGE_NAME,
-                entries=[Step(bronze_collect, output=JSONDataset(), revision="2")],
+                entries=[Step(bronze_collect, output=JSONDataset())],
             ),
             Stage(
                 name=SILVER_STAGE_NAME,
                 entries=[
-                    Step(silver_transform, output=JSONDataset(), revision="2"),
+                    Step(silver_transform, output=JSONDataset()),
                     Step(
                         silver_finalize,
-                        input_scope="all",
                         output=JSONDataset(name="finalize"),
                     ),
                 ],
@@ -122,18 +118,9 @@ def build_fsspec_pipeline(
     )
 
 
-def build_fsspec_storage(
-    *,
-    state_root: Path | str,
-    artifacts_root: str | Path | None = None,
-    storage_options: Mapping[str, Any] | None = None,
-) -> DurableStorage:
-    """Local authoritative state; artifacts wherever they are configured."""
-    return DurableStorage.at(
-        Path(state_root) / "output",
-        artifacts_root=artifacts_root or os.getenv("CARAVEL_ARTIFACTS_ROOT"),
-        storage_options=storage_options,
-    )
+def build_fsspec_output(*, state_root: Path | str) -> Path:
+    """Where this example's generated output goes."""
+    return Path(state_root) / "output"
 
 
 def run_fsspec_pipeline(
@@ -147,12 +134,11 @@ def run_fsspec_pipeline(
 ) -> Any:
     """Run the example and return its structured status."""
     pipeline = build_fsspec_pipeline(input_path=input_path, storage_options=storage_options)
-    storage = build_fsspec_storage(
-        state_root=state_root,
-        artifacts_root=artifacts_root,
-        storage_options=storage_options,
+    return run(
+        durable(pipeline, job_id),
+        output=build_fsspec_output(state_root=state_root),
+        params=params,
     )
-    return run(pipeline, job_id=job_id, storage=storage, params=params)
 
 
 __all__ = [
@@ -163,6 +149,6 @@ __all__ = [
     "SILVER_TRANSFORM_STEP_NAME",
     "SILVER_FINALIZE_STEP_NAME",
     "build_fsspec_pipeline",
-    "build_fsspec_storage",
+    "build_fsspec_output",
     "run_fsspec_pipeline",
 ]

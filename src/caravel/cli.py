@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
-from .durability.storage import DurableStorage, LegacyStateError
+from .options import DurabilityOptions
 from .runner import run
 from .viz import to_mermaid
 
@@ -42,6 +42,7 @@ def make_cli(
     pipeline: Any,
     *,
     run_fn: RunFn = run,
+    default_output: Path | str | None = None,
     mermaid_fn: MermaidFn | None = to_mermaid,
     plugins: Sequence[Any] | None = None,
     source: Any = None,
@@ -56,37 +57,41 @@ def make_cli(
         prog=pipeline.name,
         description=f"Run the '{pipeline.name}' pipeline.",
     )
-    default_output = Path("data") / pipeline.name / "output"
+    resolved_default = (
+        Path(default_output)
+        if default_output is not None
+        else Path("data") / pipeline.name / "output"
+    )
     parser.add_argument(
         "--output",
         default=None,
         metavar="PATH",
-        help=(f"Where published results go. Default: {default_output}. May be an fsspec URL."),
+        help=(f"Where generated output goes. Default: {resolved_default}. May be an fsspec URL."),
     )
     parser.add_argument(
         "--state",
         default=None,
         metavar="PATH",
         help=(
-            "Recovery storage directory: the progress store and attempt "
-            "artifacts. Reserved for Caravel; deleting it loses the ability to "
-            "resume. Default: '.caravel' beside the output directory, or "
-            f"data/{pipeline.name}/.caravel when output is remote."
-        ),
-    )
-    parser.add_argument(
-        "--ephemeral",
-        action="store_true",
-        help=(
-            "Use throwaway recovery storage. Published results still go to the "
-            "configured output; nothing resumes and the run reports "
-            "restart_safe=false."
+            "Recovery directory holding the pipeline's database. Reserved for "
+            "Caravel; it is what lets a job resume. Default: '.caravel' beside "
+            f"the output directory, or data/{pipeline.name}/.caravel when "
+            "output is remote."
         ),
     )
     parser.add_argument(
         "--job-id",
         default=None,
-        help="Identity of this bounded run. Required unless --ephemeral.",
+        help=(
+            "Identity this run resumes under. Supplying it makes the run durable: "
+            "committed steps are restored instead of recomputed."
+        ),
+    )
+    parser.add_argument(
+        "--commit-scope",
+        default="step",
+        choices=("pipeline", "stage", "step"),
+        help="When a durable run commits. Default: step.",
     )
     parser.add_argument(
         "--param",
@@ -110,49 +115,43 @@ def make_cli(
             print(mermaid_fn(pipeline))
             return 0
 
-        if args.ephemeral and args.state:
-            parser.error(
-                "--ephemeral uses throwaway recovery storage, so --state has no effect. Choose one."
-            )
-        if not args.ephemeral and not args.job_id:
-            parser.error(
-                "--job-id is required: a durable run needs a stable identity to "
-                "resume. Use --ephemeral for a throwaway run."
-            )
-
         try:
             params = _parse_params(args.param)
         except ValueError as error:
             parser.error(str(error))
 
-        output = args.output if args.output is not None else default_output
+        output = args.output if args.output is not None else resolved_default
+        state = args.state
+        if state is None and "://" in str(output):
+            # Remote output cannot host the recovery database; fall back to a
+            # documented pipeline-scoped local directory.
+            state = Path("data") / pipeline.name / ".caravel"
+
+        if args.job_id:
+            pipeline.durability_options = DurabilityOptions(
+                schema_version="v1.0.0",
+                job_id=args.job_id,
+                commit_scope=args.commit_scope,
+            )
+
         try:
-            if args.ephemeral:
-                storage = DurableStorage.ephemeral(output)
-            else:
-                state = args.state
-                if state is None and "://" in str(output):
-                    # Remote output cannot host the progress store; fall back to
-                    # a documented pipeline-scoped local directory.
-                    state = Path("data") / pipeline.name / ".caravel"
-                storage = DurableStorage.at(output, state=state)
-        except (ValueError, LegacyStateError) as error:
+            result = run_fn(
+                pipeline,
+                output=output,
+                state=state,
+                source=source if source is not None else pipeline.source,
+                params=params or None,
+                plugins=tuple(plugins) if plugins is not None else (),
+            )
+        except ValueError as error:
             parser.error(str(error))
 
-        result = run_fn(
-            pipeline,
-            job_id=args.job_id,
-            source=source if source is not None else pipeline.source,
-            storage=storage,
-            params=params or None,
-            plugins=tuple(plugins) if plugins is not None else (),
-        )
         print(
-            f"status={result.status} job_id={result.job_id} "
-            f"batches={result.committed_batches} restart_safe={result.restart_safe}"
+            f"pipeline={result.pipeline_name} job_id={result.job_id} "
+            f"executed={result.steps_executed} restored={result.steps_restored}"
         )
-        print(f"output={storage.output_root}")
-        return 0 if result.status in ("completed", "caught_up", "yielded") else 1
+        print(f"output={result.output_root}")
+        return 0
 
     return entrypoint
 

@@ -10,12 +10,9 @@ Retry is always explicit. A boundary with ``retry=None`` does not retry, and an
 enabled boundary does not implicitly enable its nested boundaries, because
 nested attempts multiply. ``RetryOptions()`` selects the documented defaults.
 
-Inside managed execution a private control is installed in a ``ContextVar``, so
-a :func:`retry_operation` call written inside a callback inherits the
-invocation's deadline, cancellation state, ownership facts, and shared retry
-allowance without the caller passing a context argument. Outside the runner the
-same function runs with ordinary sleeping and its own local limits, and claims
-no durable recovery.
+One retry loop serves every boundary. :func:`retry_operation` is callable
+anywhere -- inside a processor to retry a smaller scope, or in ordinary
+application code -- and repeats only the operation it is given.
 
 Retries do not provide exactly-once effects. Every retried scope must be
 replay-safe: a timeout can occur after an external write already succeeded.
@@ -26,9 +23,8 @@ from __future__ import annotations
 import math
 import random
 import time
-from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, TypeVar
+from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
 
@@ -158,23 +154,6 @@ class RetryOptions:
                 )
 
 
-class _RetryControl(Protocol):
-    """The private hook managed execution installs around user callbacks."""
-
-    def before_attempt(self, attempt: int) -> None:
-        """Check deadline/cancellation/ownership and charge shared retries."""
-        ...
-
-    def wait(self, seconds: float) -> None:
-        """Wait within the active budget, or raise before it expires."""
-        ...
-
-
-_active_retry_control: ContextVar[_RetryControl | None] = ContextVar(
-    "caravel_retry_control", default=None
-)
-
-
 def retry_operation(
     *,
     operation: Callable[[], T],
@@ -195,12 +174,8 @@ def retry_operation(
     if not callable(operation):
         raise TypeError(f"operation must be callable, got {type(operation).__name__}.")
     options = retry if retry is not None else RetryOptions()
-    control = _active_retry_control.get()
 
     for attempt in range(1, options.max_attempts + 1):
-        if control is not None:
-            control.before_attempt(attempt)
-
         try:
             result = operation()
         except RetryError:
@@ -235,10 +210,7 @@ def retry_operation(
             or delay < 0
         ):
             raise RetryPolicyError("Retry delay must be finite and nonnegative.")
-        if control is None:
-            time.sleep(delay)
-        else:
-            control.wait(delay)
+        time.sleep(delay)
 
     raise AssertionError("Retry operation completed without a result.")
 

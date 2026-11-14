@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -24,15 +25,13 @@ class _StubLoader:
 
 
 def _linear_pipeline(name: str = "linear_demo") -> Pipeline:
-    def normalize(inputs, *, context: object) -> dict[str, dict[str, object]]:
-        [partition] = inputs.partitions()
-        partitions: dict[str, dict[str, object]] = partition.load()
+    def normalize(value, *, context: Any) -> dict[str, dict[str, object]]:
+        partitions: dict[str, dict[str, object]] = value
         _ = context
         return partitions
 
-    def summarize(inputs, *, context: object) -> dict[str, object]:
-        [partition] = inputs.partitions()
-        partitions: dict[str, dict[str, object]] = partition.load()
+    def summarize(value, *, context: Any) -> dict[str, object]:
+        partitions: dict[str, dict[str, object]] = value
         _ = context
         return {"count": len(partitions)}
 
@@ -51,21 +50,18 @@ def _linear_pipeline(name: str = "linear_demo") -> Pipeline:
 
 
 def _branching_pipeline() -> Pipeline:
-    def parse(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def parse(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
-    def normalize(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def normalize(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
-    def decode(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def decode(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
@@ -156,15 +152,13 @@ def test_node_ids_are_index_based_and_survive_renames() -> None:
 
 
 def test_repeated_route_step_names_across_routes_get_distinct_node_ids() -> None:
-    def normalize(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def normalize(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
-    def normalize_right(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def normalize_right(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
@@ -188,9 +182,8 @@ def test_repeated_route_step_names_across_routes_get_distinct_node_ids() -> None
 
 
 def test_duplicate_route_step_names_within_one_route_are_rejected() -> None:
-    def normalize(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def normalize(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
@@ -220,9 +213,8 @@ def test_non_callable_route_entry_is_rejected() -> None:
 
 
 def test_bare_route_callable_uses_documented_step_defaults() -> None:
-    def normalize(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def normalize(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
@@ -238,9 +230,8 @@ def test_bare_route_callable_uses_documented_step_defaults() -> None:
 
 
 def test_unsupported_branch_by_shape_is_rejected() -> None:
-    def fine(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def fine(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
@@ -266,9 +257,8 @@ def test_branch_without_routes_is_rejected() -> None:
 
 
 def test_empty_route_step_list_models_pass_through_to_merge() -> None:
-    def only(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def only(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
@@ -296,9 +286,8 @@ def test_empty_route_step_list_models_pass_through_to_merge() -> None:
     ["with/slash", "with\\backslash", "..", ""],
 )
 def test_path_unsafe_stage_names_are_rejected(bad_name: str) -> None:
-    def fine(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def fine(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
@@ -319,9 +308,8 @@ def test_path_unsafe_stage_names_are_rejected(bad_name: str) -> None:
 
 
 def test_path_unsafe_route_keys_are_rejected() -> None:
-    def fine(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def fine(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 
@@ -336,9 +324,8 @@ def test_path_unsafe_route_keys_are_rejected() -> None:
 
 
 def test_empty_stage_compiles_to_no_nodes_and_preserves_flow() -> None:
-    def final(inputs, *, context: object) -> object:
-        [partition] = inputs.partitions()
-        partitions: object = partition.load()
+    def final(value, *, context: Any) -> object:
+        partitions: object = value
         _ = context
         return partitions
 

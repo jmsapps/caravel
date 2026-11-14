@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from caravel import (
-    DurableStorage,
+    DurabilityOptions,
     JSONDataset,
     PartitionedJSONDataset,
     Pipeline,
@@ -24,28 +24,21 @@ SILVER_TRANSFORM_STEP_NAME = "silver_transform"
 _DEFAULT_INPUT_PATH = Path(__file__).resolve().parent / "data" / "input_partitions.json"
 
 
-def bronze_collect(inputs, *, context: object) -> dict[str, Any]:
-    """Add bronze fields to the available records."""
-    records = {}
-    for partition in inputs.partitions():
-        record = partition.load()
-        records[partition.partition_id] = {
-            **record,
-            "bronze": True,
-            "doubled_value": int(record["value"]) * 2,
-        }
-    return records
+def bronze_collect(value, *, context: object) -> dict[str, Any]:
+    """Add bronze fields to every incoming record."""
+
+    return {
+        key: {**record, "bronze": True, "doubled_value": int(record["value"]) * 2}
+        for key, record in value.items()
+    }
 
 
-def silver_transform(inputs, *, context: object) -> dict[str, Any]:
-    """Normalize available bronze records without assuming one input handle."""
-    records = {}
-    for partition in inputs.partitions():
-        for key, record in partition.load().items():
-            if key in records:
-                raise ValueError(f"Duplicate record key: {key}")
-            records[key] = {**record, "normalized": float(record["doubled_value"]) / 4.0}
-    return records
+def silver_transform(value, *, context: object) -> dict[str, Any]:
+    """Normalize every bronze record."""
+    return {
+        key: {**record, "normalized": float(record["doubled_value"]) / 4.0}
+        for key, record in value.items()
+    }
 
 
 def build_minimal_pipeline(input_path: Path | str | None = None) -> Pipeline:
@@ -78,14 +71,12 @@ def run_minimal_pipeline(
     input_path: Path | str | None = None,
     params: dict[str, str] | None = None,
 ) -> Any:
-    """Run the minimal example and return its structured status."""
+    """Run the minimal example durably and return its result."""
     pipeline = build_minimal_pipeline(input_path=input_path)
-    return run(
-        pipeline,
-        job_id=job_id,
-        storage=DurableStorage.at(Path(state_root) / "output"),
-        params=params,
+    pipeline.durability_options = DurabilityOptions(
+        schema_version="v1.0.0", job_id=job_id, commit_scope="step"
     )
+    return run(pipeline, output=Path(state_root) / "output", params=params)
 
 
 __all__ = [

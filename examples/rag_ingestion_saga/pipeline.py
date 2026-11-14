@@ -9,7 +9,6 @@ from typing import Any, Callable, Mapping, cast
 from caravel import (
     Branch,
     CallableLoader,
-    DurableStorage,
     JSONDataset,
     Pipeline,
     Stage,
@@ -17,6 +16,9 @@ from caravel import (
     run,
 )
 from caravel.plugins import RunFacts, RunOutcome
+
+from ..support import durable
+
 
 PIPELINE_NAME = "rag_ingestion_saga_example"
 _DEFAULT_INPUT = Path(__file__).resolve().parent / "data" / "document.json"
@@ -100,14 +102,13 @@ def build_rag_ingestion_pipeline(
 ) -> Pipeline:
     seed = Path(input_path) if input_path is not None else _DEFAULT_INPUT
 
-    def stage_chunks(inputs, *, context: object) -> dict[str, Any]:
+    def stage_chunks(value, *, context: object) -> dict[str, Any]:
         documents = {}
         saga.record("delete_staging")
         staging = saga.root / "staging"
         shutil.rmtree(staging, ignore_errors=True)
         chunk_index = 0
-        for partition in inputs.partitions():
-            document = partition.load()
+        for _key, document in value.items():
             words = str(document["text"]).split()
             chunks = [words[index : index + 4] for index in range(0, len(words), 4)]
             for chunk in chunks:
@@ -116,16 +117,15 @@ def build_rag_ingestion_pipeline(
                     staging / f"chunk-{chunk_index:03d}.json",
                     {"text": " ".join(chunk), "vector": [chunk_index, len(chunk)]},
                 )
-            documents[partition.partition_id] = {**document, "chunk_count": len(chunks)}
+            documents[_key] = {**document, "chunk_count": len(chunks)}
         return documents
 
-    def replace_index(inputs, *, context: object) -> dict[str, Any]:
+    def replace_index(value, *, context: object) -> dict[str, Any]:
         documents = {}
-        for partition in inputs.partitions():
-            for key, payload in partition.load().items():
-                if key in documents:
-                    raise ValueError(f"Duplicate document key: {key}")
-                documents[key] = {**payload, "index_recreated": True}
+        for key, payload in value.items():
+            if key in documents:
+                raise ValueError(f"Duplicate document key: {key}")
+            documents[key] = {**payload, "index_recreated": True}
         saga.record("restore_index")
         _replace_dir(saga.root / "index", saga.root / "index.backup")
         _write(
@@ -139,25 +139,23 @@ def build_rag_ingestion_pipeline(
         )
         return documents
 
-    def promote_chunks(inputs, *, context: object) -> dict[str, Any]:
+    def promote_chunks(value, *, context: object) -> dict[str, Any]:
         documents = {}
-        for partition in inputs.partitions():
-            for key, payload in partition.load().items():
-                if key in documents:
-                    raise ValueError(f"Duplicate document key: {key}")
-                documents[key] = {**payload, "chunks_promoted": True}
+        for key, payload in value.items():
+            if key in documents:
+                raise ValueError(f"Duplicate document key: {key}")
+            documents[key] = {**payload, "chunks_promoted": True}
         saga.record("restore_current")
         _replace_dir(saga.root / "current", saga.root / "current.backup")
         _replace_dir(saga.root / "staging", saga.root / "current")
         return documents
 
-    def commit_version(inputs, *, context: object) -> dict[str, Any]:
+    def commit_version(value, *, context: object) -> dict[str, Any]:
         documents = {}
-        for partition in inputs.partitions():
-            for key, payload in partition.load().items():
-                if key in documents:
-                    raise ValueError(f"Duplicate document key: {key}")
-                documents[key] = {**payload, "status": "committed"}
+        for key, payload in value.items():
+            if key in documents:
+                raise ValueError(f"Duplicate document key: {key}")
+            documents[key] = {**payload, "status": "committed"}
         shutil.copy2(saga.root / "version.json", saga.root / "version.backup.json")
         saga.record("restore_version")
         _write(
@@ -170,10 +168,10 @@ def build_rag_ingestion_pipeline(
         return documents
 
     entries: list[Step | Branch | Callable[..., Any]] = [
-        Step(stage_chunks, JSONDataset(), name="stage_chunks", revision="2"),
-        Step(replace_index, JSONDataset(), name="replace_index", revision="2"),
-        Step(promote_chunks, JSONDataset(), name="promote_chunks", revision="2"),
-        Step(commit_version, JSONDataset(), name="commit_version", revision="2"),
+        Step(stage_chunks, JSONDataset(), name="stage_chunks"),
+        Step(replace_index, JSONDataset(), name="replace_index"),
+        Step(promote_chunks, JSONDataset(), name="promote_chunks"),
+        Step(commit_version, JSONDataset(), name="commit_version"),
     ]
 
     # One document is one execution partition.
@@ -192,9 +190,8 @@ def run_rag_ingestion(
 ) -> Path | str:
     saga = RagWorkspaceSaga(workspace_root)
     return run(
-        build_rag_ingestion_pipeline(saga),
-        job_id="rag-1",
-        storage=DurableStorage.at(Path(state_root) / "output"),
+        durable(build_rag_ingestion_pipeline(saga), "rag-1"),
+        output=Path(state_root) / "output",
         params={"fail": "true"} if fail else None,
         plugins=[saga],
     )

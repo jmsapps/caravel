@@ -11,12 +11,10 @@ roots.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Mapping
 
 from caravel import (
-    DurableStorage,
     JSONDataset,
     PartitionedJSONDataset,
     PartitionedTextDataset,
@@ -26,6 +24,8 @@ from caravel import (
     dataset_as_loader,
     run,
 )
+
+from ..support import durable
 
 PIPELINE_NAME = "fsspec_partitioned_example"
 BRONZE_STAGE_NAME = "bronze"
@@ -44,11 +44,10 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx : value.index(end, start_idx)]
 
 
-def bronze_render_html(inputs, *, context: object) -> dict[str, str]:
+def bronze_render_html(value, *, context: object) -> dict[str, str]:
     """Render one source record into a deterministic HTML partition."""
     rendered = {}
-    for partition in inputs.partitions():
-        record = partition.load()
+    for _key, record in value.items():
         item_id = str(record["id"])
         if item_id in rendered:
             raise ValueError(f"Duplicate record key: {item_id}")
@@ -61,33 +60,31 @@ def bronze_render_html(inputs, *, context: object) -> dict[str, str]:
     return rendered
 
 
-def silver_extract_structured(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+def silver_extract_structured(value, *, context: object) -> dict[str, dict[str, Any]]:
     """Convert one partition's bronze HTML back into structured records."""
     structured: dict[str, dict[str, Any]] = {}
-    for partition in inputs.partitions():
-        for key, html in sorted(partition.load().items()):
-            if key in structured:
-                raise ValueError(f"Duplicate record key: {key}")
-            snippet = _extract_between(html, "<p>", "</p>")
-            structured[key] = {
-                "id": _extract_between(html, "data-id='", "'"),
-                "lang": _extract_between(html, "data-lang='", "'"),
-                "title": _extract_between(html, "<h1>", "</h1>"),
-                "snippet": snippet,
-                "normalized_snippet": snippet.lower(),
-            }
+    for key, html in sorted(value.items()):
+        if key in structured:
+            raise ValueError(f"Duplicate record key: {key}")
+        snippet = _extract_between(html, "<p>", "</p>")
+        structured[key] = {
+            "id": _extract_between(html, "data-id='", "'"),
+            "lang": _extract_between(html, "data-lang='", "'"),
+            "title": _extract_between(html, "<h1>", "</h1>"),
+            "snippet": snippet,
+            "normalized_snippet": snippet.lower(),
+        }
     return structured
 
 
-def gold_summarize(inputs, *, context: object) -> dict[str, Any]:
+def gold_summarize(value, *, context: object) -> dict[str, Any]:
     """Summarize every committed partition behind an all-input barrier."""
     _ = context
     languages: dict[str, int] = {}
     total = 0
-    for partition in inputs.partitions():
-        for record in partition.load().values():
-            languages[str(record["lang"])] = languages.get(str(record["lang"]), 0) + 1
-            total += 1
+    for record in value.values():
+        languages[str(record["lang"])] = languages.get(str(record["lang"]), 0) + 1
+        total += 1
     return {
         "pipeline": PIPELINE_NAME,
         "total_records": total,
@@ -122,7 +119,6 @@ def build_fsspec_partitioned_pipeline(
                 entries=[
                     Step(
                         gold_summarize,
-                        input_scope="all",
                         output=JSONDataset(name="summary"),
                     )
                 ],
@@ -150,12 +146,7 @@ def run_fsspec_partitioned_pipeline(
     pipeline = build_fsspec_partitioned_pipeline(
         input_dir=input_dir, storage_options=storage_options
     )
-    storage = DurableStorage.at(
-        Path(state_root) / "output",
-        artifacts_root=artifacts_root or os.getenv("CARAVEL_ARTIFACTS_ROOT"),
-        storage_options=storage_options,
-    )
-    return run(pipeline, job_id=job_id, storage=storage)
+    return run(durable(pipeline, job_id), output=Path(state_root) / "output")
 
 
 __all__ = [

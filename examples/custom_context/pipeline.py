@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from caravel import (
-    DurableStorage,
     JSONDataset,
     Pipeline,
     Stage,
@@ -20,6 +19,8 @@ from caravel import (
     StepContext,
     run,
 )
+
+from ..support import durable
 
 PIPELINE_NAME = "custom_context_example"
 STAGE_NAME = "summary"
@@ -47,9 +48,9 @@ def make_job_context(context: StepContext) -> JobContext:
     return JobContext(framework=context, job_name=context.pipeline_name.upper())
 
 
-def summarize(inputs, *, context: JobContext) -> dict[str, Any]:
+def summarize(value, *, context: JobContext) -> dict[str, Any]:
     """Aggregate every partition behind an explicit all-input barrier."""
-    records = {partition.partition_id: partition.load() for partition in inputs.partitions()}
+    records = dict(value)
     return {
         "job_name": context.job_name,
         "count": len(records),
@@ -69,7 +70,6 @@ def build_custom_context_pipeline() -> Pipeline:
                 entries=[
                     Step(
                         summarize,
-                        input_scope="all",
                         output=JSONDataset(name="summary"),
                     )
                 ],
@@ -82,9 +82,8 @@ def build_custom_context_pipeline() -> Pipeline:
 def run_custom_context_pipeline(*, state_root: Path | str, job_id: str = "custom-context-1") -> Any:
     """Run the example with an application-supplied context factory."""
     return run(
-        build_custom_context_pipeline(),
-        job_id=job_id,
-        storage=DurableStorage.at(Path(state_root) / "output"),
+        durable(build_custom_context_pipeline(), job_id),
+        output=Path(state_root) / "output",
         context_factory=make_job_context,
     )
 

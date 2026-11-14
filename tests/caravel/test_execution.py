@@ -1,301 +1,196 @@
-"""Behaviour of the one execution model that survives consolidation.
-
-The legacy single-pass runner's selective execution, ``clean_dirs``,
-``stage_root``, ``context_factory``, and ``keep_source_tag`` are gone with it.
-What remains is covered here; the public contract is in
-``test_public_api_acceptance.py``.
-"""
+"""Ordered execution over complete values."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
-
-import pytest
 
 from caravel import (
-    DurableStorage,
+    SOURCE_FIELD,
+    CallableLoader,
+    DurabilityOptions,
     InMemorySource,
     JSONDataset,
+    MultiSourceLoader,
+    PartitionedJSONDataset,
     Pipeline,
     Stage,
     Step,
-    TextDataset,
     run,
 )
 
 
-def _passthrough(inputs, *, context: Any) -> Any:
-    del context
-    [partition] = inputs.partitions()
-    return partition.load()
-
-
-DOCUMENTS = {"doc-1": {"id": "doc-1", "n": 1}, "doc-2": {"id": "doc-2", "n": 2}}
-
-
-def _run(pipeline: Pipeline, tmp_path: Path, **kwargs: Any) -> Any:
-    storage = kwargs.pop("storage", None) or DurableStorage.at(tmp_path / "output")
-    return run(
-        pipeline,
-        job_id=kwargs.pop("job_id", "j1"),
-        source=kwargs.pop("source", InMemorySource(DOCUMENTS)),
-        storage=storage,
-        **kwargs,
+def build(entries, *, source=None, durable=False, job_id="exec-1", stage_name="only"):
+    return Pipeline(
+        name="exec_example",
+        stages=[Stage(name=stage_name, entries=entries)],
+        source=source or InMemorySource({"a": 1}),
+        durability_options=(
+            DurabilityOptions(schema_version="v1.0.0", job_id=job_id, commit_scope="step")
+            if durable
+            else None
+        ),
     )
 
 
-# ---------------------------------------------------------------------------
-# Step context
-# ---------------------------------------------------------------------------
+def test_a_processor_receives_the_complete_upstream_value(tmp_path: Path) -> None:
+    seen = []
 
+    def first(value, *, context):
+        return {"doubled": {key: item * 2 for key, item in value.items()}}
 
-def test_params_reach_the_step_context(tmp_path: Path) -> None:
-    seen: list[str] = []
+    def second(value, *, context):
+        seen.append(value)
+        return value
 
-    def capture(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        document: Any = partition.load()
-        seen.append(context.params["env"])
-        return document
-
-    _run(
-        Pipeline(name="p", stages=[Stage(name="s", entries=[Step(capture)])]),
-        tmp_path,
-        params={"env": "staging"},
+    run(
+        build([Step(first), Step(second)], source=InMemorySource({"a": 1, "b": 2})),
+        output=tmp_path / "output",
     )
-    assert seen == ["staging"] * len(DOCUMENTS)
+    assert seen == [{"doubled": {"a": 2, "b": 4}}]
 
 
-def test_the_context_identifies_the_step_and_its_stage(tmp_path: Path) -> None:
-    seen: list[tuple[str, str, int]] = []
+def test_steps_run_in_declaration_order(tmp_path: Path) -> None:
+    order = []
 
-    def capture(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        document: Any = partition.load()
-        seen.append((context.stage_name, context.step_name, context.stage_index))
-        return document
-
-    _run(
-        Pipeline(name="p", stages=[Stage(name="prepare", entries=[Step(capture)])]),
-        tmp_path,
-    )
-    assert {item[:2] for item in seen} == {("prepare", "capture")}
-    assert {item[2] for item in seen} == {1}
-
-
-# ---------------------------------------------------------------------------
-# Ordering and failure propagation
-# ---------------------------------------------------------------------------
-
-
-def test_steps_run_in_declaration_order_within_a_partition(tmp_path: Path) -> None:
-    order: list[str] = []
-
-    def first(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        document: Any = partition.load()
+    def first(value, *, context):
         order.append("first")
-        return document
+        return value
 
-    def second(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        document: Any = partition.load()
+    def second(value, *, context):
         order.append("second")
-        return document
+        return value
 
-    _run(
-        Pipeline(name="p", stages=[Stage(name="s", entries=[Step(first), Step(second)])]),
-        tmp_path,
-        source=InMemorySource({"only": {"id": "only"}}),
+    pipeline = Pipeline(
+        name="ordered",
+        stages=[
+            Stage(name="one", entries=[Step(first, name="first")]),
+            Stage(name="two", entries=[Step(second, name="second")]),
+        ],
+        source=InMemorySource({"a": 1}),
     )
+    run(pipeline, output=tmp_path / "output")
     assert order == ["first", "second"]
 
 
-def test_a_step_failure_propagates_with_its_original_exception(tmp_path: Path) -> None:
-    class VendorError(RuntimeError):
-        pass
+def test_a_bare_callable_is_a_step(tmp_path: Path) -> None:
+    def produce(value, *, context):
+        return {"n": 1}
 
-    def explode(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        raise VendorError("vendor is down")
-
-    with pytest.raises(VendorError, match="vendor is down"):
-        _run(
-            Pipeline(name="p", stages=[Stage(name="s", entries=[Step(explode)])]),
-            tmp_path,
-        )
+    result = run(build([produce]), output=tmp_path / "output")
+    assert "produce" in result.outputs
 
 
-def test_a_downstream_step_receives_the_upstream_payload(tmp_path: Path) -> None:
-    def produce(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        document: Any = partition.load()
-        return {"produced": document["id"]}
+def test_persist_false_passes_the_value_without_saving_it(tmp_path: Path) -> None:
+    def hidden(value, *, context):
+        return {"hidden": True}
 
-    def consume(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        payload: Any = partition.load()
-        assert set(payload) == {"produced"}
-        return {"consumed": payload["produced"]}
+    def visible(value, *, context):
+        return value
 
-    storage = DurableStorage.at(tmp_path / "output")
-    pipeline = Pipeline(
-        name="p",
-        stages=[Stage(name="a", entries=[Step(produce)]), Stage(name="b", entries=[Step(consume)])],
-    )
-    _run(pipeline, tmp_path, storage=storage)
-    assert storage.results(pipeline, job_id="j1").of("consume")["doc-1"] == {"consumed": "doc-1"}
-
-
-# ---------------------------------------------------------------------------
-# Declarations
-# ---------------------------------------------------------------------------
-
-
-def test_a_declared_dataset_is_used_for_the_committed_output(tmp_path: Path) -> None:
-    def render(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        document: Any = partition.load()
-        return f"id={document['id']}"
-
-    storage = DurableStorage.at(tmp_path / "output")
-    pipeline = Pipeline(
-        name="p",
-        stages=[Stage(name="s", entries=[Step(render, output=TextDataset(name="rendered"))])],
-    )
-    _run(pipeline, tmp_path, storage=storage)
-    assert storage.results(pipeline, job_id="j1").of("render")["doc-1"] == "id=doc-1"
-
-
-def test_an_explicit_dataset_overrides_the_default(tmp_path: Path) -> None:
-    def render(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        document: Any = partition.load()
-        return f"id={document['id']}"
-
-    declared = Step(render, output=TextDataset(name="text"))
-    assert isinstance(declared.dataset, TextDataset)
-    assert Step(render).dataset.name == "render"
-    assert isinstance(Step(render).dataset, JSONDataset)
-
-
-def test_persist_false_is_rejected_because_recovery_needs_committed_output() -> None:
-    def render(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        document: Any = partition.load()
-        return document
-
-    with pytest.raises(ValueError, match="persist=False"):
-        Step(render, persist=False)
-
-
-def test_a_pipeline_may_declare_its_own_source(tmp_path: Path) -> None:
-    pipeline = Pipeline(
-        name="p",
-        stages=[
-            Stage(
-                name="s",
-                entries=[Step(_passthrough)],
-            )
-        ],
-        source=InMemorySource(DOCUMENTS),
-    )
-    pipeline.stages[0].entries[0].name = "identity"
-    result = run(pipeline, job_id="j1", storage=DurableStorage.at(tmp_path / "output"))
-    assert result.status == "completed"
-
-
-def test_a_loader_is_accepted_as_a_source(tmp_path: Path) -> None:
-    """Loaders describe input; they are not a second execution path."""
-    from caravel import CallableLoader
-
-    storage = DurableStorage.at(tmp_path / "output")
-    pipeline = Pipeline(
-        name="p",
-        stages=[
-            Stage(
-                name="s",
-                entries=[Step(_passthrough)],
-            )
-        ],
-    )
-    pipeline.stages[0].entries[0].name = "identity"
     result = run(
-        pipeline,
-        job_id="j1",
-        source=CallableLoader("src", lambda: DOCUMENTS),
-        storage=storage,
+        build([Step(hidden, persist=False), Step(visible, name="visible")]),
+        output=tmp_path / "output",
     )
-    assert result.status == "completed"
-    assert set(storage.results(pipeline, job_id="j1").of("identity")) == set(DOCUMENTS)
+    assert "hidden" not in result.outputs
+    assert JSONDataset().load_from(result.outputs["visible"]) == {"hidden": True}
 
 
-def test_running_without_any_source_is_rejected(tmp_path: Path) -> None:
-    from caravel import SourceError
+def test_the_context_carries_the_declaration_facts(tmp_path: Path) -> None:
+    seen = {}
 
-    pipeline = Pipeline(
-        name="p",
-        stages=[
-            Stage(
-                name="s",
-                entries=[Step(_passthrough)],
-            )
-        ],
-    )
-    pipeline.stages[0].entries[0].name = "identity"
-    with pytest.raises(SourceError, match="No input source"):
-        run(pipeline, job_id="j1", storage=DurableStorage.at(tmp_path / "output"))
+    def inspect(value, *, context):
+        seen.update(
+            {
+                "pipeline_name": context.pipeline_name,
+                "stage_name": context.stage_name,
+                "step_name": context.step_name,
+                "params": dict(context.params),
+            }
+        )
+        return value
 
-
-# ---------------------------------------------------------------------------
-# Source tagging
-# ---------------------------------------------------------------------------
-
-
-def test_the_source_tag_is_stripped_before_output_is_committed(tmp_path: Path) -> None:
-    """Preparing a payload happens before the commit, so immutability is intact."""
-    from caravel import SOURCE_FIELD, CallableLoader
-
-    def passthrough(inputs, *, context: Any) -> Any:
-        [partition] = inputs.partitions()
-        record: Any = partition.load()
-        assert SOURCE_FIELD in record, "steps still see the tag"
-        return record
-
-    storage = DurableStorage.at(tmp_path / "output")
-    pipeline = Pipeline(name="p", stages=[Stage(name="s", entries=[Step(passthrough)])])
     run(
-        pipeline,
-        job_id="j1",
-        source=CallableLoader("src", lambda: {"p1": {SOURCE_FIELD: "a", "v": 1}}),
-        storage=storage,
+        build([Step(inspect, name="inspect")], stage_name="bronze"),
+        output=tmp_path / "output",
+        params={"region": "eu"},
     )
-    committed = storage.results(pipeline, job_id="j1").of("passthrough")["p1"]
-    assert SOURCE_FIELD not in committed, "lineage tag leaked into committed output"
-    assert committed == {"v": 1}
+    assert seen["pipeline_name"] == "exec_example"
+    assert seen["stage_name"] == "bronze"
+    assert seen["step_name"] == "inspect"
+    assert seen["params"] == {"region": "eu"}
 
 
-def test_keep_source_tag_retains_it_when_asked(tmp_path: Path) -> None:
-    from caravel import SOURCE_FIELD, CallableLoader
+def test_a_context_factory_wraps_the_framework_context(tmp_path: Path) -> None:
+    class JobContext:
+        def __init__(self, base):
+            self.base = base
+            self.job_name = base.pipeline_name.upper()
 
-    storage = DurableStorage.at(tmp_path / "output")
-    pipeline = Pipeline(
-        name="p",
-        stages=[
-            Stage(
-                name="s",
-                entries=[Step(_passthrough)],
-            )
-        ],
-    )
-    pipeline.stages[0].entries[0].name = "passthrough"
+    seen = []
+
+    def inspect(value, *, context):
+        seen.append(context.job_name)
+        return value
+
     run(
-        pipeline,
-        job_id="j1",
-        source=CallableLoader("src", lambda: {"p1": {SOURCE_FIELD: "a", "v": 1}}),
-        storage=storage,
+        build([Step(inspect)]),
+        output=tmp_path / "output",
+        context_factory=JobContext,
+    )
+    assert seen == ["EXEC_EXAMPLE"]
+
+
+def _multi_source():
+    return MultiSourceLoader(
+        [
+            CallableLoader("feed_a", lambda: {"one": {"value": 1}}),
+            CallableLoader("feed_b", lambda: {"two": {"value": 2}}),
+        ]
+    )
+
+
+def test_source_tags_reach_the_processor(tmp_path: Path) -> None:
+    seen = []
+
+    def inspect(value, *, context):
+        seen.append({key: item[SOURCE_FIELD] for key, item in value.items()})
+        return {"count": len(value)}
+
+    run(build([Step(inspect)], source=_multi_source()), output=tmp_path / "output")
+    assert seen == [{"one": "feed_a", "two": "feed_b"}]
+
+
+def test_a_source_tag_is_stripped_from_committed_output(tmp_path: Path) -> None:
+    def passthrough(value, *, context):
+        return value
+
+    result = run(
+        build([Step(passthrough, output=PartitionedJSONDataset())], source=_multi_source()),
+        output=tmp_path / "output",
+    )
+    saved = PartitionedJSONDataset().load_from(result.outputs["passthrough"])
+    assert all(SOURCE_FIELD not in record for record in saved.values())
+
+
+def test_keeping_the_source_tag_is_a_run_decision(tmp_path: Path) -> None:
+    def passthrough(value, *, context):
+        return value
+
+    result = run(
+        build([Step(passthrough, output=PartitionedJSONDataset())], source=_multi_source()),
+        output=tmp_path / "output",
         keep_source_tag=True,
     )
-    committed = storage.results(pipeline, job_id="j1").of("passthrough")["p1"]
-    assert committed[SOURCE_FIELD] == "a"
+    saved = PartitionedJSONDataset().load_from(result.outputs["passthrough"])
+    assert all(SOURCE_FIELD in record for record in saved.values())
+
+
+def test_a_run_reports_what_it_executed_and_where(tmp_path: Path) -> None:
+    def produce(value, *, context):
+        return {"n": 1}
+
+    result = run(build([Step(produce, name="produce")]), output=tmp_path / "output")
+    assert result.pipeline_name == "exec_example"
+    assert result.steps_executed == 1
+    assert result.steps_restored == 0
+    assert Path(result.outputs["produce"]).exists()
