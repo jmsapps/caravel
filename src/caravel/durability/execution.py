@@ -13,6 +13,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+import uuid
 
 from ..branch import Branch
 from ..logger import get_logger
@@ -58,6 +59,7 @@ class RunResult:
     __slots__ = (
         "pipeline_name",
         "job_id",
+        "invocation_id",
         "output_root",
         "steps_executed",
         "steps_restored",
@@ -69,6 +71,7 @@ class RunResult:
         *,
         pipeline_name: str,
         job_id: str | None,
+        invocation_id: str,
         output_root: str | Path,
         steps_executed: int,
         steps_restored: int,
@@ -76,6 +79,7 @@ class RunResult:
     ) -> None:
         self.pipeline_name = pipeline_name
         self.job_id = job_id
+        self.invocation_id = invocation_id
         self.output_root = output_root
         self.steps_executed = steps_executed
         self.steps_restored = steps_restored
@@ -105,6 +109,7 @@ class Invocation:
         state: str | Path | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
+        self.invocation_id = str(uuid.uuid4())
         self.pipeline = pipeline
         self.output = output
         self.source = source
@@ -135,7 +140,7 @@ class Invocation:
             pipeline_name=self.pipeline.name,
             pipeline_id=self.pipeline.name,
             job_id=job_id,
-            invocation_id=job_id,
+            invocation_id=self.invocation_id,
             storage_root=str(self.output.root),
             restart_safe=self.options is not None,
         )
@@ -293,6 +298,7 @@ class Invocation:
             pipeline_name=self.pipeline.name,
             job_id=job_id,
             output_root=self.output.root,
+            invocation_id=self.invocation_id,
             steps_executed=self.executed,
             steps_restored=self.restored,
             outputs=self._outputs,

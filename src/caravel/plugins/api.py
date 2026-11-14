@@ -12,9 +12,6 @@ declares one or more small typed capabilities:
   around one complete run. Guards enter in plugin order before user code runs
   and exit in reverse order, with teardown attempted for every guard whose
   startup completed.
-Checkpoint, ownership, and lease capabilities have been retired. The
-authoritative progress store owns committed-output evidence, cross-run
-inventory, and worker leases, so a plugin can no longer contradict it.
 """
 
 from __future__ import annotations

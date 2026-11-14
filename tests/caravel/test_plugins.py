@@ -9,6 +9,7 @@ leases, so a plugin can no longer contradict it.
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +139,27 @@ def test_an_ephemeral_run_tells_observers_it_is_not_restart_safe(
         plugins=[recorder],
     )
     assert all(event.run.restart_safe is False for event in recorder.events)
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_each_invocation_has_one_unique_id(tmp_path: Path, durable: bool) -> None:
+    pipeline = _pipeline()
+    if not durable:
+        pipeline.durability_options = None
+    invocation_ids = []
+    for _ in range(2):
+        recorder = Recorder()
+        result = run(
+            pipeline,
+            source=InMemorySource(DOCUMENTS),
+            output=tmp_path / "output",
+            plugins=[recorder],
+        )
+        assert uuid.UUID(result.invocation_id).version == 4
+        assert {event.run.invocation_id for event in recorder.events} == {result.invocation_id}
+        assert result.job_id == ("j1" if durable else None)
+        invocation_ids.append(result.invocation_id)
+    assert invocation_ids[0] != invocation_ids[1]
 
 
 def test_a_required_observer_failure_fails_the_run(tmp_path: Path) -> None:
@@ -289,7 +311,7 @@ def test_the_evidence_plugin_records_a_real_run(tmp_path: Path) -> None:
         plugins=[evidence],
     )
 
-    events_dir = Path(evidence.events_dir(result.job_id))
+    events_dir = Path(evidence.events_dir(result.invocation_id))
     written = sorted(events_dir.glob("*.json"))
     assert written, "a completed run must leave evidence"
 
@@ -310,7 +332,7 @@ def test_the_evidence_plugin_records_a_real_run(tmp_path: Path) -> None:
     ]
     node = node_events[0]["node"]
     assert node["node_id"] == "stage-001-entry-001"
-    assert Path(evidence.summary_path(result.job_id)).is_file()
+    assert Path(evidence.summary_path(result.invocation_id)).is_file()
 
 
 def test_the_evidence_plugin_records_every_declared_node(tmp_path: Path) -> None:
@@ -334,7 +356,7 @@ def test_the_evidence_plugin_records_every_declared_node(tmp_path: Path) -> None
 
     names = {
         json.loads(path.read_text())["node"]["name"]
-        for path in Path(evidence.events_dir(result.job_id)).glob("*.json")
+        for path in Path(evidence.events_dir(result.invocation_id)).glob("*.json")
         if json.loads(path.read_text())["node"]
     }
     assert names == {"load", "summarize"}
