@@ -67,10 +67,9 @@ def make_branching_loader(
     )
 
 
-def bronze_normalize_json_source_partition(
-    partition, *, context: object
-) -> dict[str, dict[str, Any]]:
+def bronze_normalize_json_source(inputs, *, context: object) -> dict[str, dict[str, Any]]:
     """Normalize one JSON-sourced record. Runs only for partitions routed here."""
+    [partition] = inputs.partitions()
     record: dict[str, Any] = partition.load()
     _ = context
     payload = record.get("content", record)
@@ -86,16 +85,9 @@ def bronze_normalize_json_source_partition(
     }
 
 
-def bronze_normalize_json_source(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(bronze_normalize_json_source_partition)
-
-
-def bronze_normalize_html_source_partition(
-    partition, *, context: object
-) -> dict[str, dict[str, Any]]:
+def bronze_normalize_html_source(inputs, *, context: object) -> dict[str, dict[str, Any]]:
     """Normalize one HTML-sourced record. Runs only for partitions routed here."""
+    [partition] = inputs.partitions()
     record: dict[str, Any] = partition.load()
     _ = context
     html = record.get("content", record)
@@ -113,75 +105,38 @@ def bronze_normalize_html_source_partition(
     }
 
 
-def bronze_normalize_html_source(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(bronze_normalize_html_source_partition)
-
-
-def silver_unify_records_partition(partition, *, context: object) -> dict[str, dict[str, Any]]:
-    """Unify one partition's normalized record."""
-    payload: dict[str, dict[str, Any]] = partition.load()
-    _ = context
+def silver_unify_records(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+    """Unify the available normalized records."""
     unified: dict[str, dict[str, Any]] = {}
-    for key in sorted(payload):
-        record = payload[key]
-        unified[
-            f"{record['lang']}/{record['id']}"
-            if "silver_unify_records" == "gold_partition_by_language"
-            else key
-        ] = {**record, "unified": True}
+    for partition in inputs.partitions():
+        for key, record in sorted(partition.load().items()):
+            if key in unified:
+                raise ValueError(f"Duplicate record key: {key}")
+            unified[key] = {**record, "unified": True}
     return unified
 
 
-def silver_unify_records(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(silver_unify_records_partition)
-
-
-def bronze_converged_records_partition(partition, *, context: object) -> dict[str, dict[str, Any]]:
-    """Pass one converged partition through."""
-    payload: dict[str, dict[str, Any]] = partition.load()
-    _ = context
+def bronze_converged_records(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+    """Collect available converged records without changing their keys."""
     unified: dict[str, dict[str, Any]] = {}
-    for key in sorted(payload):
-        record = payload[key]
-        unified[
-            f"{record['lang']}/{record['id']}"
-            if "bronze_converged_records" == "gold_partition_by_language"
-            else key
-        ] = {**record, "unified": True}
+    for partition in inputs.partitions():
+        for key, record in sorted(partition.load().items()):
+            if key in unified:
+                raise ValueError(f"Duplicate record key: {key}")
+            unified[key] = {**record, "unified": True}
     return unified
 
 
-def bronze_converged_records(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(bronze_converged_records_partition)
-
-
-def gold_partition_by_language_partition(
-    partition, *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Key one partition's record by language."""
-    payload: dict[str, dict[str, Any]] = partition.load()
-    _ = context
+def gold_partition_by_language(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+    """Key available records by language, under either input scope."""
     unified: dict[str, dict[str, Any]] = {}
-    for key in sorted(payload):
-        record = payload[key]
-        unified[
-            f"{record['lang']}/{record['id']}"
-            if "gold_partition_by_language" == "gold_partition_by_language"
-            else key
-        ] = {**record, "unified": True}
+    for partition in inputs.partitions():
+        for record in partition.load().values():
+            key = f"{record['lang']}/{record['id']}"
+            if key in unified:
+                raise ValueError(f"Duplicate record key: {key}")
+            unified[key] = {**record, "unified": True}
     return unified
-
-
-def gold_partition_by_language(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(gold_partition_by_language_partition)
 
 
 def build_branching_pipeline(

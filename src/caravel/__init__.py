@@ -41,14 +41,7 @@ from .durability import (
     StorageCapabilityError,
     UnsupportedDurableDeclarationError,
 )
-from .inputs import (
-    AggregateInput,
-    DeclarationContext,
-    Inputs,
-    ManagedDescriptor,
-    ManagedInputError,
-    PartitionInput,
-)
+from .inputs import InputPartition, StepInputs, StepInputsError
 from .loaders import CallableLoader, MultiSourceLoader, dataset_as_loader
 from .paths import partition_key_to_relpath, validate_partition_key
 from .pipeline import Pipeline, Stage, Step
@@ -68,6 +61,7 @@ from .types import (
     BranchPredicate,
     Dataset,
     EmptyOutputError,
+    InputScope,
     KeyCollisionError,
     Loader,
     MissingSourceTagError,
@@ -111,13 +105,10 @@ __all__ = [
     "CallableLoader",
     "MultiSourceLoader",
     "dataset_as_loader",
-    # Managed inputs
-    "Inputs",
-    "ManagedDescriptor",
-    "DeclarationContext",
-    "PartitionInput",
-    "AggregateInput",
-    "ManagedInputError",
+    # Runtime inputs
+    "StepInputs",
+    "InputPartition",
+    "StepInputsError",
     # Retries
     "RetryOptions",
     "retry_operation",
@@ -145,6 +136,7 @@ __all__ = [
     "SOURCE_FIELD",
     "StepContext",
     "StepFn",
+    "InputScope",
     "Dataset",
     "Loader",
     "BranchPredicate",

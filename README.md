@@ -67,40 +67,31 @@ python3 -m mypy src/caravel
 
 ## Core Declaration Pattern
 
-A pipeline is a name and ordered stages. A step's function is a **declaration
-builder**: it receives an `Inputs` builder and returns exactly one descriptor
-from `inputs.each(...)` or `inputs.all(...)`. That descriptor decides whether
-the step runs once per partition or once as an aggregate barrier. The callback
-you declare is what actually runs, and only the durable engine ever calls it.
+A pipeline is a name and ordered stages. A step's function is **ordinary
+processing code**: it receives one `StepInputs` object and the runtime context,
+and only the durable engine ever calls it. `input_scope` on the `Step` declares
+whether it runs once per partition or once as an aggregate barrier.
 
 ```python
 from caravel import DurableStorage, InMemorySource, Pipeline, Stage, Step, run
 
-def load_document(partition, *, context):
+def load(inputs, *, context):
+    [partition] = inputs.partitions()
     return {**partition.load(), "loaded": True}
 
-def load(inputs, *, context):
-    return inputs.each(load_document)
-
-def enrich_document(partition, *, context):
+def enrich(inputs, *, context):
+    [partition] = inputs.partitions()
     return {**partition.load(), "enriched": True}
 
-def enrich(inputs, *, context):
-    return inputs.each(enrich_document)
-
-def summarize_documents(partitions, *, context):
-    # An all-input callback receives a reader over committed partitions,
-    # never an eagerly materialized dataset.
-    return {"documents": sum(1 for _ in partitions.partitions())}
-
 def summarize(inputs, *, context):
-    return inputs.all(summarize_documents)
+    # Handles load on demand, so a barrier over a large job stays bounded.
+    return {"documents": sum(1 for _ in inputs.partitions())}
 
 pipeline = Pipeline(
     name="documents",
     stages=[
         Stage(name="prepare", entries=[Step(load), Step(enrich)]),
-        Stage(name="summary", entries=[Step(summarize)]),
+        Stage(name="summary", entries=[Step(summarize, input_scope="all")]),
     ],
 )
 
@@ -119,15 +110,35 @@ processor. No loader stub and no dataset are required.
 
 There is one engine, reached through `run()`. There is no `durable=True` and no
 second entry point: batching, retries, storage, and concurrency all configure
-the same model. A step runs once per partition unless its builder declares
-`inputs.all(...)`.
+the same model. A step runs once per partition unless it declares
+`input_scope="all"`.
 
-Builders run at compilation, before source discovery and before any durable
-mutation. They must be deterministic and free of I/O: a builder is re-run on
-every resume, and its side effects are not replayed durably. Attempting to read
-data through the `Inputs` object raises `ManagedInputError`, as does declaring
-more than one helper, registering helpers in a loop, or returning a descriptor
-built by another declaration.
+Scope is compiled from the declaration, before source discovery and before any
+durable mutation. No processor runs during planning, and nothing about a
+processor's signature, name, annotations, or return value selects an execution
+mode. The same function can therefore be declared under either scope: scope
+changes readiness and which handles the processor receives, never the type of
+what it is handed.
+
+### One input interface, in every scope
+
+Both scopes pass the same `StepInputs` class, yielding the same `InputPartition`
+handles:
+
+| Member | Meaning |
+| --- | --- |
+| `inputs.partitions()` | a fresh iterator of handles; payloads load on demand |
+| `inputs.batch_id` | the durable batch this call commits |
+| `len(inputs)`, `inputs.is_empty` | how many handles this batch holds |
+| `partition.partition_id` | the input's declared identity |
+| `partition.batch_id`, `partition.count` | its durable batch and record count |
+| `partition.load()` | its payload, in the dataset-defined type |
+
+Under `input_scope="partition"` there is exactly one handle: the unit's own
+input, or one batch of it. Under `input_scope="all"` there is one handle per
+required upstream commit. An aggregate-derived handle carries the upstream
+step's declared output name, so the private aggregate execution ID never
+reaches a key your processor produces.
 
 ### Storage is an explicit decision
 
@@ -195,23 +206,24 @@ results.feed("enrich")      # a bounded, ordered consumer feed
 
 Output is addressed by **logical identity**, never by execution identity. A
 per-partition step keys on each source partition's own id. A step declaring
-`inputs.all(...)` runs as one work unit on a reserved aggregate partition, but
+`input_scope="all"` runs as one work unit on a reserved aggregate partition, but
 that id is private scheduling and recovery state: its output is addressed by
 the step's declared dataset name, which defaults to the declared step name.
 
 ```python
-Step(summarize, output=JSONDataset(name="summary"))
+Step(summarize, input_scope="all", output=JSONDataset(name="summary"))
 # results.of("summarize")          -> {"summary": {...}}
 # published                        -> <stage>/<step>/summary/summary.json
 
-Step(summarize)                    # no dataset name declared
+Step(summarize, input_scope="all")  # no dataset name declared
 # results.of("summarize")          -> {"summarize": {...}}
 ```
 
-`inputs.all(...)` chooses input availability and readiness. It does not choose
-an output name, merge payloads, or repartition: a callback returning a
+`input_scope="all"` chooses input availability and readiness. It does not choose
+an output name, merge payloads, or repartition: a processor returning a
 partitioned payload keeps its returned keys inside that one logical result, and
-each-mode steps downstream of a barrier publish under their own declarations.
+partition-scope steps downstream of a barrier publish under their own
+declarations.
 
 The published tree is a *projection* of committed state, never a second source
 of truth. Publication progress lives in the progress store, so the two cannot
@@ -368,11 +380,11 @@ externally-dependent predicate cannot re-route a record after a crash.
 
 The merge is partition-scoped: each partition merges as soon as its own route
 seals. That is the right fit for per-partition routing, but it does **not**
-subsume a whole-dataset merge — for that, add an `inputs.all(...)` step after
+subsume a whole-dataset merge — for that, add an `input_scope="all"` step after
 the merge.
 
 A route step transforms one partition's payload and must preserve that
-partition's identity. Whole-input processing belongs in an `inputs.all(...)`
+partition's identity. Whole-input processing belongs in an `input_scope="all"`
 step outside the branch; returned storage keys do not create new execution partitions.
 
 ## Breaking Changes From The Single-Pass Runner
@@ -384,7 +396,7 @@ step outside the branch; returned storage keys do not create new execution parti
 | `Stage(stage_root=...)` | One `artifacts_root` on `DurableStorage.at`. |
 | `Stage(clean_dirs=True)` | Rejected: cleanup could delete committed output. |
 | `@step(...)` decorator | `Step(...)` is the only step configuration surface. Move the decorator's arguments into the `Step(...)` that lists the processor in a stage or branch route: `@step(output=d)` above `def load` becomes `Step(load, output=d)`. A bare callable still works wherever it wants every documented `Step` default. |
-| `Step(persist=False)` | Rejected: recovery restores committed output. Use cheap steps plus one `inputs.all(...)` step. |
+| `Step(persist=False)` | Rejected: recovery restores committed output. Use cheap steps plus one `input_scope="all"` step. |
 | `keep_source_tag` | **Still supported**, with its original default: the tag is stripped before commit unless you pass `keep_source_tag=True`. |
 | Stage-directory output layout | `storage.results(pipeline, job_id=...)` |
 | Checkpoint / ownership / lease plugins | Owned by the authoritative store. |
@@ -411,7 +423,7 @@ and migrate the results. There is no dual-layout mode and no alias tree.
 
 One `RetryOptions` type and one `retry_operation` utility cover every boundary:
 a stage, a step, a managed helper, or a single operation. The same instance is
-accepted as `retry=` at all four, and nested boundaries acquire **no** options
+accepted as `retry=` at every one, and nested boundaries acquire **no** options
 automatically, because nested attempts multiply.
 
 ```python
@@ -431,11 +443,9 @@ Stage(name="prepare", retry=vendor_retry, entries=[
     Step(fn=enrich, output=dataset, batch_size=100, retry=vendor_retry),
 ])
 
+# ...or just one operation inside the processor. Only that call repeats.
 def enrich(inputs, *, context):
-    return inputs.each(enrich_batch, retry=vendor_retry)
-
-# ...or just one operation inside the callback. Only that call repeats.
-def enrich_batch(partition, *, context):
+    [partition] = inputs.partitions()
     results = []
     for record in partition.load():
         value, attempts = retry_operation(
@@ -445,7 +455,12 @@ def enrich_batch(partition, *, context):
     return results
 ```
 
-Inside a callback, `retry_operation` inherits the invocation's deadline,
+An ordinary loop iteration acquires no retry and no checkpoint of its own. In
+partition scope durable completion stays per partition or batch; in all scope a
+failed batch replays that whole batch, so successful iterations inside it may
+run again.
+
+Inside a processor, `retry_operation` inherits the invocation's deadline,
 cancellation state, ownership, and shared retry allowance automatically — there
 is no context argument to wire up. Outside the runner the same function works
 with its own local limits and claims no durable recovery.
@@ -468,16 +483,20 @@ never retried, and arbitrary exception text is never classified as transient.
 `KeyboardInterrupt`, `SystemExit`, and other `BaseException` control signals
 propagate without retry.
 
-### Migrating from `RetryPolicy`
+### Migrating from the removed declaration and retry APIs
 
 This is a breaking replacement with no aliases or compatibility dispatch. Old
-API usage fails explicitly, and a job whose declaration fingerprint predates the
-descriptor model fails before any mutation; start a new `job_id`.
+API usage fails explicitly, and a job whose persisted declaration fingerprint
+does not match the current declaration fails before any source read or
+mutation; start a new `job_id`.
 
 | Removed | Replacement |
 | --- | --- |
-| `Step(input_scope="all")` | `inputs.all(callback)` returned by the step's builder |
-| processor receiving a payload | builder receiving `Inputs`, callback receiving `PartitionInput`/`AggregateInput` |
+| `Inputs`, `inputs.each(...)`, `inputs.all(...)` | a plain processor plus `Step(fn, input_scope=...)` |
+| `ManagedDescriptor`, `DeclarationContext` | nothing: scope is declared, and the runtime context is the processor's `context=` |
+| `PartitionInput`, `AggregateInput` | one `StepInputs` yielding `InputPartition` handles |
+| `ManagedInputError` | `StepInputsError` |
+| `inputs.each(callback, retry=...)` | `Step(fn, retry=...)`, or `retry_operation()` inside the processor |
 | `RetryPolicy(max_retries=n, when=...)` | `RetryOptions(max_attempts=n + 1, should_retry_error=...)` |
 | `RetryPolicy(on_result=...)` | `RetryOptions(should_retry_result=...)` |
 | `retry(op, policy=p)` | `retry_operation(operation=op, retry=p)`, returning `(result, attempts)` |
@@ -513,7 +532,7 @@ A runnable end-to-end example lives in [examples/durable_partitions](examples/du
 
 Start with [minimal](examples/minimal/README.md) for independent per-partition
 steps. See [combining_results](examples/combining_results/README.md) for combining
-partition outputs into one summary with `inputs.all(...)`.
+partition outputs into one summary with `input_scope="all"`.
 
 ## Concurrent workers
 

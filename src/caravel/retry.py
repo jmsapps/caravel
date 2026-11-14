@@ -1,8 +1,8 @@
 """One retry configuration class and one retry loop, reusable at any boundary.
 
 :class:`RetryOptions` is the only retry configuration surface. The same instance
-is accepted as ``retry=`` by ``Stage``, ``Step``, ``inputs.each``,
-``inputs.all``, and :func:`retry_operation`, and every one of them runs the same
+is accepted as ``retry=`` by ``Stage``, ``Step``, and
+:func:`retry_operation`, and every one of them runs the same
 loop. There are no dictionaries, keyword bundles, decorators, or
 wrapper-specific retry APIs.
 

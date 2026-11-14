@@ -24,25 +24,17 @@ class _StubLoader:
 
 
 def _linear_pipeline(name: str = "linear_demo") -> Pipeline:
-    def normalize_partition(partition, *, context: object) -> dict[str, dict[str, object]]:
+    def normalize(inputs, *, context: object) -> dict[str, dict[str, object]]:
+        [partition] = inputs.partitions()
         partitions: dict[str, dict[str, object]] = partition.load()
         _ = context
         return partitions
 
-    def normalize(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(normalize_partition)
-
-    def summarize_partition(partition, *, context: object) -> dict[str, object]:
+    def summarize(inputs, *, context: object) -> dict[str, object]:
+        [partition] = inputs.partitions()
         partitions: dict[str, dict[str, object]] = partition.load()
         _ = context
         return {"count": len(partitions)}
-
-    def summarize(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(summarize_partition)
 
     return Pipeline(
         name=name,
@@ -59,35 +51,23 @@ def _linear_pipeline(name: str = "linear_demo") -> Pipeline:
 
 
 def _branching_pipeline() -> Pipeline:
-    def parse_partition(partition, *, context: object) -> object:
+    def parse(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
 
-    def parse(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(parse_partition)
-
-    def normalize_partition(partition, *, context: object) -> object:
+    def normalize(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
 
-    def normalize(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(normalize_partition)
-
-    def decode_partition(partition, *, context: object) -> object:
+    def decode(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def decode(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(decode_partition)
 
     branch = Branch(
         name="by_source",
@@ -176,25 +156,17 @@ def test_node_ids_are_index_based_and_survive_renames() -> None:
 
 
 def test_repeated_route_step_names_across_routes_get_distinct_node_ids() -> None:
-    def normalize_partition(partition, *, context: object) -> object:
+    def normalize(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
 
-    def normalize(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(normalize_partition)
-
-    def normalize_right_partition(partition, *, context: object) -> object:
+    def normalize_right(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def normalize_right(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(normalize_right_partition)
 
     branch = Branch(
         name="dup_names",
@@ -216,15 +188,11 @@ def test_repeated_route_step_names_across_routes_get_distinct_node_ids() -> None
 
 
 def test_duplicate_route_step_names_within_one_route_are_rejected() -> None:
-    def normalize_partition(partition, *, context: object) -> object:
+    def normalize(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def normalize(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(normalize_partition)
 
     duplicate = [
         Step(fn=normalize, output=PartitionedJSONDataset(), name="normalize"),
@@ -252,15 +220,11 @@ def test_non_callable_route_entry_is_rejected() -> None:
 
 
 def test_bare_route_callable_uses_documented_step_defaults() -> None:
-    def normalize_partition(partition, *, context: object) -> object:
+    def normalize(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def normalize(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(normalize_partition)
 
     branch = Branch(name="shorthand", by="source", routes={"a": [normalize]})
     pipeline = Pipeline(
@@ -274,15 +238,11 @@ def test_bare_route_callable_uses_documented_step_defaults() -> None:
 
 
 def test_unsupported_branch_by_shape_is_rejected() -> None:
-    def fine_partition(partition, *, context: object) -> object:
+    def fine(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def fine(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(fine_partition)
 
     branch = Branch(name="bad_by", by=42, routes={"a": [fine]})  # type: ignore[arg-type]
     pipeline = Pipeline(
@@ -306,15 +266,11 @@ def test_branch_without_routes_is_rejected() -> None:
 
 
 def test_empty_route_step_list_models_pass_through_to_merge() -> None:
-    def only_partition(partition, *, context: object) -> object:
+    def only(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def only(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(only_partition)
 
     branch = Branch(
         name="passthrough",
@@ -340,15 +296,11 @@ def test_empty_route_step_list_models_pass_through_to_merge() -> None:
     ["with/slash", "with\\backslash", "..", ""],
 )
 def test_path_unsafe_stage_names_are_rejected(bad_name: str) -> None:
-    def fine_partition(partition, *, context: object) -> object:
+    def fine(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def fine(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(fine_partition)
 
     if bad_name == "":
         with pytest.raises(ValueError):
@@ -367,15 +319,11 @@ def test_path_unsafe_stage_names_are_rejected(bad_name: str) -> None:
 
 
 def test_path_unsafe_route_keys_are_rejected() -> None:
-    def fine_partition(partition, *, context: object) -> object:
+    def fine(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def fine(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(fine_partition)
 
     branch = Branch(name="unsafe_route", by="source", routes={"a/b": [fine]})
     pipeline = Pipeline(
@@ -388,15 +336,11 @@ def test_path_unsafe_route_keys_are_rejected() -> None:
 
 
 def test_empty_stage_compiles_to_no_nodes_and_preserves_flow() -> None:
-    def final_partition(partition, *, context: object) -> object:
+    def final(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
         partitions: object = partition.load()
         _ = context
         return partitions
-
-    def final(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(final_partition)
 
     pipeline = Pipeline(
         name="empty_stage_pipeline",

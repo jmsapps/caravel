@@ -3,28 +3,38 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from caravel import DurableStorage, JSONDataset, Pipeline, Stage, Step, dataset_as_loader, run
+from caravel import (
+    DurableStorage,
+    JSONDataset,
+    PartitionedJSONDataset,
+    Pipeline,
+    Stage,
+    Step,
+    dataset_as_loader,
+    run,
+)
 
 PIPELINE_NAME = "combining_results_example"
 _DEFAULT_INPUT_PATH = Path(__file__).resolve().parent / "data" / "input_partitions.json"
 
 
-def transform_partition(partition, *, context: object) -> dict[str, Any]:
+def transform(inputs, *, context: object) -> dict[str, Any]:
     """Process each partition independently before combining results."""
-    record: dict[str, Any] = partition.load()
-    return {**record, "normalized": float(record["value"]) / 2.0}
+    records = {}
+    for partition in inputs.partitions():
+        record = partition.load()
+        records[partition.partition_id] = {**record, "normalized": float(record["value"]) / 2.0}
+    return records
 
 
-def transform(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(transform_partition)
-
-
-def combine_results_all(partitions, *, context: object) -> dict[str, Any]:
-    """Read all committed partitions and return one combined summary."""
-    dataset = partitions
-    records = {partition.partition_id: partition.load() for partition in dataset.partitions()}
+def combine_results(inputs, *, context: object) -> dict[str, Any]:
+    """Read every committed partition and return one combined summary."""
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = record
     ids = sorted(records)
     return {
         "pipeline": PIPELINE_NAME,
@@ -35,22 +45,16 @@ def combine_results_all(partitions, *, context: object) -> dict[str, Any]:
     }
 
 
-def combine_results(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(combine_results_all)
-
-
 def build_combining_pipeline(input_path: Path | str | None = None) -> Pipeline:
     seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
     return Pipeline(
         name=PIPELINE_NAME,
         source=dataset_as_loader(JSONDataset(name="seed", path=seed_path)),
         stages=[
-            Stage(name="prepare", entries=[Step(transform, output=JSONDataset())]),
+            Stage(name="prepare", entries=[Step(transform, output=PartitionedJSONDataset())]),
             Stage(
                 name="combine",
-                entries=[Step(combine_results, output=JSONDataset())],
+                entries=[Step(combine_results, input_scope="all", output=JSONDataset())],
             ),
         ],
     )

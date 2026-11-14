@@ -38,78 +38,44 @@ DOCUMENTS = {f"doc-{index}": {"id": f"doc-{index}", "words": index} for index in
 # -- processors -------------------------------------------------------------
 
 
-def load_partition(partition, *, context: Any) -> Any:
+def load(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     document: Any = partition.load()
     return {**document, "loaded": True}
 
 
-def load(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(load_partition)
-
-
-def summarize_all(partitions, *, context: Any) -> Any:
+def summarize(inputs, *, context: Any) -> Any:
     """Read every committed partition and return one summary."""
     del context
-    ids = sorted(partition.partition_id for partition in partitions.partitions())
+    ids = sorted(partition.partition_id for partition in inputs.partitions())
     return {"documents": len(ids), "ids": ids}
 
 
-def summarize(inputs, *, context):
-    """Declare this step's managed input."""
+def describe(inputs, *, context: Any) -> Any:
     del context
-    return inputs.all(summarize_all)
+    return f"documents={sum(1 for _ in inputs.partitions())}"
 
 
-def describe_all(partitions, *, context: Any) -> Any:
+def pack(inputs, *, context: Any) -> Any:
     del context
-    return f"documents={sum(1 for _ in partitions.partitions())}"
+    return f"documents={sum(1 for _ in inputs.partitions())}".encode("utf-8")
 
 
-def describe(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(describe_all)
-
-
-def pack_all(partitions, *, context: Any) -> Any:
-    del context
-    return f"documents={sum(1 for _ in partitions.partitions())}".encode("utf-8")
-
-
-def pack(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(pack_all)
-
-
-def shard_all(partitions, *, context: Any) -> Any:
+def shard(inputs, *, context: Any) -> Any:
     """An all-mode callback that returns separately keyed records."""
     del context
     return {
         f"en/{partition.partition_id}": {"id": partition.partition_id}
-        for partition in partitions.partitions()
+        for partition in inputs.partitions()
     }
 
 
-def shard(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(shard_all)
-
-
-def restate_partition(partition, *, context: Any) -> Any:
+def restate(inputs, *, context: Any) -> Any:
     """An each-mode step downstream of a barrier."""
+    [partition] = inputs.partitions()
     del context
     payload: Any = partition.load()
     return {"restated": payload}
-
-
-def restate(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(restate_partition)
 
 
 # -- helpers ----------------------------------------------------------------
@@ -155,7 +121,12 @@ def test_changed_dataset_name_cannot_resume_completed_output(tmp_path: Path) -> 
     def build(name: str) -> Pipeline:
         return Pipeline(
             name="documents",
-            stages=[Stage(name="s", entries=[Step(summarize, output=JSONDataset(name=name))])],
+            stages=[
+                Stage(
+                    name="s",
+                    entries=[Step(summarize, input_scope="all", output=JSONDataset(name=name))],
+                )
+            ],
         )
 
     with DurableStorage.at(tmp_path / "output") as storage:
@@ -172,7 +143,10 @@ def test_aggregate_output_uses_an_explicit_dataset_name(tmp_path: Path) -> None:
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -194,7 +168,9 @@ def test_an_omitted_dataset_name_defaults_to_the_declared_step_name(tmp_path: Pa
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset())]),
+            Stage(
+                name="finish", entries=[Step(summarize, input_scope="all", output=JSONDataset())]
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -212,7 +188,7 @@ def test_a_declared_step_name_names_the_aggregate_output(tmp_path: Path) -> None
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, name="rollup")]),
+            Stage(name="finish", entries=[Step(summarize, input_scope="all", name="rollup")]),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -237,7 +213,10 @@ def test_json_text_and_bytes_aggregates_keep_declaration_naming(
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(processor, output=dataset, name="rollup")]),
+            Stage(
+                name="finish",
+                entries=[Step(processor, input_scope="all", output=dataset, name="rollup")],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -260,7 +239,9 @@ def test_a_partitioned_aggregate_keeps_its_returned_keys_separate(tmp_path: Path
             Stage(name="prepare", entries=[Step(load)]),
             Stage(
                 name="finish",
-                entries=[Step(shard, output=PartitionedJSONDataset(name="documents"))],
+                entries=[
+                    Step(shard, input_scope="all", output=PartitionedJSONDataset(name="documents"))
+                ],
             ),
         ],
     )
@@ -289,7 +270,10 @@ def test_an_each_step_after_a_barrier_publishes_its_own_declared_name(tmp_path: 
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
             Stage(name="after", entries=[Step(restate, output=JSONDataset(name="restated"))]),
         ],
     )
@@ -306,8 +290,14 @@ def test_repeated_barriers_each_publish_their_own_name(tmp_path: Path) -> None:
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="first", entries=[Step(summarize, output=JSONDataset(name="first"))]),
-            Stage(name="second", entries=[Step(summarize, output=JSONDataset(name="second"))]),
+            Stage(
+                name="first",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="first"))],
+            ),
+            Stage(
+                name="second",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="second"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -321,7 +311,12 @@ def test_repeated_barriers_each_publish_their_own_name(tmp_path: Path) -> None:
 def test_a_leading_barrier_publishes_its_declared_name(tmp_path: Path) -> None:
     pipeline = Pipeline(
         name="documents",
-        stages=[Stage(name="only", entries=[Step(summarize, output=JSONDataset(name="summary"))])],
+        stages=[
+            Stage(
+                name="only",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            )
+        ],
     )
     storage = _run(pipeline, tmp_path)
 
@@ -332,7 +327,12 @@ def test_a_leading_barrier_publishes_its_declared_name(tmp_path: Path) -> None:
 def test_an_empty_aggregate_still_publishes_under_its_declared_name(tmp_path: Path) -> None:
     pipeline = Pipeline(
         name="documents",
-        stages=[Stage(name="only", entries=[Step(summarize, output=JSONDataset(name="summary"))])],
+        stages=[
+            Stage(
+                name="only",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            )
+        ],
     )
     storage = DurableStorage.at(tmp_path / "output")
     assert run(pipeline, job_id="j1", source=InMemorySource({}), storage=storage).status == (
@@ -348,14 +348,10 @@ def test_an_empty_aggregate_still_publishes_under_its_declared_name(tmp_path: Pa
 def test_a_branch_feeding_a_barrier_publishes_the_declared_name(tmp_path: Path) -> None:
     from caravel import Branch
 
-    def wide(partition, *, context: Any) -> Any:
+    def wide_step(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         del context
-        return {**partition.load(), "route": "wide"}
-
-    def wide_step(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(wide)
+        return {**partition.load(), "route": "wide_step"}
 
     pipeline = Pipeline(
         name="documents",
@@ -366,12 +362,17 @@ def test_a_branch_feeding_a_barrier_publishes_the_declared_name(tmp_path: Path) 
                 entries=[
                     Branch(
                         name="pick",
-                        by=lambda record: "wide",
-                        routes={"wide": [Step(wide_step, output=JSONDataset(name="wide"))]},
+                        by=lambda record: "wide_step",
+                        routes={
+                            "wide_step": [Step(wide_step, output=JSONDataset(name="wide_step"))]
+                        },
                     )
                 ],
             ),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -390,7 +391,10 @@ def test_the_completion_manifest_addresses_output_logically(tmp_path: Path) -> N
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -414,7 +418,10 @@ def test_the_feed_addresses_aggregate_output_logically(tmp_path: Path) -> None:
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -434,7 +441,10 @@ def test_recomputation_republishes_under_the_logical_name(tmp_path: Path) -> Non
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -457,7 +467,10 @@ def test_retention_prunes_only_superseded_generations_of_the_logical_output(
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = DurableStorage.at(tmp_path / "output", keep_superseded=0)
@@ -477,7 +490,10 @@ def test_rebuilding_restores_the_logical_tree(tmp_path: Path) -> None:
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -494,7 +510,10 @@ def test_reopening_a_job_sees_the_same_logical_addresses(tmp_path: Path) -> None
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -510,7 +529,10 @@ def test_no_aggregate_sentinel_reaches_the_published_tree(tmp_path: Path) -> Non
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
             Stage(name="after", entries=[Step(restate, output=JSONDataset(name="restated"))]),
         ],
     )
@@ -537,7 +559,12 @@ def test_an_unusable_aggregate_output_name_is_rejected_before_any_mutation(
 
     pipeline = Pipeline(
         name="documents",
-        stages=[Stage(name="only", entries=[Step(summarize, output=JSONDataset(name=name))])],
+        stages=[
+            Stage(
+                name="only",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name=name))],
+            )
+        ],
     )
     storage = DurableStorage.at(tmp_path / "output")
     with pytest.raises(UnsupportedDurableDeclarationError, match="Output name"):
@@ -573,7 +600,10 @@ def test_a_dotted_aggregate_name_owns_exactly_its_own_directory(tmp_path: Path) 
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="doc.other"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="doc.other"))],
+            ),
         ],
     )
     storage = DurableStorage.at(tmp_path / "output", keep_superseded=0)
@@ -598,7 +628,10 @@ def test_a_store_written_under_an_older_layout_fails_closed(tmp_path: Path) -> N
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = _run(pipeline, tmp_path)
@@ -626,7 +659,10 @@ def test_a_crash_before_marking_published_republishes_the_logical_output(
         name="documents",
         stages=[
             Stage(name="prepare", entries=[Step(load)]),
-            Stage(name="finish", entries=[Step(summarize, output=JSONDataset(name="summary"))]),
+            Stage(
+                name="finish",
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
+            ),
         ],
     )
     storage = DurableStorage.at(tmp_path / "output")

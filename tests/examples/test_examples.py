@@ -68,11 +68,14 @@ def test_minimal_example_keeps_results_per_partition(tmp_path: Path) -> None:
 
     results = _results(tmp_path, build_minimal_pipeline(), "minimal-1")
     per_partition = results.of("silver_transform")
-    assert {key: record["normalized"] for key, record in per_partition.items()} == {
+    assert {key: records[key]["normalized"] for key, records in per_partition.items()} == {
         "alpha": 1.0,
         "beta": 3.0,
     }
     assert set(results.of("bronze_collect")) == set(per_partition)
+    steps = [step for stage in build_minimal_pipeline().stages for step in stage.entries]
+    assert [step.name for step in steps] == ["bronze_collect", "silver_transform"]
+    assert all(step.input_scope == "partition" for step in steps)
 
 
 def test_combining_example_aggregates_all_partition_results(tmp_path: Path) -> None:
@@ -85,7 +88,61 @@ def test_combining_example_aggregates_all_partition_results(tmp_path: Path) -> N
     assert summary[0]["count"] == len(per_partition)
     assert summary[0]["ids"] == ["alpha", "beta"]
     assert summary[0]["total_normalized"] == 4.0
-    assert summary[0]["records"] == per_partition
+    assert summary[0]["records"] == {
+        key: record for payload in per_partition.values() for key, record in payload.items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("example", "stage_index"),
+    [
+        (name, index)
+        for name in (
+            "minimal",
+            "branching",
+            "partitioned",
+            "fsspec_partitioned",
+            "combining_results",
+        )
+        for index in range(
+            1
+            if name == "combining_results"
+            else 2
+            if name in ("minimal", "fsspec_partitioned")
+            else 3
+        )
+    ],
+)
+def test_collection_examples_preserve_records_when_scope_changes(
+    tmp_path: Path, example: str, stage_index: int
+) -> None:
+    from caravel import run
+    from examples.branching.pipeline import build_branching_pipeline
+
+    builders = {
+        "minimal": build_minimal_pipeline,
+        "branching": build_branching_pipeline,
+        "partitioned": build_partitioned_pipeline,
+        "fsspec_partitioned": build_fsspec_partitioned_pipeline,
+        "combining_results": build_combining_pipeline,
+    }
+
+    def execute(scope: str) -> dict[str, Any]:
+        pipeline = builders[example]()
+        pipeline.stages[stage_index].entries[-1].input_scope = scope
+        final = pipeline.stages[-1].entries[-1]
+        with DurableStorage.at(tmp_path / scope / "output") as storage:
+            assert run(pipeline, job_id="scope", storage=storage).status == "completed"
+            payloads = storage.results(pipeline, job_id="scope").of(final.name).values()
+            if example in ("fsspec_partitioned", "combining_results"):
+                return next(iter(payloads))
+            merged = {}
+            for payload in payloads:
+                assert not merged.keys() & payload.keys()
+                merged.update(payload)
+            return merged
+
+    assert execute("partition") == execute("all")
 
 
 def test_partitioned_example_keeps_storage_keys_distinct_from_identity(

@@ -28,7 +28,7 @@ from ..plugins.api import (
     RunOutcome,
     validate_plugins,
 )
-from ..inputs import AggregateInput, PartitionInput
+from ..inputs import InputPartition, StepInputs
 from ..retry import (
     DEFAULT_INVOCATION_RETRY_ALLOWANCE,
     RetryBudgetExhaustedError,
@@ -39,6 +39,7 @@ from ..retry import (
 )
 from ..types import SOURCE_FIELD, Dataset, StepContext
 from .commits import BatchPublisher
+from .identity import logical_output_id
 from .output import AttemptOutputStore, OutputReference
 from .leases import LeaseHolder, LeasePolicy, acquire, validate_concurrency
 from .scheduler import (
@@ -211,6 +212,36 @@ class CommittedPartitionView:
 
 def _batch_id(index: int) -> str:
     return f"batch-{index:0{_BATCH_ID_WIDTH}d}"
+
+
+@dataclass(frozen=True)
+class _HandleSpec:
+    """One input handle before it is bound to a durable batch identity."""
+
+    partition_id: str
+    count: int
+    loader: Callable[[], Any]
+
+
+def _payload_spec(partition_id: str, count: int, payload: Any) -> _HandleSpec:
+    """Describe an already-resolved payload as one handle spec."""
+    return _HandleSpec(partition_id=partition_id, count=count, loader=lambda: payload)
+
+
+def _step_inputs(batch_id: str, specs: Sequence[_HandleSpec]) -> StepInputs:
+    """Bind handle specs to one durable batch and wrap them as processor inputs."""
+    return StepInputs(
+        batch_id=batch_id,
+        handles=tuple(
+            InputPartition(
+                partition_id=spec.partition_id,
+                batch_id=batch_id,
+                count=spec.count,
+                loader=spec.loader,
+            )
+            for spec in specs
+        ),
+    )
 
 
 class _Deadline:
@@ -652,49 +683,74 @@ class DurableInvocation:
             return base
         return self.context_factory(base)
 
+    def _input_identity(self, node: DurableNode, partition_id: str) -> str:
+        """Return the declared identity a processor sees for this unit's input.
+
+        A real source partition addresses itself, hierarchical ids included. An
+        input derived from an upstream barrier is addressed by that step's
+        declared output name, so the reserved aggregate execution id never
+        reaches a key a processor produces.
+        """
+        if partition_id != AGGREGATE_PARTITION_ID:
+            return partition_id
+        previous = self.plan.previous(node)
+        if previous is None:  # pragma: no cover - the aggregate partition always has an upstream
+            return partition_id
+        return logical_output_id(previous, partition_id)
+
+    def _view_specs(self, node: DurableNode, views: Sequence[Any]) -> tuple[_HandleSpec, ...]:
+        """Describe upstream views as handle specs with their declared identities."""
+        previous = self.plan.previous(node)
+        return tuple(
+            _HandleSpec(
+                partition_id=(
+                    view.partition_id
+                    if previous is None or view.partition_id != AGGREGATE_PARTITION_ID
+                    else logical_output_id(previous, view.partition_id)
+                ),
+                count=view.count,
+                loader=view.load,
+            )
+            for view in views
+        )
+
     def _batches(
         self, node: DurableNode, partition_id: str, resolved: Any
-    ) -> list[tuple[str, Any, int]]:
-        """Split a unit's input into durable batches of callback handles.
+    ) -> list[tuple[str, StepInputs, int]]:
+        """Split a unit's input into durable batches of processor inputs.
 
-        ``batch_size=None`` executes the selected scope as one durable unit. For
-        an ``each`` descriptor a positive size requires input that can be read
-        in bounded, replayable pieces; anything else is rejected before the
-        callback runs. For an ``all`` descriptor a positive size slices the
-        aggregate reader's partition *views*, never their loaded payloads, so
-        aggregating a large job stays bounded in memory.
+        ``batch_size=None`` executes the selected scope as one durable unit. In
+        partition scope a positive size requires input that can be read in
+        bounded, replayable pieces; anything else is rejected before the
+        processor runs. In all scope a positive size slices the upstream
+        partition *views*, never their loaded payloads, so aggregating a large
+        job stays bounded in memory.
+
+        Every batch, in every scope, is one ``StepInputs`` holding
+        ``InputPartition`` handles. Payloads load through a handle, so building
+        the batches materializes nothing.
         """
         size = node.step.batch_size
 
         if node.input_scope == "all":
-            views: Sequence[Any] = resolved
+            specs = self._view_specs(node, resolved)
             if size is None:
-                batch_id = _batch_id(0)
-                return [
-                    (
-                        batch_id,
-                        AggregateInput(views, partition_id=partition_id, batch_id=batch_id),
-                        len(views),
-                    )
-                ]
-            slices = [views[start : start + size] for start in range(0, len(views), size)] or [()]
+                return [(_batch_id(0), _step_inputs(_batch_id(0), specs), len(specs))]
+            slices = [specs[start : start + size] for start in range(0, len(specs), size)] or [()]
             return [
-                (
-                    _batch_id(index),
-                    AggregateInput(part, partition_id=partition_id, batch_id=_batch_id(index)),
-                    len(part),
-                )
+                (_batch_id(index), _step_inputs(_batch_id(index), part), len(part))
                 for index, part in enumerate(slices)
             ]
 
+        identity = self._input_identity(node, partition_id)
         payload = resolved
         if size is None:
-            batch_id = _batch_id(0)
+            count = len(payload) if isinstance(payload, list) else 1
             return [
                 (
-                    batch_id,
-                    PartitionInput(partition_id=partition_id, batch_id=batch_id, payload=payload),
-                    len(payload) if isinstance(payload, list) else 1,
+                    _batch_id(0),
+                    _step_inputs(_batch_id(0), (_payload_spec(identity, count, payload),)),
+                    count,
                 )
             ]
         if isinstance(payload, (str, bytes)) or not isinstance(payload, Sequence):
@@ -708,7 +764,7 @@ class DurableInvocation:
         return [
             (
                 _batch_id(index),
-                PartitionInput(partition_id=partition_id, batch_id=_batch_id(index), payload=part),
+                _step_inputs(_batch_id(index), (_payload_spec(identity, len(part), part),)),
                 len(part),
             )
             for index, part in enumerate(batched)
@@ -805,17 +861,19 @@ class DurableInvocation:
         resolved: Any,
         context: Any,
     ) -> tuple[int, WorkUnitState]:
-        """Run this unit's batches under its stage, step, and helper retries.
+        """Run this unit's batches under its stage and step retries.
 
-        The three boundaries nest stage -> step -> helper, all strictly inside
-        the lease this worker already holds, so inner retries exhaust first and
-        no retry re-acquires authority or re-runs a declaration builder.
+        The two boundaries nest stage -> step, both strictly inside the lease
+        this worker already holds, so the inner retry exhausts first and no
+        retry re-acquires authority or recompiles the declaration. A smaller
+        scope is retried by calling ``retry_operation()`` inside the processor;
+        the engine adds no boundary of its own around one loop iteration.
         """
         batches = self._batches(node, unit.key.partition_id, resolved)
-        descriptor = node.descriptor
+        processor = node.step.fn
         progress: dict[str, Any] = {"committed": 0, "state": claimed}
 
-        def run_batch(batch_id: str, handle: Any, record_count: int) -> None:
+        def run_batch(batch_id: str, inputs: StepInputs, record_count: int) -> None:
             def attempt() -> Any:
                 # Authority is fixed at claim time. This worker presents the
                 # fence token it acquired and the generation it last observed
@@ -826,7 +884,7 @@ class DurableInvocation:
                 # Idempotency does not need a re-read: publish() resolves an
                 # already-committed batch id from the manifest, so an attempt
                 # that published before failing is observed, not repeated.
-                produced = self._prepare_output(descriptor.callback(handle, context=context))
+                produced = self._prepare_output(processor(inputs, context=context))
                 observed: WorkUnitState = progress["state"]
                 return self.publisher.publish(
                     unit.key,
@@ -840,7 +898,7 @@ class DurableInvocation:
                     record_count=record_count,
                 )
 
-            commit = self._with_retry(attempt, descriptor.retry)
+            commit = attempt()
             progress["state"] = commit.state
             progress["committed"] = int(progress["committed"]) + 1
 
@@ -848,10 +906,10 @@ class DurableInvocation:
             # Re-read on every entry: an outer retry must skip what an earlier
             # pass already committed rather than republish it.
             already = {record.batch_id for record in self.store.work_unit_batches(unit.key)}
-            for batch_id, handle, record_count in batches:
+            for batch_id, inputs, record_count in batches:
                 if batch_id in already:
                     continue
-                run_batch(batch_id, handle, record_count)
+                run_batch(batch_id, inputs, record_count)
 
         self._with_retry(
             lambda: self._with_retry(run_all, node.step.retry),
@@ -911,7 +969,7 @@ class DurableInvocation:
             DiscoveredWorkUnit(
                 node_id=member.node_id,
                 step_revision=member.step.revision,
-                params_fingerprint=declaration_fingerprint(self.plan)[:512],
+                params_fingerprint=declaration_fingerprint(self.plan),
                 input_scope="partition",
             )
             for member in chain
@@ -987,7 +1045,31 @@ class DurableInvocation:
             return None
         return (allocated.start, allocated.end)
 
+    def _reject_foreign_declaration(self) -> None:
+        """Fail a persisted job whose declaration contract is not this one.
+
+        This runs before the source is consulted and before any durable
+        mutation, so a job written under an older declaration fingerprint can
+        never allocate a range, re-pin a snapshot, register discovery, or run a
+        processor. Stored state is not reinterpreted under a new contract; the
+        remedy is a fresh job id. ``initialize_job`` keeps the same check as the
+        transactional backstop for a concurrent writer.
+        """
+        existing = self.store.load_job(self.job_id)
+        if existing is None:
+            return
+        current = declaration_fingerprint(self.plan)
+        if existing.declaration_fingerprint != current:
+            raise InvalidTransitionError(
+                f"Durable job '{self.job_id}' already exists with a different "
+                "declaration fingerprint. Its persisted scope, revisions, or output "
+                "identities describe a declaration this run does not match, and stored "
+                "state is never reinterpreted under a new contract; start a new job id "
+                "instead."
+            )
+
     def _ensure_job(self) -> Any:
+        self._reject_foreign_declaration()
         existing = self.store.load_job(self.job_id)
         if existing is not None and existing.status == "completed":
             # A finished job is answered from its own durable state. Consulting
@@ -1000,7 +1082,7 @@ class DurableInvocation:
                 self.job_id,
                 pipeline_id=self.pipeline_id,
                 source_mode=self.source_mode,
-                declaration_fingerprint=declaration_fingerprint(self.plan)[:512],
+                declaration_fingerprint=declaration_fingerprint(self.plan),
                 lineage=self.lineage,
                 snapshot_id=self.snapshot_id,
                 range_start=existing.range_start,
@@ -1020,7 +1102,7 @@ class DurableInvocation:
             self.job_id,
             pipeline_id=self.pipeline_id,
             source_mode=self.source_mode,
-            declaration_fingerprint=declaration_fingerprint(self.plan)[:512],
+            declaration_fingerprint=declaration_fingerprint(self.plan),
             lineage=self.lineage,
             snapshot_id=self.snapshot_id,
             range_start=range_start,

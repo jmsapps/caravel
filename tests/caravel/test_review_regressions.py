@@ -36,16 +36,11 @@ PIPELINE_ID = "customer-42/document-changes"
 NODE = "stage-001-entry-001"
 
 
-def apply_change_partition(partition, *, context: Any) -> Any:
+def apply_change(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     payload: Any = partition.load()
     del context
     return {"applied": payload}
-
-
-def apply_change(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(apply_change_partition)
 
 
 def _pipeline(**step_kwargs: Any) -> Pipeline:
@@ -122,18 +117,14 @@ def test_an_incomplete_job_still_fails_closed_on_a_retention_gap(
     """The D-2 fix must not weaken retention enforcement for unfinished work."""
     calls = {"n": 0}
 
-    def fail_once_partition(partition, *, context: Any) -> Any:
+    def fail_once(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("stop")
         return {"applied": payload}
-
-    def fail_once(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(fail_once_partition)
 
     pipeline = _pipeline()
     pipeline.stages[0].entries[0] = Step(fn=fail_once, output=JSONDataset(name="apply"))
@@ -322,7 +313,8 @@ def test_a_retry_cannot_adopt_a_newer_token_after_being_fenced_out(
     displaced: list[int] = []
     callback_calls: list[int] = []
 
-    def fail_after_being_displaced_partition(partition, *, context: Any) -> Any:
+    def fail_after_being_displaced(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         callback_calls.append(1)
         payload: Any = partition.load()
         del context
@@ -341,11 +333,6 @@ def test_a_retry_cannot_adopt_a_newer_token_after_being_fenced_out(
             displaced.append(taken.fence_token)
             raise ConnectionError("vendor down")
         return {"applied": payload}
-
-    def fail_after_being_displaced(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(fail_after_being_displaced_partition)
 
     pipeline = Pipeline(
         name="changes",

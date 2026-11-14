@@ -1,7 +1,8 @@
 """State, identity, and error contracts for the C-8 durable execution store.
 
-This module is self-contained: it defines the durable state machine's value
-types and its error taxonomy without importing any other Caravel module. The
+This module defines the durable state machine's value types and its error
+taxonomy. Its only Caravel dependency is the core type contracts, from which it
+takes the one definition of ``InputScope`` that ``Step`` declares. The
 authoritative schema and transition table live in the C-8 task record's
 ``references/storage-contract.md``.
 
@@ -15,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from ..types import InputScope
+
 DURABLE_SCHEMA_VERSION = 2
 
 MAX_IDENTIFIER_LENGTH = 512
@@ -22,7 +25,6 @@ MAX_OPAQUE_LENGTH = 65536
 
 SourceMode = Literal["snapshot", "incremental"]
 JobStatus = Literal["open", "completed"]
-InputScope = Literal["partition", "all"]
 WorkUnitStatus = Literal["eligible", "executing", "sealed", "failed"]
 ChangeOperation = Literal["insert", "update", "delete"]
 

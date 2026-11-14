@@ -99,7 +99,8 @@ def build_saga_pipeline(
 ) -> Pipeline:
     seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
 
-    def reserve_inventory_partition(partition, *, context: object) -> dict[str, Any]:
+    def reserve_inventory(inputs, *, context: object) -> dict[str, Any]:
+        [partition] = inputs.partitions()
         order: dict[str, Any] = partition.load()
         _ = context
         quantity = int(order["quantity"])
@@ -110,12 +111,8 @@ def build_saga_pipeline(
         transaction.record("release_inventory", quantity=quantity)
         return {**order, "inventory_reserved": True}
 
-    def reserve_inventory(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(reserve_inventory_partition)
-
-    def charge_account_partition(partition, *, context: object) -> dict[str, Any]:
+    def charge_account(inputs, *, context: object) -> dict[str, Any]:
+        [partition] = inputs.partitions()
         order: dict[str, Any] = partition.load()
         _ = context
         amount = int(order["amount"])
@@ -126,12 +123,8 @@ def build_saga_pipeline(
         transaction.record("refund_account", amount=amount)
         return {**order, "account_charged": True}
 
-    def charge_account(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(charge_account_partition)
-
-    def create_shipment_partition(partition, *, context: object) -> dict[str, Any]:
+    def create_shipment(inputs, *, context: object) -> dict[str, Any]:
+        [partition] = inputs.partitions()
         order: dict[str, Any] = partition.load()
         _ = context
         shipment_id = f"shipment-{order['order_id']}"
@@ -140,21 +133,12 @@ def build_saga_pipeline(
         transaction.record("cancel_shipment", shipment_id=shipment_id)
         return {**order, "shipment_id": shipment_id}
 
-    def create_shipment(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(create_shipment_partition)
-
-    def finalize_order_partition(partition, *, context: object) -> dict[str, Any]:
+    def finalize_order(inputs, *, context: object) -> dict[str, Any]:
+        [partition] = inputs.partitions()
         order: dict[str, Any] = partition.load()
         if _params(context).get("fail") == "true":
             raise RuntimeError("Simulated failure after all reversible actions")
         return {**order, "status": "completed"}
-
-    def finalize_order(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(finalize_order_partition)
 
     steps: list[Step | Branch | Callable[..., Any]] = [
         Step(reserve_inventory, JSONDataset(), name="reserve_inventory"),

@@ -25,16 +25,11 @@ JOB = "snapshot-2026-11-12-v7"
 NODE = "stage-001-entry-001"
 
 
-def publish_partition(partition, *, context: Any) -> Any:
+def publish(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     payload: Any = partition.load()
     del context
     return {"published": payload}
-
-
-def publish(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(publish_partition)
 
 
 @pytest.fixture()
@@ -382,7 +377,8 @@ def test_a_step_retry_preserves_already_committed_batches(
 ) -> None:
     attempts = {"n": 0}
 
-    def flaky_partition(partition, *, context: Any) -> Any:
+    def flaky(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         records: Any = partition.load()
         del context
         attempts["n"] += 1
@@ -390,11 +386,6 @@ def test_a_step_retry_preserves_already_committed_batches(
         if records == [4, 5] and attempts["n"] == 3:
             raise ConnectionError("vendor down")
         return [value * 10 for value in records]
-
-    def flaky(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(flaky_partition)
 
     policy = RetryOptions(delay_seconds=lambda attempt: 0.0)
     pipeline = Pipeline(
@@ -438,14 +429,10 @@ def test_a_step_retry_preserves_already_committed_batches(
 def test_retry_exhaustion_leaves_the_batch_cursor_uncommitted(
     store: SQLiteDurableStore, output: AttemptOutputStore
 ) -> None:
-    def always_fails_partition(partition, *, context: Any) -> Any:
+    def always_fails(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         del context
         raise ConnectionError("vendor down")
-
-    def always_fails(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(always_fails_partition)
 
     policy = RetryOptions(max_attempts=3, delay_seconds=lambda attempt: 0.0)
     pipeline = Pipeline(
@@ -485,15 +472,11 @@ def test_a_step_without_a_policy_acquires_no_retries(
 ) -> None:
     attempts = {"n": 0}
 
-    def flaky_partition(partition, *, context: Any) -> Any:
+    def flaky(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         del context
         attempts["n"] += 1
         raise ConnectionError("vendor down")
-
-    def flaky(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(flaky_partition)
 
     pipeline = Pipeline(
         name="documents",

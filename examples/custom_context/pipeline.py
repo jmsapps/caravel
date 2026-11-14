@@ -47,22 +47,15 @@ def make_job_context(context: StepContext) -> JobContext:
     return JobContext(framework=context, job_name=context.pipeline_name.upper())
 
 
-def summarize_all(partitions, *, context: JobContext) -> dict[str, Any]:
+def summarize(inputs, *, context: JobContext) -> dict[str, Any]:
     """Aggregate every partition behind an explicit all-input barrier."""
-    dataset = partitions
-    records = {partition.partition_id: partition.load() for partition in dataset.partitions()}
+    records = {partition.partition_id: partition.load() for partition in inputs.partitions()}
     return {
         "job_name": context.job_name,
         "count": len(records),
         "total": sum(int(record["value"]) for record in records.values()),
         "ids": sorted(records),
     }
-
-
-def summarize(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(summarize_all)
 
 
 def build_custom_context_pipeline() -> Pipeline:
@@ -76,6 +69,7 @@ def build_custom_context_pipeline() -> Pipeline:
                 entries=[
                     Step(
                         summarize,
+                        input_scope="all",
                         output=JSONDataset(name="summary"),
                     )
                 ],

@@ -7,8 +7,9 @@ from typing import Any, Callable
 
 from .branch import Branch
 from .datasets import JSONDataset
+from .inputs import validate_processor_signature
 from .retry import RetryOptions
-from .types import Dataset, Loader, StepFn
+from .types import Dataset, InputScope, Loader, StepFn
 
 
 def _callable_name(fn: Callable[..., Any]) -> str:
@@ -38,24 +39,29 @@ class Step:
     ``output`` defaults to a JSON dataset named for the processor, so
     ``Step(load)`` is a complete declaration.
 
-    ``fn`` is a declaration builder: it receives an ``Inputs`` builder and
-    returns exactly one descriptor from ``inputs.each(...)`` or
-    ``inputs.all(...)``. That descriptor, not a field on this class, decides
-    whether the step runs per partition or as the aggregate barrier.
+    ``fn`` is ordinary processing code. It is called during execution only,
+    never during planning, and always as ``fn(inputs, context=...)`` with one
+    :class:`~caravel.inputs.StepInputs` object.
+
+    ``input_scope`` declares when this step becomes ready and which input
+    partitions it receives: ``"partition"`` runs it once per partition over that
+    partition's own input, and ``"all"`` makes it the aggregate barrier over
+    every required upstream commit. It does not change what ``fn`` is handed.
 
     ``batch_size``, ``revision``, and ``retry`` configure the one durable
     execution model. Their defaults give whole-partition recovery with no
     retries, which is the simplest useful behavior.
 
-    ``retry`` attaches options at the step boundary only. Nested boundaries
-    acquire none automatically; pass ``retry=`` to ``inputs.each``/``inputs.all``
-    or call ``retry_operation()`` inside a callback to retry a smaller scope.
+    ``retry`` attaches options at the step boundary only, wrapping this step's
+    unfinished batch loop. Nested boundaries acquire none automatically; call
+    ``retry_operation()`` inside the processor to retry a smaller scope.
     """
 
     fn: StepFn
     output: Dataset | None = None
     persist: bool = True
     name: str | None = None
+    input_scope: InputScope = "partition"
     batch_size: int | None = None
     revision: str = "1"
     retry: RetryOptions | None = None
@@ -63,6 +69,13 @@ class Step:
     def __post_init__(self) -> None:
         if not callable(self.fn):
             raise TypeError(f"Step.fn must be callable, got {type(self.fn).__name__}.")
+
+        if self.input_scope not in ("partition", "all"):
+            raise ValueError(
+                f'Step.input_scope must be "partition" or "all", got '
+                f"{self.input_scope!r}. Scope is declared explicitly; it is never "
+                "inferred from the processor."
+            )
 
         if self.output is None:
             # A declaration needs no dataset: the processor's output is
@@ -87,6 +100,8 @@ class Step:
 
         if not isinstance(self.name, str):
             raise TypeError(f"Step.name must be str, got {type(self.name).__name__}.")
+
+        validate_processor_signature(self.fn, what=f"Step '{self.name}' processor")
 
         if self.batch_size is not None:
             if not isinstance(self.batch_size, int) or isinstance(self.batch_size, bool):

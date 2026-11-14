@@ -168,7 +168,7 @@ class JobResults:
 
         A source partition is keyed by its own identity. An all-input step's
         output is keyed by its declared dataset name, which defaults to the
-        step name: ``inputs.all(...)`` chooses input readiness, not an output
+        step name: ``input_scope="all"`` chooses input readiness, not an output
         name, so the private aggregate execution ID never appears here.
 
         A unit that committed one batch yields that payload directly; a batched

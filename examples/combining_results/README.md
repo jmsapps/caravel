@@ -1,7 +1,7 @@
 # Combining results
 
 This example transforms partitions independently, then combines every committed
-result into one summary using `inputs.all(...)`. It demonstrates aggregation,
+result into one summary using `input_scope="all"`. It demonstrates aggregation,
 not branch routing.
 
 ```bash
@@ -13,21 +13,22 @@ python -m examples.combining_results --job-id combining-demo
 flowchart LR
     A[alpha input] --> B[transform alpha]
     C[beta input] --> D[transform beta]
-    B --> E[combine_results: inputs.all]
+    B --> E[combine_results: input_scope=all]
     D --> E
     E --> F[One summary]
 ```
 
 `combine_results` waits for sealed upstream production and every required
-partition. Its dataset reader exposes committed results through `partitions()`;
-this small example collects them in a dictionary to include them in the summary.
-For large inputs, aggregate through the reader without collecting all records.
+partition. It receives the same `StepInputs` object a per-partition step
+receives, and its handles expose committed results through `partitions()`; this
+small example collects them in a dictionary to include them in the summary. For
+large inputs, aggregate through the handles without collecting all records.
 
 Published output is under
 `data/combining_results_example/output/combining_results_example/combining-demo/`.
-`inputs.all(...)` chooses input readiness, not an output name: the `combine`
+`input_scope="all"` chooses input readiness, not an output name: the `combine`
 stage publishes under its declared dataset name, which defaults to the step
-name. With `Step(combine_results, output=JSONDataset())` that is
+name. With `Step(combine_results, input_scope="all", output=JSONDataset())` that is
 `combine_results/combine_results.json`, and `results.of("combine_results")` is
 keyed by `"combine_results"`. Declaring `JSONDataset(name="summary")` would
 publish `summary/summary.json` instead. It contains:

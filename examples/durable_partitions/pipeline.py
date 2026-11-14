@@ -53,54 +53,37 @@ DOCUMENTS = {
 WORK_SECONDS = 0.004
 
 
-def enrich_partition(partition, *, context: Any) -> Any:
+def enrich(inputs, *, context: Any) -> Any:
     """Partition-scoped work: runs as soon as its own partition is ready."""
+    [partition] = inputs.partitions()
     document: Any = partition.load()
     del context
     time.sleep(WORK_SECONDS)
     return {**document, "enriched": True}
 
 
-def enrich(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(enrich_partition)
-
-
-def publish_partition(partition, *, context: Any) -> Any:
+def publish(inputs, *, context: Any) -> Any:
     """Destination publication is an ordinary partition-scoped step."""
+    [partition] = inputs.partitions()
     document: Any = partition.load()
     del context
     time.sleep(WORK_SECONDS)
     return {"id": document["id"], "words": document["words"], "published": True}
 
 
-def publish(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(publish_partition)
-
-
-def summarize_all(partitions, *, context: Any) -> Any:
+def summarize(inputs, *, context: Any) -> Any:
     """All-input barrier: waits for every required partition, then runs once.
 
     It receives a reader over committed references rather than a materialized
     dataset, so finalization stays bounded.
     """
-    dataset = partitions
     del context
     total = 0
     count = 0
-    for partition in dataset.partitions():
+    for partition in inputs.partitions():
         total += partition.load()["words"]
         count += 1
     return {"documents": count, "words": total}
-
-
-def summarize(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(summarize_all)
 
 
 def build_pipeline() -> Pipeline:
@@ -120,6 +103,7 @@ def build_pipeline() -> Pipeline:
                 entries=[
                     Step(
                         fn=summarize,
+                        input_scope="all",
                         output=JSONDataset(name="summary"),
                     )
                 ],

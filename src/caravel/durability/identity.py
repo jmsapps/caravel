@@ -1,7 +1,7 @@
 """One mapping between private execution identity and public output identity.
 
 Execution identity is scheduling and recovery metadata. A step declaring
-``inputs.all(...)`` becomes a single work unit on the reserved aggregate
+``input_scope="all"`` becomes a single work unit on the reserved aggregate
 partition, and that reserved ID belongs to authoritative state and to immutable
 attempt artifacts. It is not an application-visible name.
 

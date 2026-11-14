@@ -44,58 +44,47 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx : value.index(end, start_idx)]
 
 
-def bronze_render_html_partition(partition, *, context: object) -> dict[str, str]:
+def bronze_render_html(inputs, *, context: object) -> dict[str, str]:
     """Render one source record into a deterministic HTML partition."""
-    record: dict[str, Any] = partition.load()
-    _ = context
-    item_id = str(record["id"])
-    return {
-        item_id: (
+    rendered = {}
+    for partition in inputs.partitions():
+        record = partition.load()
+        item_id = str(record["id"])
+        if item_id in rendered:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        rendered[item_id] = (
             f"<article data-id='{item_id}' data-lang='{record['lang']}'>"
             f"<h1>{record['title']}</h1>"
             f"<p>{record['snippet']}</p>"
             "</article>"
         )
-    }
+    return rendered
 
 
-def bronze_render_html(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(bronze_render_html_partition)
-
-
-def silver_extract_structured_partition(partition, *, context: object) -> dict[str, dict[str, Any]]:
+def silver_extract_structured(inputs, *, context: object) -> dict[str, dict[str, Any]]:
     """Convert one partition's bronze HTML back into structured records."""
-    payload: dict[str, str] = partition.load()
-    _ = context
     structured: dict[str, dict[str, Any]] = {}
-    for key in sorted(payload):
-        html = payload[key]
-        snippet = _extract_between(html, "<p>", "</p>")
-        structured[key] = {
-            "id": _extract_between(html, "data-id='", "'"),
-            "lang": _extract_between(html, "data-lang='", "'"),
-            "title": _extract_between(html, "<h1>", "</h1>"),
-            "snippet": snippet,
-            "normalized_snippet": snippet.lower(),
-        }
+    for partition in inputs.partitions():
+        for key, html in sorted(partition.load().items()):
+            if key in structured:
+                raise ValueError(f"Duplicate record key: {key}")
+            snippet = _extract_between(html, "<p>", "</p>")
+            structured[key] = {
+                "id": _extract_between(html, "data-id='", "'"),
+                "lang": _extract_between(html, "data-lang='", "'"),
+                "title": _extract_between(html, "<h1>", "</h1>"),
+                "snippet": snippet,
+                "normalized_snippet": snippet.lower(),
+            }
     return structured
 
 
-def silver_extract_structured(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(silver_extract_structured_partition)
-
-
-def gold_summarize_all(partitions, *, context: object) -> dict[str, Any]:
+def gold_summarize(inputs, *, context: object) -> dict[str, Any]:
     """Summarize every committed partition behind an all-input barrier."""
-    dataset = partitions
     _ = context
     languages: dict[str, int] = {}
     total = 0
-    for partition in dataset.partitions():
+    for partition in inputs.partitions():
         for record in partition.load().values():
             languages[str(record["lang"])] = languages.get(str(record["lang"]), 0) + 1
             total += 1
@@ -104,12 +93,6 @@ def gold_summarize_all(partitions, *, context: object) -> dict[str, Any]:
         "total_records": total,
         "counts_by_language": dict(sorted(languages.items())),
     }
-
-
-def gold_summarize(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(gold_summarize_all)
 
 
 def build_fsspec_partitioned_pipeline(
@@ -139,6 +122,7 @@ def build_fsspec_partitioned_pipeline(
                 entries=[
                     Step(
                         gold_summarize,
+                        input_scope="all",
                         output=JSONDataset(name="summary"),
                     )
                 ],

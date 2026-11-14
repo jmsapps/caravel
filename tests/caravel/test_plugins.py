@@ -25,15 +25,10 @@ from caravel.plugins import (
 DOCUMENTS = {"doc-1": {"id": "doc-1"}, "doc-2": {"id": "doc-2"}}
 
 
-def load_partition(partition, *, context: Any) -> Any:
+def load(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     document: Any = partition.load()
     return document
-
-
-def load(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(load_partition)
 
 
 def _pipeline() -> Pipeline:
@@ -204,13 +199,9 @@ def test_guards_enter_in_order_and_exit_in_reverse(tmp_path: Path) -> None:
 def test_a_failing_run_still_exits_its_guards(tmp_path: Path) -> None:
     log: list[str] = []
 
-    def explode_partition(partition, *, context: Any) -> Any:
+    def explode(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         raise RuntimeError("step failed")
-
-    def explode(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(explode_partition)
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(explode)])])
     with pytest.raises(RuntimeError, match="step failed"):

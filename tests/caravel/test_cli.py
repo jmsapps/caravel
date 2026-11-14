@@ -13,15 +13,10 @@ from caravel import InMemorySource, JSONDataset, Pipeline, Stage, Step, make_cli
 DOCUMENTS = {"doc-1": {"id": "doc-1"}, "doc-2": {"id": "doc-2"}}
 
 
-def load_partition(partition, *, context: Any) -> Any:
+def load(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     document: Any = partition.load()
     return {**document, "loaded": True}
-
-
-def load(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(load_partition)
 
 
 def _pipeline() -> Pipeline:
@@ -79,15 +74,11 @@ def test_an_ephemeral_run_needs_no_job_id_and_says_so(
 def test_params_reach_the_run(tmp_path: Path) -> None:
     seen: dict[str, str] = {}
 
-    def capture_partition(partition, *, context: Any) -> Any:
+    def capture(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         document: Any = partition.load()
         seen.update(context.params)
         return document
-
-    def capture(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(capture_partition)
 
     pipeline = Pipeline(
         name="documents",

@@ -11,14 +11,10 @@ class _StubLoader:
 
 
 def _build_viz_fixture_pipeline() -> Pipeline:
-    def normalize_partition(partition, *, _context: object) -> dict[str, str]:
+    def normalize(inputs, *, context: object) -> dict[str, str]:
+        [partition] = inputs.partitions()
         payload: dict[str, str] = partition.load()
         return payload
-
-    def normalize(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(normalize_partition)
 
     branch_entry = Branch(
         name="route_by_source",
@@ -29,23 +25,15 @@ def _build_viz_fixture_pipeline() -> Pipeline:
         },
     )
 
-    def merge_partition(partition, *, _context: object) -> dict[str, str]:
+    def merge(inputs, *, context: object) -> dict[str, str]:
+        [partition] = inputs.partitions()
         payload: dict[str, str] = partition.load()
         return payload
 
-    def merge(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(merge_partition)
-
-    def normalize_silver_partition(partition, *, _context: object) -> dict[str, str]:
+    def normalize_silver(inputs, *, context: object) -> dict[str, str]:
+        [partition] = inputs.partitions()
         payload: dict[str, str] = partition.load()
         return payload
-
-    def normalize_silver(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(normalize_silver_partition)
 
     return Pipeline(
         name="viz_fixture",

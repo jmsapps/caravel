@@ -53,26 +53,14 @@ def _durable(tmp_path: Path, remote_root: str, backend: Any) -> DurableStorage:
     )
 
 
-def load_partition(partition, *, context: Any) -> Any:
+def load(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     document: Any = partition.load()
     return {**document, "loaded": True}
 
 
-def load(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(load_partition)
-
-
-def summarize_all(partitions, *, context: Any) -> Any:
-    dataset = partitions
-    return {"documents": sum(1 for _ in dataset.partitions())}
-
-
-def summarize(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(summarize_all)
+def summarize(inputs, *, context: Any) -> Any:
+    return {"documents": sum(1 for _ in inputs.partitions())}
 
 
 def _pipeline() -> Pipeline:
@@ -82,7 +70,7 @@ def _pipeline() -> Pipeline:
             Stage(name="prepare", entries=[Step(load, output=JSONDataset(name="load"))]),
             Stage(
                 name="summary",
-                entries=[Step(summarize, output=JSONDataset(name="summary"))],
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
             ),
         ],
     )
@@ -140,15 +128,11 @@ def test_resuming_reads_committed_remote_output_instead_of_recomputing(
 ) -> None:
     calls: list[str] = []
 
-    def counted_partition(partition, *, context: Any) -> Any:
+    def counted(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         document: Any = partition.load()
         calls.append(document["id"])
         return {**document, "loaded": True}
-
-    def counted(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(counted_partition)
 
     pipeline = Pipeline(
         name="qualification",

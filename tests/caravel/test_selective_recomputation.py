@@ -36,26 +36,16 @@ ENRICH_NODE = "stage-001-entry-002"
 _VERSION = {"n": 1}
 
 
-def load_partition(partition, *, context: Any) -> Any:
+def load(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     record: Any = partition.load()
     return {**record, "loaded": _VERSION["n"]}
 
 
-def load(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(load_partition)
-
-
-def enrich_partition(partition, *, context: Any) -> Any:
+def enrich(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     record: Any = partition.load()
     return {**record, "enriched": record["loaded"] * 10}
-
-
-def enrich(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(enrich_partition)
 
 
 @pytest.fixture(autouse=True)
@@ -139,15 +129,11 @@ def test_an_upstream_outside_the_closure_is_not_recomputed(tmp_path: Path) -> No
     """Edges into the closure from outside stay satisfied."""
     calls: list[str] = []
 
-    def counted_load_partition(partition, *, context: Any) -> Any:
+    def counted_load(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         record: Any = partition.load()
         calls.append("load")
         return {**record, "loaded": 1}
-
-    def counted_load(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(counted_load_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -337,14 +323,10 @@ def test_an_incremental_lineage_checkpoint_is_not_rolled_back(tmp_path: Path) ->
 
 
 def test_invalidating_a_branch_clears_its_committed_route(tmp_path: Path) -> None:
-    def prepare_partition(partition, *, context: Any) -> Any:
+    def prepare(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         record: Any = partition.load()
         return {**record, "lang": "en" if record["n"] % 2 else "fr"}
-
-    def prepare(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(prepare_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -402,22 +384,16 @@ def crash(name):
         os._exit(137)
 
 
-def load_partition(partition, *, context):
+def load(inputs, *, context):
+    [partition] = inputs.partitions()
     r = partition.load()
     return {{**r, "loaded": 1}}
 
 
-def load(inputs, *, context):
-    return inputs.each(load_partition)
-
-
-def enrich_partition(partition, *, context):
+def enrich(inputs, *, context):
+    [partition] = inputs.partitions()
     r = partition.load()
     return {{**r, "enriched": r["loaded"] * 10}}
-
-
-def enrich(inputs, *, context):
-    return inputs.each(enrich_partition)
 
 
 pipeline = Pipeline(name="documents", stages=[Stage(name="s", entries=[Step(load), Step(enrich)])])

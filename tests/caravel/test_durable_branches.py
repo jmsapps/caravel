@@ -38,38 +38,23 @@ BRANCH_NODE = "stage-001-entry-002"
 MERGE_NODE = "stage-001-entry-002-merge"
 
 
-def prepare_partition(partition, *, context: Any) -> Any:
+def prepare(inputs, *, context: Any) -> Any:
     """Produce the value the predicate routes on, proving it is not source-only."""
+    [partition] = inputs.partitions()
     record: Any = partition.load()
     return {**record, "lang": "en" if record["n"] % 2 else "fr"}
 
 
-def prepare(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(prepare_partition)
-
-
-def english_partition(partition, *, context: Any) -> Any:
+def english(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     record: Any = partition.load()
     return {**record, "route": "en"}
 
 
-def english(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(english_partition)
-
-
-def french_partition(partition, *, context: Any) -> Any:
+def french(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     record: Any = partition.load()
     return {**record, "route": "fr"}
-
-
-def french(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(french_partition)
 
 
 def _pipeline(**branch_kwargs: Any) -> Pipeline:
@@ -251,15 +236,11 @@ def test_a_merge_waits_for_its_own_route_not_for_other_partitions(
 ) -> None:
     import time
 
-    def slow_english_partition(partition, *, context: Any) -> Any:
+    def slow_english(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         record: Any = partition.load()
         time.sleep(0.02)
         return {**record, "route": "en"}
-
-    def slow_english(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(slow_english_partition)
 
     from caravel import ExecutionBudget
 
@@ -306,14 +287,8 @@ def test_whole_dataset_work_after_a_merge_still_needs_an_all_input_step(
 ) -> None:
     """Per-partition merge does not subsume a whole-dataset merge."""
 
-    def summarize_all(partitions, *, context: Any) -> Any:
-        dataset = partitions
-        return {"routes": sorted({p.load()["route"] for p in dataset.partitions()})}
-
-    def summarize(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.all(summarize_all)
+    def summarize(inputs, *, context: Any) -> Any:
+        return {"routes": sorted({p.load()["route"] for p in inputs.partitions()})}
 
     storage = DurableStorage.at(tmp_path / "output")
     pipeline = Pipeline(
@@ -332,7 +307,7 @@ def test_whole_dataset_work_after_a_merge_still_needs_an_all_input_step(
             ),
             Stage(
                 name="summary",
-                entries=[Step(summarize, output=JSONDataset(name="summary"))],
+                entries=[Step(summarize, input_scope="all", output=JSONDataset(name="summary"))],
             ),
         ],
     )
@@ -347,16 +322,16 @@ def test_whole_dataset_work_after_a_merge_still_needs_an_all_input_step(
 
 
 def test_a_route_step_may_not_declare_an_all_input_helper() -> None:
-    def aggregate(partitions: Any, *, context: Any) -> Any:
-        del context
-        return {"count": len(partitions)}
-
     def routed(inputs: Any, *, context: Any) -> Any:
         del context
-        return inputs.all(aggregate)
+        return {"count": len(inputs)}
 
     with pytest.raises(UnsupportedDurableDeclarationError, match="after convergence"):
-        compile_durable_plan(_pipeline(routes={"en": [Step(routed, output=JSONDataset(name="e"))]}))
+        compile_durable_plan(
+            _pipeline(
+                routes={"en": [Step(routed, input_scope="all", output=JSONDataset(name="e"))]}
+            )
+        )
 
 
 def test_a_branch_must_declare_at_least_one_route() -> None:
@@ -409,31 +384,22 @@ sqlite_module._failpoint_hook = crash
 commits_module._failpoint_hook = crash
 
 
-def prepare_partition(partition, *, context):
+def prepare(inputs, *, context):
+    [partition] = inputs.partitions()
     r = partition.load()
     return {{**r, "lang": "en" if r["n"] % 2 else "fr"}}
 
 
-def prepare(inputs, *, context):
-    return inputs.each(prepare_partition)
-
-
-def english_partition(partition, *, context):
+def english(inputs, *, context):
+    [partition] = inputs.partitions()
     r = partition.load()
     return {{**r, "route": "en"}}
 
 
-def english(inputs, *, context):
-    return inputs.each(english_partition)
-
-
-def french_partition(partition, *, context):
+def french(inputs, *, context):
+    [partition] = inputs.partitions()
     r = partition.load()
     return {{**r, "route": "fr"}}
-
-
-def french(inputs, *, context):
-    return inputs.each(french_partition)
 
 
 pipeline = Pipeline(

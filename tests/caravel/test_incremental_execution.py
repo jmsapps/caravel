@@ -28,28 +28,16 @@ PIPELINE_ID = "customer-42/document-changes"
 LOAD_NODE = "stage-001-entry-001"
 
 
-def apply_change_partition(partition, *, context: Any) -> Any:
+def apply_change(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     payload: Any = partition.load()
     del context
     return {"applied": payload}
 
 
-def apply_change(inputs, *, context):
-    """Declare this step's managed input."""
+def summarize(inputs, *, context: Any) -> Any:
     del context
-    return inputs.each(apply_change_partition)
-
-
-def summarize_all(partitions, *, context: Any) -> Any:
-    reader = partitions
-    del context
-    return {"changes": len(list(reader.partitions()))}
-
-
-def summarize(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.all(summarize_all)
+    return {"changes": len(list(inputs.partitions()))}
 
 
 @pytest.fixture()
@@ -74,7 +62,7 @@ def _pipeline(*, with_barrier: bool = False) -> Pipeline:
         stages.append(
             Stage(
                 name="summary",
-                entries=[Step(fn=summarize, output=JSONDataset(name="summary"))],
+                entries=[Step(fn=summarize, input_scope="all", output=JSONDataset(name="summary"))],
             )
         )
     return Pipeline(name="changes", stages=stages)
@@ -145,18 +133,14 @@ def test_a_retried_job_reuses_its_stored_bounds_without_reallocating(
     adapter = ListChangeAdapter([_event(i, f"doc-{i}") for i in range(3)])
     calls = {"n": 0}
 
-    def fail_once_partition(partition, *, context: Any) -> Any:
+    def fail_once(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("stop")
         return {"applied": payload}
-
-    def fail_once(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(fail_once_partition)
 
     pipeline = _pipeline()
     pipeline.stages[0].entries[0] = Step(fn=fail_once, output=JSONDataset(name="apply"))
@@ -250,18 +234,14 @@ def test_a_retention_gap_fails_closed_and_never_resets_a_position(
     adapter = ListChangeAdapter([_event(i, f"doc-{i}") for i in range(4)])
     calls = {"n": 0}
 
-    def fail_once_partition(partition, *, context: Any) -> Any:
+    def fail_once(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("stop")
         return {"applied": payload}
-
-    def fail_once(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(fail_once_partition)
 
     pipeline = _pipeline()
     pipeline.stages[0].entries[0] = Step(fn=fail_once, output=JSONDataset(name="apply"))
@@ -404,7 +384,8 @@ def test_a_version_aware_destination_rejects_a_stale_replayed_write(
 ) -> None:
     index = FakeVersionedIndex()
 
-    def sync_partition(partition, *, context: Any) -> Any:
+    def sync(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         index.apply(
@@ -414,11 +395,6 @@ def test_a_version_aware_destination_rejects_a_stale_replayed_write(
             value=payload.get("value"),
         )
         return payload
-
-    def sync(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(sync_partition)
 
     pipeline = Pipeline(
         name="changes",
@@ -548,13 +524,10 @@ sqlite_module._failpoint_hook = crash
 commits_module._failpoint_hook = crash
 
 
-def apply_change_partition(partition, *, context):
+def apply_change(inputs, *, context):
+    [partition] = inputs.partitions()
     payload = partition.load()
     return {{"applied": payload}}
-
-
-def apply_change(inputs, *, context):
-    return inputs.each(apply_change_partition)
 
 
 pipeline = Pipeline(

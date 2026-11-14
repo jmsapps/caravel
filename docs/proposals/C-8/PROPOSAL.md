@@ -168,7 +168,7 @@ distinct namespaces.
 
 Stages are organizational boundaries, with partition dependencies continuing
 across stage boundaries. A partition can enter the next stage while others are
-still in earlier stages. Whole-run waiting is expressed by `inputs.all(...)`.
+still in earlier stages. Whole-run waiting is expressed by `input_scope="all"`.
 
 ```mermaid
 flowchart LR
@@ -244,15 +244,18 @@ batched output use the same publication contract.
 
 | Configuration | Readiness and execution |
 | --- | --- |
-| `inputs.each(callback)` (per-partition) | Run for each partition as soon as its required upstream partition output commits, while other partitions may still be loading. |
-| `inputs.all(callback)` | Wait for sealed upstream production and completion of every required upstream partition, then execute once logically over the full committed dataset. |
+| `Step(fn)` / `input_scope="partition"` (default) | Run for each partition as soon as its required upstream partition output commits, while other partitions may still be loading. |
+| `Step(fn, input_scope="all")` | Wait for sealed upstream production and completion of every required upstream partition, then execute once logically over the full committed dataset. |
 
-All-input steps receive a dataset reader or manifest rather than an eagerly
+Scope is declared on the step and compiled without running the processor. Both
+scopes pass the same `StepInputs` object, yielding the same `InputPartition`
+handles; scope changes readiness and membership, never the argument type.
+All-input steps receive handles that load on demand rather than an eagerly
 materialized dataset. Optional batching bounds their work within one logical
 aggregate operation. Aggregate output becomes one stable partition for subsequent
 steps. That partition's identity is private scheduling and recovery state:
 published paths, result keys, manifest entries, and feed addresses use the step's
-declared dataset name, which defaults to the declared step name. `inputs.all(...)`
+declared dataset name, which defaults to the declared step name. `input_scope="all"`
 selects input availability and readiness; it does not select an output name.
 Partition-scoped steps preserve partition identity; arbitrary repartitioning
 and partition fan-out require a separate contract.
@@ -309,7 +312,7 @@ pipeline = Pipeline(
 )
 ```
 
-Every step declares `inputs.each(...)` unless it declares `inputs.all(...)`, and defaults to `batch_size=None`. With a
+Every step runs per partition unless it declares `input_scope="all"`, and defaults to `batch_size=None`. With a
 partitioned source, the default single worker can execute:
 
 ```text
@@ -432,7 +435,8 @@ vendor_retry = RetryOptions(should_retry_error=retryable)
 
 # Retry only a record operation inside the batch. The managed deadline,
 # cancellation, and shared allowance are inherited; there is no context to pass.
-def enrich_batch(partition, *, context):
+def enrich(inputs, *, context):
+    [partition] = inputs.partitions()
     return [
         retry_operation(
             operation=lambda record=record: enrich_record(record), retry=vendor_retry
@@ -440,24 +444,19 @@ def enrich_batch(partition, *, context):
         for record in partition.load()
     ]
 
-def enrich(inputs, *, context):
-    return inputs.each(enrich_batch)      # no outer retry enabled
+record_retry_step = Step(enrich, batch_size=100)   # no outer retry enabled
 
-record_retry_step = Step(enrich, batch_size=100)
-
-# Alternatively, retry the batch as a whole, using a callback without inner retries.
-def enrich_without_inner_retry(partition, *, context):
+# Alternatively, retry the batch as a whole, using a processor without inner retries.
+def enrich_without_inner_retry(inputs, *, context):
+    [partition] = inputs.partitions()
     return [enrich_record(record) for record in partition.load()]
 
-def enrich_batched(inputs, *, context):
-    return inputs.each(enrich_without_inner_retry, retry=vendor_retry)
-
-batched_step = Step(enrich_batched, batch_size=100)
-per_record_commit_step = Step(enrich_batched, batch_size=1)
+batched_step = Step(enrich_without_inner_retry, batch_size=100, retry=vendor_retry)
+per_record_commit_step = Step(enrich_without_inner_retry, batch_size=1, retry=vendor_retry)
 ```
 
 These are alternative configurations. A batch-enabled step requires a replayable
-batch reader over its selected input scope. A batch callback's `partition.load()` returns a collection,
+batch reader over its selected input scope. A batched step's handle `load()` returns a collection,
 including a one-record collection when size is 1. With size 100, record retry
 success remains in memory until the batch commits: termination
 can repeat those records. Size 1 gives each record a durable commit boundary.

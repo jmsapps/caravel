@@ -10,8 +10,6 @@ import pytest
 
 from caravel import (
     DurableStorage,
-    Inputs,
-    ManagedInputError,
     Pipeline,
     RetryBudgetExhaustedError,
     RetryCancelledError,
@@ -248,26 +246,20 @@ def test_a_failing_delay_function_is_a_policy_error() -> None:
         )
 
 
-@pytest.mark.parametrize("boundary", ["stage", "step", "each", "all", "operation"])
+@pytest.mark.parametrize("boundary", ["stage", "step", "operation"])
 def test_dictionary_based_retry_configuration_is_rejected(boundary: str) -> None:
     invalid_options: Any = {"max_attempts": 2}
 
-    def callback(value: Any, *, context: Any) -> Any:
+    def processor(inputs: Any, *, context: Any) -> Any:
+        del context
+        [value] = inputs.partitions()
         return value.load()
 
-    def builder(inputs: Any, *, context: Any) -> Any:
-        return inputs.each(callback)
-
-    expected_error = ManagedInputError if boundary in ("each", "all") else TypeError
-    with pytest.raises(expected_error, match=r"retry.*RetryOptions"):
+    with pytest.raises(TypeError, match=r"retry.*RetryOptions"):
         if boundary == "stage":
-            Stage(name="s", entries=[Step(builder)], retry=invalid_options)
+            Stage(name="s", entries=[Step(processor)], retry=invalid_options)
         elif boundary == "step":
-            Step(builder, retry=invalid_options)
-        elif boundary == "each":
-            Inputs().each(callback, retry=invalid_options)
-        elif boundary == "all":
-            Inputs().all(callback, retry=invalid_options)
+            Step(processor, retry=invalid_options)
         else:
             retry_operation(operation=lambda: 1, retry=invalid_options)
 
@@ -330,15 +322,16 @@ def _storage(tmp_path: Path) -> Any:
     return DurableStorage.at(tmp_path / "output")
 
 
-def test_one_options_instance_is_reused_at_stage_step_helper_and_operation(
+def test_one_options_instance_is_reused_at_stage_step_and_operation(
     tmp_path: Path,
 ) -> None:
-    """The same RetryOptions object configures all four supported boundaries."""
+    """The same RetryOptions object configures every supported boundary."""
     shared = RetryOptions(max_attempts=3, delay_seconds=lambda attempt: 0.0)
     attempts = {"operation": 0}
 
-    def callback(partition: Any, *, context: Any) -> Any:
+    def processor(inputs: Any, *, context: Any) -> Any:
         del context
+        [partition] = inputs.partitions()
 
         def call() -> Any:
             attempts["operation"] += 1
@@ -349,14 +342,10 @@ def test_one_options_instance_is_reused_at_stage_step_helper_and_operation(
         value, _ = retry_operation(operation=call, retry=shared)
         return value
 
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(callback, retry=shared)
-
     pipeline = Pipeline(
         name="documents",
         stages=[
-            Stage(name="prepare", retry=shared, entries=[Step(builder, retry=shared)]),
+            Stage(name="prepare", retry=shared, entries=[Step(processor, retry=shared)]),
         ],
     )
     result = run(
@@ -369,19 +358,18 @@ def test_one_options_instance_is_reused_at_stage_step_helper_and_operation(
     assert attempts["operation"] == 2
 
 
-def test_disabled_retry_does_not_repeat_a_failing_callback(tmp_path: Path) -> None:
+def test_disabled_retry_does_not_repeat_a_failing_processor(tmp_path: Path) -> None:
     calls = {"n": 0}
 
-    def callback(partition: Any, *, context: Any) -> Any:
-        del context, partition
+    def processor(inputs: Any, *, context: Any) -> Any:
+        del context, inputs
         calls["n"] += 1
         raise ConnectionError("vendor down")
 
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(callback, retry=None)
-
-    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    pipeline = Pipeline(
+        name="documents",
+        stages=[Stage(name="prepare", entries=[Step(processor, retry=None)])],
+    )
     with pytest.raises(ConnectionError):
         run(
             pipeline,
@@ -393,18 +381,18 @@ def test_disabled_retry_does_not_repeat_a_failing_callback(tmp_path: Path) -> No
 
 
 def test_inner_retries_exhaust_before_an_outer_boundary_restarts(tmp_path: Path) -> None:
-    """Nesting is stage -> step -> helper, so the innermost exhausts first."""
+    """Nesting is stage -> step -> operation, so the innermost exhausts first."""
     calls: list[str] = []
 
-    def callback(partition: Any, *, context: Any) -> Any:
-        del context, partition
-        calls.append("callback")
-        raise ConnectionError("vendor down")
+    def processor(inputs: Any, *, context: Any) -> Any:
+        del context, inputs
 
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(
-            callback, retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0)
+        def call() -> Any:
+            calls.append("operation")
+            raise ConnectionError("vendor down")
+
+        return retry_operation(
+            operation=call, retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0)
         )
 
     pipeline = Pipeline(
@@ -415,7 +403,7 @@ def test_inner_retries_exhaust_before_an_outer_boundary_restarts(tmp_path: Path)
                 retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0),
                 entries=[
                     Step(
-                        builder,
+                        processor,
                         retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0),
                     )
                 ],
@@ -429,7 +417,7 @@ def test_inner_retries_exhaust_before_an_outer_boundary_restarts(tmp_path: Path)
             source=InMemorySource({"p1": {"id": "p1"}}),
             storage=_storage(tmp_path),
         )
-    # 2 helper attempts x 2 step attempts x 2 stage attempts.
+    # 2 operation attempts x 2 step attempts x 2 stage attempts.
     assert len(calls) == 8
 
 
@@ -437,7 +425,8 @@ def test_an_operation_retry_repeats_only_the_wrapped_call(tmp_path: Path) -> Non
     callback_calls = {"n": 0}
     operation_calls = {"n": 0}
 
-    def callback(partition: Any, *, context: Any) -> Any:
+    def builder(inputs: Any, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         del context
         callback_calls["n"] += 1
 
@@ -449,10 +438,6 @@ def test_an_operation_retry_repeats_only_the_wrapped_call(tmp_path: Path) -> Non
 
         value, _ = retry_operation(operation=call, retry=NO_DELAY)
         return value
-
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(callback)
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
     result = run(
@@ -482,7 +467,8 @@ def test_nested_retries_share_the_invocation_allowance(tmp_path: Path) -> None:
     """Explicitly nested policies cannot multiply attempts without bound."""
     calls = {"n": 0}
 
-    def callback(partition: Any, *, context: Any) -> Any:
+    def builder(inputs: Any, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         del context, partition
 
         def call() -> Any:
@@ -492,10 +478,6 @@ def test_nested_retries_share_the_invocation_allowance(tmp_path: Path) -> None:
         return retry_operation(
             operation=call, retry=RetryOptions(max_attempts=50, delay_seconds=lambda a: 0.0)
         )
-
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(callback)
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
     with pytest.raises(RetryBudgetExhaustedError):
@@ -514,8 +496,8 @@ def test_an_exhausted_allowance_is_terminal_for_the_enclosing_retry(tmp_path: Pa
     """Budget exhaustion propagates through outer policies, never reclassified."""
     calls = {"n": 0}
 
-    def callback(partition: Any, *, context: Any) -> Any:
-        del context, partition
+    def processor(inputs: Any, *, context: Any) -> Any:
+        del context, inputs
 
         def call() -> Any:
             calls["n"] += 1
@@ -525,19 +507,18 @@ def test_an_exhausted_allowance_is_terminal_for_the_enclosing_retry(tmp_path: Pa
             operation=call, retry=RetryOptions(max_attempts=50, delay_seconds=lambda a: 0.0)
         )
 
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(
-            callback, retry=RetryOptions(max_attempts=10, delay_seconds=lambda a: 0.0)
-        )
-
     pipeline = Pipeline(
         name="documents",
         stages=[
             Stage(
                 name="prepare",
                 retry=RetryOptions(max_attempts=10, delay_seconds=lambda a: 0.0),
-                entries=[Step(builder)],
+                entries=[
+                    Step(
+                        processor,
+                        retry=RetryOptions(max_attempts=10, delay_seconds=lambda a: 0.0),
+                    )
+                ],
             )
         ],
     )
@@ -556,16 +537,16 @@ def test_initial_attempts_do_not_consume_the_allowance(tmp_path: Path) -> None:
     """A zero allowance still permits every initial call across many partitions."""
     seen: list[str] = []
 
-    def callback(partition: Any, *, context: Any) -> Any:
+    def processor(inputs: Any, *, context: Any) -> Any:
         del context
+        [partition] = inputs.partitions()
         seen.append(partition.partition_id)
         return partition.load()
 
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(callback, retry=NO_DELAY)
-
-    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    pipeline = Pipeline(
+        name="documents",
+        stages=[Stage(name="prepare", entries=[Step(processor, retry=NO_DELAY)])],
+    )
     result = run(
         pipeline,
         job_id="j1",
@@ -582,7 +563,8 @@ def test_a_retry_stops_rather_than_overrunning_the_invocation_deadline(
 ) -> None:
     calls = {"n": 0}
 
-    def callback(partition: Any, *, context: Any) -> Any:
+    def builder(inputs: Any, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         del context, partition
 
         def call() -> Any:
@@ -593,10 +575,6 @@ def test_a_retry_stops_rather_than_overrunning_the_invocation_deadline(
         return retry_operation(
             operation=call, retry=RetryOptions(max_attempts=5, delay_seconds=lambda a: 600.0)
         )
-
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(callback)
 
     pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
     with pytest.raises(RetryCancelledError):
@@ -624,20 +602,28 @@ def test_controls_are_isolated_between_invocations(tmp_path: Path) -> None:
 
     state = {"fail": True, "calls": 0}
 
-    def callback(partition: Any, *, context: Any) -> Any:
+    def processor(inputs: Any, *, context: Any) -> Any:
         del context
+        [partition] = inputs.partitions()
         state["calls"] = int(state["calls"]) + 1
         if state["fail"]:
             raise ConnectionError("vendor down")
         return partition.load()
 
-    def builder(inputs: Any, *, context: Any) -> Any:
-        del context
-        return inputs.each(
-            callback, retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0)
-        )
-
-    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(builder)])])
+    pipeline = Pipeline(
+        name="documents",
+        stages=[
+            Stage(
+                name="prepare",
+                entries=[
+                    Step(
+                        processor,
+                        retry=RetryOptions(max_attempts=2, delay_seconds=lambda a: 0.0),
+                    )
+                ],
+            )
+        ],
+    )
     storage = _storage(tmp_path)
     source = InMemorySource({"p1": {"id": "p1"}})
 

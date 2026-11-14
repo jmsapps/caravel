@@ -34,82 +34,65 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx:end_idx]
 
 
-def bronze_render_html_partition(partition, *, context: object) -> dict[str, str]:
+def bronze_render_html(inputs, *, context: object) -> dict[str, str]:
     """Render one source record into a deterministic HTML partition."""
-    record: dict[str, Any] = partition.load()
-    _ = context
-    item_id = str(record["id"])
-    return {
-        item_id: (
+    rendered = {}
+    for partition in inputs.partitions():
+        record = partition.load()
+        item_id = str(record["id"])
+        if item_id in rendered:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        rendered[item_id] = (
             f"<article data-id='{item_id}' data-lang='{record['lang']}'>"
             f"<h1>{record['title']}</h1>"
             f"<p>{record['snippet']}</p>"
             "</article>"
         )
-    }
+    return rendered
 
 
-def bronze_render_html(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(bronze_render_html_partition)
-
-
-def silver_extract_structured_partition(partition, *, context: object) -> dict[str, dict[str, Any]]:
+def silver_extract_structured(inputs, *, context: object) -> dict[str, dict[str, Any]]:
     """Convert one partition's bronze HTML back into a structured record."""
-    payload: dict[str, str] = partition.load()
-    _ = context
     structured: dict[str, dict[str, Any]] = {}
-    for key in sorted(payload):
-        html = payload[key]
-        snippet = _extract_between(html, "<p>", "</p>")
-        structured[key] = {
-            "id": _extract_between(html, "data-id='", "'"),
-            "lang": _extract_between(html, "data-lang='", "'"),
-            "title": _extract_between(html, "<h1>", "</h1>"),
-            "snippet": snippet,
-            "normalized_snippet": snippet.lower(),
-            "source_key": key,
-        }
+    for partition in inputs.partitions():
+        for key, html in sorted(partition.load().items()):
+            if key in structured:
+                raise ValueError(f"Duplicate record key: {key}")
+            snippet = _extract_between(html, "<p>", "</p>")
+            structured[key] = {
+                "id": _extract_between(html, "data-id='", "'"),
+                "lang": _extract_between(html, "data-lang='", "'"),
+                "title": _extract_between(html, "<h1>", "</h1>"),
+                "snippet": snippet,
+                "normalized_snippet": snippet.lower(),
+                "source_key": key,
+            }
     return structured
 
 
-def silver_extract_structured(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(silver_extract_structured_partition)
-
-
-def gold_partition_by_language_partition(
-    partition, *, context: object
-) -> dict[str, dict[str, Any]]:
+def gold_partition_by_language(inputs, *, context: object) -> dict[str, dict[str, Any]]:
     """Emit path-style keys (`<lang>/<id>`) to prove nested storage keys.
 
     These are *storage* partition keys inside one payload. They occupy a
     different namespace from execution partition identity, which the engine
     keeps stable across steps.
     """
-    payload: dict[str, dict[str, Any]] = partition.load()
-    _ = context
     repartitioned: dict[str, dict[str, Any]] = {}
-    for key in sorted(payload):
-        record = payload[key]
-        lang = str(record["lang"])
-        item_id = str(record["id"])
-        repartitioned[f"{lang}/{item_id}"] = {
-            "id": item_id,
-            "lang": lang,
-            "title": record["title"],
-            "normalized_snippet": record["normalized_snippet"],
-            "origin_partition": key,
-        }
+    for partition in inputs.partitions():
+        for key, record in sorted(partition.load().items()):
+            lang = str(record["lang"])
+            item_id = str(record["id"])
+            output_key = f"{lang}/{item_id}"
+            if output_key in repartitioned:
+                raise ValueError(f"Duplicate record key: {output_key}")
+            repartitioned[output_key] = {
+                "id": item_id,
+                "lang": lang,
+                "title": record["title"],
+                "normalized_snippet": record["normalized_snippet"],
+                "origin_partition": key,
+            }
     return repartitioned
-
-
-def gold_partition_by_language(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(gold_partition_by_language_partition)
 
 
 def build_partitioned_pipeline(input_dir: Path | str | None = None) -> Pipeline:

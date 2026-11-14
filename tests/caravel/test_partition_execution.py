@@ -28,40 +28,25 @@ PIPELINE_ID = "customer-42/documents"
 JOB = "snapshot-2026-11-12-v7"
 
 
-def load_partition(partition, *, context: Any) -> Any:
+def load(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     payload: Any = partition.load()
     del context
     return {"loaded": payload}
 
 
-def load(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(load_partition)
-
-
-def enrich_partition(partition, *, context: Any) -> Any:
+def enrich(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     payload: Any = partition.load()
     del context
     return {"enriched": payload}
 
 
-def enrich(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(enrich_partition)
-
-
-def publish_partition(partition, *, context: Any) -> Any:
+def publish(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
     payload: Any = partition.load()
     del context
     return {"published": payload}
-
-
-def publish(inputs, *, context):
-    """Declare this step's managed input."""
-    del context
-    return inputs.each(publish_partition)
 
 
 def _pipeline(*steps: Step, name: str = "documents") -> Pipeline:
@@ -248,7 +233,8 @@ def test_datasets_introduce_no_scheduling_barrier(
 ) -> None:
     """Execution identity is independent of how a payload serializes."""
 
-    def produce_partition(partition, *, context: Any) -> Any:
+    def produce(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         if isinstance(dataset, TextDataset):
@@ -256,11 +242,6 @@ def test_datasets_introduce_no_scheduling_barrier(
         if isinstance(dataset, PartitionedJSONDataset):
             return {"inner": payload}
         return {"loaded": payload}
-
-    def produce(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(produce_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -283,13 +264,10 @@ def test_a_partition_reaches_the_last_stage_before_another_starts(
     observed: list[tuple[str, str]] = []
 
     def record(step_name: str) -> Any:
-        def callback(partition: Any, *, context: Any) -> Any:
+        def inner(inputs: Any, *, context: Any) -> Any:
+            [partition] = inputs.partitions()
             observed.append((step_name, str(context.params.get("marker", ""))))
             return {step_name: partition.load()}
-
-        def inner(inputs: Any, *, context: Any) -> Any:
-            del context
-            return inputs.each(callback)
 
         inner.__name__ = step_name
         return inner
@@ -319,18 +297,14 @@ def test_a_failed_partition_step_leaves_committed_work_intact_and_resumes(
 ) -> None:
     failures = {"count": 0}
 
-    def flaky_partition(partition, *, context: Any) -> Any:
+    def flaky(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         if payload == {"loaded": {"n": 2}} and failures["count"] == 0:
             failures["count"] += 1
             raise RuntimeError("transient")
         return {"enriched": payload}
-
-    def flaky(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(flaky_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -368,29 +342,21 @@ def test_restart_restores_committed_upstream_output_without_recomputing(
 ) -> None:
     calls: list[str] = []
 
-    def counted_load_partition(partition, *, context: Any) -> Any:
+    def counted_load(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         calls.append("load")
         return {"loaded": payload}
 
-    def counted_load(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(counted_load_partition)
-
-    def stop_once_partition(partition, *, context: Any) -> Any:
+    def stop_once(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         if len(calls) == 1 and not getattr(stop_once, "done", False):
             stop_once.done = True  # type: ignore[attr-defined]
             raise RuntimeError("stop")
         return {"enriched": payload}
-
-    def stop_once(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(stop_once_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -435,15 +401,11 @@ def test_restart_restores_committed_upstream_output_without_recomputing(
 def test_batch_size_commits_each_batch_separately(
     store: SQLiteDurableStore, output: AttemptOutputStore
 ) -> None:
-    def double_partition(partition, *, context: Any) -> Any:
+    def double(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         records: Any = partition.load()
         del context
         return [value * 2 for value in records]
-
-    def double(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(double_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -472,15 +434,11 @@ def test_batch_size_commits_each_batch_separately(
 def test_batch_size_one_gives_each_record_a_commit_boundary(
     store: SQLiteDurableStore, output: AttemptOutputStore
 ) -> None:
-    def identity_partition(partition, *, context: Any) -> Any:
+    def identity(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         records: Any = partition.load()
         del context
         return records
-
-    def identity(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(identity_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -507,16 +465,12 @@ def test_batching_an_unsplittable_input_is_rejected_before_processing(
 ) -> None:
     called: list[str] = []
 
-    def never_partition(partition, *, context: Any) -> Any:
+    def never(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         called.append("called")
         return payload
-
-    def never(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(never_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -538,7 +492,8 @@ def test_an_arbitrary_function_gains_no_implied_internal_resume(
     """Without batching, the whole function call is the recovery unit."""
     progress: list[int] = []
 
-    def multi_part_partition(partition, *, context: Any) -> Any:
+    def multi_part(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         progress.append(1)
@@ -546,11 +501,6 @@ def test_an_arbitrary_function_gains_no_implied_internal_resume(
         if len(progress) == 2:
             raise RuntimeError("halfway")
         return payload
-
-    def multi_part(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(multi_part_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -575,16 +525,12 @@ def test_the_budget_yields_before_starting_another_unit(
 ) -> None:
     import time
 
-    def slow_partition(partition, *, context: Any) -> Any:
+    def slow(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
         payload: Any = partition.load()
         del context
         time.sleep(0.05)
         return payload
-
-    def slow(inputs, *, context):
-        """Declare this step's managed input."""
-        del context
-        return inputs.each(slow_partition)
 
     pipeline = Pipeline(
         name="documents",
@@ -758,22 +704,16 @@ sqlite_module._failpoint_hook = crash
 commits_module._failpoint_hook = crash
 
 
-def load_partition(partition, *, context):
+def load(inputs, *, context):
+    [partition] = inputs.partitions()
     payload = partition.load()
     return {{"loaded": payload}}
 
 
-def load(inputs, *, context):
-    return inputs.each(load_partition)
-
-
-def publish_partition(partition, *, context):
+def publish(inputs, *, context):
+    [partition] = inputs.partitions()
     payload = partition.load()
     return {{"published": payload}}
-
-
-def publish(inputs, *, context):
-    return inputs.each(publish_partition)
 
 
 pipeline = Pipeline(
