@@ -502,7 +502,7 @@ def test_the_replacement_retry_surface_is_public() -> None:
 
 
 def test_the_runtime_input_surface_is_public() -> None:
-    for name in ("StepInputs", "InputPartition", "StepInputsError", "InputScope"):
+    for name in ("StepInputs", "InputPartition", "InputScope"):
         assert hasattr(caravel, name), name
         assert name in caravel.__all__, name
 

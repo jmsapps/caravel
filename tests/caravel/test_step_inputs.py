@@ -31,7 +31,6 @@ from caravel import (
     Stage,
     Step,
     StepInputs,
-    StepInputsError,
     retry_operation,
     run,
 )
@@ -171,7 +170,7 @@ def test_step_inputs_exposes_exactly_the_declared_interface(storage: Any) -> Non
     assert _run(pipeline, storage).status == "completed"
 
     members = _observed_for("process")[0]["inputs_members"]
-    assert members == frozenset({"batch_id", "partitions", "is_empty", "each", "all"})
+    assert members == frozenset({"batch_id", "partitions", "is_empty"})
 
 
 def test_partitions_is_a_repeatable_lazy_iterator(storage: Any) -> None:
@@ -392,29 +391,6 @@ def test_a_context_factory_still_wraps_the_framework_context(storage: Any) -> No
 def test_the_builder_api_is_gone(removed: str) -> None:
     assert not hasattr(caravel, removed)
     assert removed not in caravel.__all__
-
-
-def test_an_obsolete_builder_fails_on_invocation_with_an_actionable_error(storage: Any) -> None:
-    def obsolete(inputs, *, context):
-        del context
-        return inputs.each(lambda partition, *, context: partition.load())
-
-    pipeline = Pipeline(name=PIPELINE, stages=[Stage(name="s", entries=[Step(obsolete)])])
-    with pytest.raises(StepInputsError, match="inputs.partitions"):
-        _run(pipeline, storage)
-
-
-def test_an_obsolete_all_builder_fails_on_invocation(storage: Any) -> None:
-    def obsolete(inputs, *, context):
-        del context
-        return inputs.all(lambda partitions, *, context: None)
-
-    pipeline = Pipeline(
-        name=PIPELINE,
-        stages=[Stage(name="s", entries=[Step(obsolete, input_scope="all")])],
-    )
-    with pytest.raises(StepInputsError, match="inputs.partitions"):
-        _run(pipeline, storage)
 
 
 # ---------------------------------------------------------------------------

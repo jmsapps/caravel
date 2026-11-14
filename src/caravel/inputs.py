@@ -1,9 +1,9 @@
 """The runtime input interface every processor receives.
 
-A processor is ordinary processing code, not a declaration builder. The durable
-engine is its only caller, so every invocation has a claimed lease, a durable
-batch identity, and a transactional commit behind it. Nothing here runs during
-planning.
+A processor is ordinary processing code, called once per work unit or batch.
+The durable engine is its only caller, so every invocation has a claimed lease,
+a durable batch identity, and a transactional commit behind it. Nothing here
+runs during planning.
 
 One class, :class:`StepInputs`, is passed in every scope, and it yields handles
 of one class, :class:`InputPartition`. ``input_scope`` on ``Step`` decides when
@@ -20,21 +20,6 @@ from __future__ import annotations
 
 import inspect
 from typing import Any, Callable, Iterator
-
-
-class StepInputsError(Exception):
-    """Raised when a processor uses its inputs as something they are not.
-
-    Plan-shape problems raise ``UnsupportedDurableDeclarationError`` instead;
-    this type covers what one processor did with its ``StepInputs`` object.
-    """
-
-
-_REPLACEMENT = (
-    "A processor is ordinary processing code: iterate inputs.partitions() and "
-    'return this unit\'s payload. Declare scope with Step(fn, input_scope="all") '
-    "instead of declaring a managed input at runtime."
-)
 
 
 class InputPartition:
@@ -107,16 +92,6 @@ class StepInputs:
         """True when this batch's sealed input contains no partitions."""
         return not self._handles
 
-    def each(self, *args: Any, **kwargs: Any) -> Any:
-        """Removed. Present only to fail an obsolete declaration builder clearly."""
-        del args, kwargs
-        raise StepInputsError(f"inputs.each(...) no longer exists. {_REPLACEMENT}")
-
-    def all(self, *args: Any, **kwargs: Any) -> Any:
-        """Removed. Present only to fail an obsolete declaration builder clearly."""
-        del args, kwargs
-        raise StepInputsError(f"inputs.all(...) no longer exists. {_REPLACEMENT}")
-
     def __repr__(self) -> str:
         return f"StepInputs(batch_id={self.batch_id!r}, partitions={len(self._handles)})"
 
@@ -151,6 +126,5 @@ def validate_processor_signature(fn: Callable[..., Any], *, what: str) -> None:
 __all__ = [
     "InputPartition",
     "StepInputs",
-    "StepInputsError",
     "validate_processor_signature",
 ]

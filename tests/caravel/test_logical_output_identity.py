@@ -1,6 +1,6 @@
 """Public output identity is declared, never the private aggregate execution ID.
 
-``inputs.all(...)`` chooses input availability and readiness. It does not choose
+``input_scope="all"`` chooses input availability and readiness. It does not choose
 an output name, merge payloads, or create an application-visible execution
 partition. These tests address output the way an application does -- published
 paths, ``results.of()``, ``results.published()``, the completion manifest, and

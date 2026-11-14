@@ -492,17 +492,18 @@ propagate without retry.
 
 ### Migrating from the removed declaration and retry APIs
 
-This is a breaking replacement with no aliases or compatibility dispatch. Old
-API usage fails explicitly, and a job whose persisted declaration fingerprint
-does not match the current declaration fails before any source read or
-mutation; start a new `job_id`.
+This is a breaking replacement: the names below are absent from the package,
+with no aliases and no compatibility dispatch. A job whose persisted declaration
+fingerprint does not match the current declaration fails before any source read
+or mutation; start a new `job_id`.
 
 | Removed | Replacement |
 | --- | --- |
-| `Inputs`, `inputs.each(...)`, `inputs.all(...)` | a plain processor plus `Step(fn, input_scope=...)` |
-| `ManagedDescriptor`, `DeclarationContext` | nothing: scope is declared, and the runtime context is the processor's `context=` |
-| `PartitionInput`, `AggregateInput` | one `StepInputs` yielding `InputPartition` handles |
-| `ManagedInputError` | `StepInputsError` |
+| `Inputs`, `inputs.each(...)`, `inputs.all(...)` | a plain processor, with scope declared as `Step(fn, input_scope=...)` |
+| `ManagedDescriptor` | `Step.input_scope` |
+| `DeclarationContext` | the processor's `context=`, plus ordinary bindings such as `functools.partial` |
+| `ManagedInputError` | none |
+| `PartitionInput`, `AggregateInput` | `StepInputs`, yielding `InputPartition` handles |
 | `inputs.each(callback, retry=...)` | `Step(fn, retry=...)`, or `retry_operation()` inside the processor |
 | `RetryPolicy(max_retries=n, when=...)` | `RetryOptions(max_attempts=n + 1, should_retry_error=...)` |
 | `RetryPolicy(on_result=...)` | `RetryOptions(should_retry_result=...)` |

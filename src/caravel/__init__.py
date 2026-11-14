@@ -41,7 +41,7 @@ from .durability import (
     StorageCapabilityError,
     UnsupportedDurableDeclarationError,
 )
-from .inputs import InputPartition, StepInputs, StepInputsError
+from .inputs import InputPartition, StepInputs
 from .loaders import CallableLoader, MultiSourceLoader, dataset_as_loader
 from .paths import partition_key_to_relpath, validate_partition_key
 from .pipeline import Pipeline, Stage, Step
@@ -108,7 +108,6 @@ __all__ = [
     # Runtime inputs
     "StepInputs",
     "InputPartition",
-    "StepInputsError",
     # Retries
     "RetryOptions",
     "retry_operation",
