@@ -11,7 +11,7 @@ python -m examples.saga_rollback
 ```
 
 The command raises the simulated error, but
-`data/output/saga_rollback_example/external_state.json` is restored to its
+`examples/saga_rollback/data/external_state.json` is restored to its
 initial values. The adjacent `compensation_journal.json` records the actions
 and has status `compensated`.
 
@@ -26,8 +26,8 @@ the created shipment. The journal has status `committed`, and the intended
 pipeline result is written to:
 
 ```text
-data/output/saga_rollback_example/pipeline/saga_rollback_example/
-  _001_fulfillment/_004_finalize_order/_004_finalize_order.json
+examples/saga_rollback/data/output/
+  001-fulfillment/004-finalize_order/order/order.json
 ```
 
 This is not an ACID transaction. Other processes can observe intermediate

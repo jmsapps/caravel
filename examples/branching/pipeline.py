@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from caravel import (
-    SOURCE_FIELD,
+    dataset_as_loader,
+    Loader,
+    StepContext,
+    RunResult,
     Branch,
     MultiSourceLoader,
     PartitionedJSONDataset,
     PartitionedTextDataset,
     Pipeline,
     Stage,
+    Step,
     run,
-    step,
 )
+
+from ..support import durable
 
 PIPELINE_NAME = "branching_example"
 
@@ -67,149 +72,127 @@ def make_branching_loader(
     )
 
 
-@step(output=PartitionedJSONDataset())
+def make_source_loader(
+    source_name: str,
+    *,
+    json_source_dir: Path | str | None = None,
+    html_source_dir: Path | str | None = None,
+) -> MultiSourceLoader:
+    """Build a loader over one source, tagged the same way as the pair.
+
+    A branch chooses one route for the value it receives, so each source is its
+    own job. Tagging stays identical, which is what lets the same declaration
+    serve both.
+    """
+    resolved_json = (
+        Path(json_source_dir) if json_source_dir is not None else _DEFAULT_JSON_SOURCE_DIR
+    )
+    resolved_html = (
+        Path(html_source_dir) if html_source_dir is not None else _DEFAULT_HTML_SOURCE_DIR
+    )
+    datasets: dict[str, Loader] = {
+        JSON_SOURCE_NAME: dataset_as_loader(
+            PartitionedJSONDataset(name=JSON_SOURCE_NAME, path=resolved_json)
+        ),
+        HTML_SOURCE_NAME: dataset_as_loader(
+            PartitionedTextDataset(name=HTML_SOURCE_NAME, path=resolved_html, suffix=".html")
+        ),
+    }
+    return MultiSourceLoader([datasets[source_name]])
+
+
+class NormalizedRecord(TypedDict):
+    """A record normalized into one shape, whatever source it came from."""
+
+    id: str
+    lang: str
+    title: str
+    body: str
+    origin: str
+
+
+class UnifiedRecord(NormalizedRecord):
+    """A normalized record after unification."""
+
+    unified: bool
+
+
+NormalizedRecords = dict[str, NormalizedRecord]
+UnifiedRecords = dict[str, UnifiedRecord]
+
+
 def bronze_normalize_json_source(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Normalize JSON-source records onto a shared schema keyed by logical `id`."""
-    _ = context
-    normalized: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
-        if not isinstance(record, dict):
-            raise TypeError(
-                f"Expected dict record for partition '{key}', got {type(record).__name__}."
-            )
-
-        source_name = str(record.get(SOURCE_FIELD, ""))
-        if source_name != JSON_SOURCE_NAME:
-            raise ValueError(
-                f"Expected source '{JSON_SOURCE_NAME}' for partition '{key}', got '{source_name}'."
-            )
-
-        item_id = str(record["id"])
-        language = str(record["language"])
-        content = str(record["body"])
-
-        normalized[item_id] = {
-            "id": item_id,
-            "language": language,
-            "source": source_name,
-            "content": content,
-            "title": str(record.get("title", "")),
-            "origin_partition": key,
-        }
-
-    return normalized
+    value: dict[str, Any], *, context: StepContext
+) -> NormalizedRecords:
+    """Normalize the JSON-sourced records. Runs only when that route is chosen."""
+    records: NormalizedRecords = {}
+    for _key, record in value.items():
+        payload = record.get("content", record)
+        item_id = str(payload["id"])
+        if item_id in records:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        records[item_id] = NormalizedRecord(
+            id=item_id,
+            lang=str(payload["language"]),
+            title=str(payload["title"]),
+            body=str(payload["body"]),
+            origin="json",
+        )
+    return records
 
 
-@step(output=PartitionedJSONDataset())
 def bronze_normalize_html_source(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Normalize HTML-source records onto the same schema keyed by logical `id`."""
-    _ = context
-    normalized: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
-        if not isinstance(record, dict):
-            raise TypeError(
-                f"Expected dict record for partition '{key}', got {type(record).__name__}."
-            )
-
-        source_name = str(record.get(SOURCE_FIELD, ""))
-        if source_name != HTML_SOURCE_NAME:
-            raise ValueError(
-                f"Expected source '{HTML_SOURCE_NAME}' for partition '{key}', got '{source_name}'."
-            )
-
-        html = str(record["content"])
+    value: dict[str, Any], *, context: StepContext
+) -> NormalizedRecords:
+    """Normalize the HTML-sourced records. Runs only when that route is chosen."""
+    records: NormalizedRecords = {}
+    for _key, record in value.items():
+        html = record.get("content", record)
+        if not isinstance(html, str):
+            raise TypeError(f"Expected HTML text, got {type(html).__name__}.")
         item_id = _extract_between(html, 'data-id="', '"')
-        language = _extract_between(html, 'data-lang="', '"')
-        title = _extract_between(html, "<h1>", "</h1>")
-        content = _extract_between(html, "<p>", "</p>")
-
-        normalized[item_id] = {
-            "id": item_id,
-            "language": language,
-            "source": source_name,
-            "content": content,
-            "title": title,
-            "origin_partition": key,
-        }
-
-    return normalized
+        if item_id in records:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        records[item_id] = NormalizedRecord(
+            id=item_id,
+            lang=_extract_between(html, 'data-lang="', '"'),
+            title=_extract_between(html, "<h1>", "</h1>"),
+            body=_extract_between(html, "<p>", "</p>"),
+            origin="html",
+        )
+    return records
 
 
-@step(output=PartitionedJSONDataset())
-def silver_unify_records(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Validate and preserve a uniform record contract after branch convergence."""
-    _ = context
-    unified: dict[str, dict[str, Any]] = {}
+def bronze_converged_records(value: NormalizedRecords, *, context: StepContext) -> UnifiedRecords:
+    """Collect the converged records without changing their keys."""
+    return {key: UnifiedRecord(**record, unified=True) for key, record in sorted(value.items())}
 
-    for key in sorted(partitions):
-        record = partitions[key]
-        required = {"id", "language", "source", "content"}
-        missing = required.difference(record)
-        if missing:
-            raise KeyError(f"Unified record '{key}' missing required fields: {sorted(missing)}")
 
-        unified[key] = {
-            "id": str(record["id"]),
-            "language": str(record["language"]),
-            "source": str(record["source"]),
-            "content": str(record["content"]),
-            "title": str(record.get("title", "")),
-            "origin_partition": str(record.get("origin_partition", key)),
-        }
+def silver_unify_records(value: UnifiedRecords, *, context: StepContext) -> UnifiedRecords:
+    """Carry the unified records through the silver stage."""
+    return dict(sorted(value.items()))
 
+
+def gold_partition_by_language(value: UnifiedRecords, *, context: StepContext) -> UnifiedRecords:
+    """Key every record by language and id."""
+    unified: UnifiedRecords = {}
+    for record in value.values():
+        key = f"{record['lang']}/{record['id']}"
+        if key in unified:
+            raise ValueError(f"Duplicate record key: {key}")
+        unified[key] = record
     return unified
-
-
-@step(output=PartitionedJSONDataset())
-def bronze_converged_records(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Persist merged branch output as a stage-terminal Step for downstream seeding."""
-    _ = context
-    return {key: dict(record) for key, record in sorted(partitions.items())}
-
-
-@step(output=PartitionedJSONDataset())
-def gold_partition_by_language(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Repartition converged records using path-style language keys (`<lang>/<id>`)."""
-    _ = context
-    repartitioned: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
-        item_id = str(record["id"])
-        language = str(record["language"])
-
-        repartitioned[f"{language}/{item_id}"] = {
-            "id": item_id,
-            "language": language,
-            "source": str(record["source"]),
-            "content": str(record["content"]),
-            "origin_key": key,
-        }
-
-    return repartitioned
 
 
 def build_branching_pipeline(
     *,
+    source_name: str = JSON_SOURCE_NAME,
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
 ) -> Pipeline:
-    """Build the synthetic branching pipeline declaration."""
-    loader = make_branching_loader(
+    """Build the synthetic branching pipeline declaration for one source."""
+    loader = make_source_loader(
+        source_name,
         json_source_dir=json_source_dir,
         html_source_dir=html_source_dir,
     )
@@ -218,34 +201,53 @@ def build_branching_pipeline(
         name=BRANCH_STEP_NAME,
         by="source",
         routes={
-            JSON_SOURCE_NAME: [bronze_normalize_json_source],
-            HTML_SOURCE_NAME: [bronze_normalize_html_source],
+            JSON_SOURCE_NAME: [Step(bronze_normalize_json_source, output=PartitionedJSONDataset())],
+            HTML_SOURCE_NAME: [Step(bronze_normalize_html_source, output=PartitionedJSONDataset())],
         },
     )
 
     return Pipeline(
         name=PIPELINE_NAME,
-        loader=loader,
+        source=loader,
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[branch_entry, bronze_converged_records]),
-            Stage(name=SILVER_STAGE_NAME, entries=[silver_unify_records]),
-            Stage(name=GOLD_STAGE_NAME, entries=[gold_partition_by_language]),
+            Stage(
+                name=BRONZE_STAGE_NAME,
+                entries=[
+                    branch_entry,
+                    Step(bronze_converged_records, output=PartitionedJSONDataset()),
+                ],
+            ),
+            Stage(
+                name=SILVER_STAGE_NAME,
+                entries=[Step(silver_unify_records, output=PartitionedJSONDataset())],
+            ),
+            Stage(
+                name=GOLD_STAGE_NAME,
+                entries=[Step(gold_partition_by_language, output=PartitionedJSONDataset())],
+            ),
         ],
     )
 
 
 def run_branching_pipeline(
     *,
-    run_root: Path | str | None = None,
+    state_root: Path | str,
+    job_id: str = "branching-1",
+    source_name: str = JSON_SOURCE_NAME,
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
-) -> Path | str:
-    """Run the branching pipeline and return the resolved run root."""
+) -> RunResult:
+    """Run the branching example for one source and return its result."""
     pipeline = build_branching_pipeline(
+        source_name=source_name,
         json_source_dir=json_source_dir,
         html_source_dir=html_source_dir,
     )
-    return run(pipeline, run_root=run_root)
+    return run(
+        durable(pipeline, job_id),
+        output=Path(state_root) / "output" / source_name,
+        source=pipeline.source,
+    )
 
 
 __all__ = [

@@ -66,7 +66,8 @@ python3 -m pytest -q tests/examples/test_multisource_pipeline.py
 After running, open the output summary JSON:
 
 ```text
-data/multisource_example/smoke_run/_001_silver/_001_summarize_by_source/_001_summarize_by_source.json
+data/multisource_example/output/multisource_example/<job-id>/
+  001-silver/001-summarize_by_source/summary/summary.json
 ```
 
 Confirm counts are present for both `src_a` and `src_b`, and that

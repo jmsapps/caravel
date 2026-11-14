@@ -1,26 +1,36 @@
 # Production Profile Qualification
 
-This example composes the four first-party production plugins explicitly around
-the `fsspec_minimal` pipeline. It is a qualification fixture, not a claim that
-every workload or fsspec backend is production-qualified.
+This example composes the production observer explicitly around the
+`fsspec_minimal` pipeline. It is a qualification fixture, not a claim that every
+workload or fsspec backend is production-qualified.
 
-Use separate output and metadata roots. Both may be local paths or fsspec URLs:
-
-```bash
-CARAVEL_METADATA_ROOT=data/qualification/metadata \
-python3 -m examples.production_profile \
-  --run-root data/qualification/output
-```
-
-After the full run, exercise checkpoint-backed selective execution against the
-same roots:
+Published output and evidence metadata use separate roots and may each be a
+local path or an fsspec URL. The authoritative progress store is different: it
+requires a local filesystem that survives invocations, so `--state` is always
+local.
 
 ```bash
 CARAVEL_METADATA_ROOT=data/qualification/metadata \
 python3 -m examples.production_profile \
-  --run-root data/qualification/output \
-  --stage silver
+  --output data/qualification/output \
+  --state data/qualification/state \
+  --job-id qualification-1
 ```
+
+Re-invoking the same job id restores committed work instead of recomputing it,
+which is the durable claim worth qualifying:
+
+```bash
+CARAVEL_METADATA_ROOT=data/qualification/metadata \
+python3 -m examples.production_profile \
+  --output data/qualification/output \
+  --state data/qualification/state \
+  --job-id qualification-1    # reports batches=0
+```
+
+Forcing recomputation is an API call rather than a CLI selector:
+`DurableStorage.invalidate(pipeline, job_id=..., step=...)`, documented in the
+task record's `selective-recomputation.md`.
 
 For Azure, install `.[azure,examples]`, set the credential variables documented
 by `examples/fsspec_minimal`, and use a fresh isolated prefix for every
@@ -31,7 +41,9 @@ QUALIFICATION_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 CARAVEL_INPUT_URL=abfs://caravel/input/input_partitions.json \
 CARAVEL_METADATA_ROOT="abfs://caravel/qualification/${QUALIFICATION_ID}/metadata" \
 python3 -m examples.production_profile \
-  --run-root "abfs://caravel/qualification/${QUALIFICATION_ID}/output"
+  --output "abfs://caravel/qualification/${QUALIFICATION_ID}/output" \
+  --state "/var/tmp/caravel-state/${QUALIFICATION_ID}" \
+  --job-id "${QUALIFICATION_ID}"
 ```
 
 Do not reuse the example's fixed `smoke_run` path as release evidence. A unique
@@ -45,19 +57,20 @@ terminates the whole job after 15 minutes. The workflow accepts an account key,
 SAS token, or complete service-principal credential set from repository secrets;
 credentials are never written to qualification artifacts.
 
-In addition to the full and selective example runs, the credential-gated suite
-at `tests/qualification/test_azure_profile.py` verifies these behaviors on a
-unique Azure prefix:
+In addition to the example run and its resume, the workflow pins
+`CARAVEL_QUALIFICATION_ARTIFACTS_ROOT` to a unique Azure prefix and runs
+`tests/qualification/test_remote_artifacts.py` against the real service rather
+than an emulator. That suite verifies, on committed artifacts:
 
-- checkpoint-backed selective execution and sanitized run events;
-- reconstruction of checkpoint-proven empty partitioned output when Azure
-  preserves no empty directory;
-- interruption after checkpoint invalidation followed by safe recovery;
-- malformed checkpoint evidence failing closed;
-- ownership pruning of a removed output;
-- live-lease refusal, stale-lease recovery, and normal lease cleanup;
-- stale-partition removal during output replacement; and
-- partition-key traversal rejection before an escaped object is written.
+- a job commits and reads artifacts on real object storage;
+- committed artifacts survive reopening the store;
+- resuming reads committed remote output instead of recomputing it;
+- an unreferenced remote attempt stays invisible; and
+- recomputation supersedes remote output without deleting it.
+
+Capabilities that the durable store absorbed during C-8 — checkpoint evidence,
+ownership inventory, and leases — are no longer plugin behavior and are covered
+by the store's own suites.
 
 The workflow publishes JUnit timings and installed dependency versions as a
 sanitized GitHub artifact. Azure objects are intentionally retained beneath the

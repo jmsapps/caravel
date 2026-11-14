@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Sequence
 
+from ..support import example_data_dir
 from .pipeline import run_saga_pipeline
 
 
@@ -16,9 +16,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    root = Path("data/output/saga_rollback_example")
+    root = example_data_dir(__file__)
     run_saga_pipeline(
-        run_root=root / "pipeline",
+        state_root=root,
         state_path=root / "external_state.json",
         journal_path=root / "compensation_journal.json",
         fail=not args.succeed,

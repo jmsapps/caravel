@@ -9,13 +9,17 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Mapping, Protocol, runtime_checkable
 
 PartitionId = str
 Record = Any
 Partitions = dict[PartitionId, Record]
 
 SOURCE_FIELD = "__source__"
+
+# Declared on ``Step``. It selects when a step becomes ready and which input
+# partitions it receives; it never changes what a processor is handed.
+InputScope = Literal["partition", "all"]
 
 
 @dataclass(frozen=True)

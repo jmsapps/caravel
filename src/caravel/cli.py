@@ -1,15 +1,21 @@
+"""A command-line entry point for one durable pipeline.
+
+The CLI drives the same single execution model as :func:`caravel.run`. It
+therefore requires the same explicit storage decision: a job that claims to be
+resumable must say where its durable state lives.
+"""
+
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
+from .options import DurabilityOptions
 from .runner import run
-from .storage import is_url_path
-from .types import MissingPriorOutputError
 from .viz import to_mermaid
 
-RunFn = Callable[..., Path | str]
+RunFn = Callable[..., Any]
 MermaidFn = Callable[[Any], str]
 
 
@@ -17,15 +23,6 @@ class CliEntrypoint(Protocol):
     """Callable returned by `make_cli` — argv defaults to `sys.argv[1:]`."""
 
     def __call__(self, argv: Sequence[str] | None = None) -> int: ...
-
-
-def _coerce_selector(value: str | None) -> str | int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return value
 
 
 def _parse_params(values: Sequence[str]) -> dict[str, str]:
@@ -45,101 +42,118 @@ def make_cli(
     pipeline: Any,
     *,
     run_fn: RunFn = run,
+    default_output: Path | str | None = None,
     mermaid_fn: MermaidFn | None = to_mermaid,
     plugins: Sequence[Any] | None = None,
+    source: Any = None,
 ) -> CliEntrypoint:
     """Create a CLI entrypoint callable for a pipeline declaration.
 
     Plugins are application-owned composition: the entry point that builds the
-    CLI passes explicit plugin instances, which are forwarded to every run.
-    A selective request (``--stage``/``--step``) that needs prior output fails
-    closed unless a checkpoint-capable plugin is configured here.
+    CLI passes explicit observer and run-guard instances, forwarded to the run.
     """
 
     parser = argparse.ArgumentParser(
         prog=pipeline.name,
-        description=f"Run pipeline '{pipeline.name}' or emit Mermaid graph.",
+        description=f"Run the '{pipeline.name}' pipeline.",
+    )
+    resolved_default = (
+        Path(default_output)
+        if default_output is not None
+        else Path("data") / pipeline.name / "output"
     )
     parser.add_argument(
-        "--run-root",
-        dest="run_root",
-        help="Output run root (local path or URL root). Defaults to data/output.",
+        "--output",
+        default=None,
+        metavar="PATH",
+        help=(f"Where generated output goes. Default: {resolved_default}. May be an fsspec URL."),
     )
-    parser.add_argument("--stage", dest="stage", help="Stage selector (name or 1-based index).")
-    parser.add_argument("--step", dest="step", help="Step selector (name or 1-based index).")
+    parser.add_argument(
+        "--state",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Recovery directory holding the pipeline's database. Reserved for "
+            "Caravel; it is what lets a job resume. Default: '.caravel' beside "
+            f"the output directory, or data/{pipeline.name}/.caravel when "
+            "output is remote."
+        ),
+    )
+    parser.add_argument(
+        "--job-id",
+        default=None,
+        help=(
+            "Identity this run resumes under. Supplying it makes the run durable: "
+            "committed steps are restored instead of recomputed."
+        ),
+    )
+    parser.add_argument(
+        "--commit-scope",
+        default="step",
+        choices=("pipeline", "stage", "step"),
+        help="When a durable run commits. Default: step.",
+    )
     parser.add_argument(
         "--param",
-        dest="params",
         action="append",
         default=[],
-        metavar="key=value",
-        help="Custom runtime parameter forwarded to step context; repeatable.",
+        metavar="KEY=VALUE",
+        help="Run-scoped parameter. Repeatable.",
     )
     parser.add_argument(
-        "--keep-source-tag",
-        dest="keep_source_tag",
+        "--graph",
         action="store_true",
-        help="Preserve __source__ field in persisted output payloads.",
-    )
-    parser.add_argument(
-        "--mermaid",
-        dest="mermaid",
-        help="Emit Mermaid diagram to output file path without executing pipeline.",
+        help="Print the pipeline as a Mermaid graph and exit without running.",
     )
 
-    def cli_entrypoint(argv: Sequence[str] | None = None) -> int:
-        args = parser.parse_args(list(argv) if argv is not None else None)
+    def entrypoint(argv: Sequence[str] | None = None) -> int:
+        args = parser.parse_args(argv)
 
-        has_execution_flags = any(
-            [
-                args.run_root is not None,
-                args.stage is not None,
-                args.step is not None,
-                bool(args.params),
-                bool(args.keep_source_tag),
-            ]
-        )
-
-        if args.mermaid is not None:
-            if has_execution_flags:
-                parser.error("--mermaid cannot be combined with execution options.")
+        if args.graph:
             if mermaid_fn is None:
-                parser.error("--mermaid requires an available Mermaid renderer.")
-
-            content = mermaid_fn(pipeline)
-            Path(args.mermaid).write_text(content, encoding="utf-8")
+                parser.error("Graph rendering is not available.")
+            print(mermaid_fn(pipeline))
             return 0
 
-        only_stage = _coerce_selector(args.stage)
-        only_step = _coerce_selector(args.step)
-        if args.run_root is None:
-            run_root: Path | str | None = None
-        elif is_url_path(args.run_root):
-            run_root = args.run_root
-        else:
-            run_root = Path(args.run_root)
-
         try:
-            params = _parse_params(args.params)
-        except ValueError as exc:
-            parser.error(str(exc))
+            params = _parse_params(args.param)
+        except ValueError as error:
+            parser.error(str(error))
 
-        try:
-            run_fn(
-                pipeline,
-                run_root=run_root,
-                only_stage=only_stage,
-                only_step=only_step,
-                params=params,
-                keep_source_tag=bool(args.keep_source_tag),
-                plugins=list(plugins) if plugins is not None else None,
+        output = args.output if args.output is not None else resolved_default
+        state = args.state
+        if state is None and "://" in str(output):
+            # Remote output cannot host the recovery database; fall back to a
+            # documented pipeline-scoped local directory.
+            state = Path("data") / pipeline.name / ".caravel"
+
+        if args.job_id:
+            pipeline.durability_options = DurabilityOptions(
+                schema_version="v1.0.0",
+                job_id=args.job_id,
+                commit_scope=args.commit_scope,
             )
-        except (ValueError, MissingPriorOutputError) as exc:
-            parser.error(str(exc))
 
+        try:
+            result = run_fn(
+                pipeline,
+                output=output,
+                state=state,
+                source=source if source is not None else pipeline.source,
+                params=params or None,
+                plugins=tuple(plugins) if plugins is not None else (),
+            )
+        except ValueError as error:
+            parser.error(str(error))
+
+        print(
+            f"pipeline={result.pipeline_name} job_id={result.job_id} "
+            f"executed={result.steps_executed} restored={result.steps_restored}"
+        )
+        print(f"output={result.output_root}")
         return 0
 
-    return cli_entrypoint
+    return entrypoint
 
 
 __all__ = ["make_cli"]

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from caravel import (
+    RunResult,
+    StepContext,
     PartitionedJSONDataset,
     PartitionedTextDataset,
     Pipeline,
     Stage,
+    Step,
     dataset_as_loader,
     run,
-    step,
 )
+
+from ..support import durable
 
 PIPELINE_NAME = "partitioned_example"
 
@@ -33,75 +37,99 @@ def _extract_between(value: str, start: str, end: str) -> str:
     return value[start_idx:end_idx]
 
 
-@step(output=PartitionedTextDataset(suffix=".html", encoding="utf-8"))
-def bronze_render_html(partitions: dict[str, dict[str, Any]], *, context: object) -> dict[str, str]:
-    """Render source JSON partitions into deterministic HTML partitions."""
-    _ = context
-    rendered: dict[str, str] = {}
+class SourceRecord(TypedDict):
+    """One record as the input partitions supply it."""
 
-    for key in sorted(partitions):
-        record = partitions[key]
+    id: str
+    lang: str
+    title: str
+    snippet: str
+
+
+class StructuredRecord(TypedDict):
+    """A bronze HTML partition parsed back into fields."""
+
+    id: str
+    lang: str
+    title: str
+    snippet: str
+    normalized_snippet: str
+    source_key: str
+
+
+class GoldRecord(TypedDict):
+    """A structured record keyed by language and id."""
+
+    id: str
+    lang: str
+    title: str
+    normalized_snippet: str
+    origin_partition: str
+
+
+SourceRecords = dict[str, SourceRecord]
+RenderedPartitions = dict[str, str]
+StructuredRecords = dict[str, StructuredRecord]
+GoldRecords = dict[str, GoldRecord]
+
+
+def bronze_render_html(value: SourceRecords, *, context: StepContext) -> RenderedPartitions:
+    """Render one source record into a deterministic HTML partition."""
+    rendered: RenderedPartitions = {}
+    for _key, record in value.items():
         item_id = str(record["id"])
-        lang = str(record["lang"])
-        title = str(record["title"])
-        snippet = str(record["snippet"])
-        rendered[key] = (
-            f"<article data-id='{item_id}' data-lang='{lang}'>"
-            f"<h1>{title}</h1>"
-            f"<p>{snippet}</p>"
+        if item_id in rendered:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        rendered[item_id] = (
+            f"<article data-id='{item_id}' data-lang='{record['lang']}'>"
+            f"<h1>{record['title']}</h1>"
+            f"<p>{record['snippet']}</p>"
             "</article>"
         )
-
     return rendered
 
 
-@step(output=PartitionedJSONDataset())
 def silver_extract_structured(
-    partitions: dict[str, str], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Convert bronze HTML partitions back into structured JSON records."""
-    _ = context
-    structured: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        html = partitions[key]
-        item_id = _extract_between(html, "data-id='", "'")
-        lang = _extract_between(html, "data-lang='", "'")
-        title = _extract_between(html, "<h1>", "</h1>")
+    value: RenderedPartitions, *, context: StepContext
+) -> StructuredRecords:
+    """Convert every bronze HTML partition back into a structured record."""
+    structured: StructuredRecords = {}
+    for key, html in sorted(value.items()):
+        if key in structured:
+            raise ValueError(f"Duplicate record key: {key}")
         snippet = _extract_between(html, "<p>", "</p>")
-
-        structured[key] = {
-            "id": item_id,
-            "lang": lang,
-            "title": title,
-            "snippet": snippet,
-            "normalized_snippet": snippet.lower(),
-            "source_key": key,
-        }
-
+        structured[key] = StructuredRecord(
+            id=_extract_between(html, "data-id='", "'"),
+            lang=_extract_between(html, "data-lang='", "'"),
+            title=_extract_between(html, "<h1>", "</h1>"),
+            snippet=snippet,
+            normalized_snippet=snippet.lower(),
+            source_key=key,
+        )
     return structured
 
 
-@step(output=PartitionedJSONDataset())
-def gold_partition_by_language(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Emit path-style keys (`<lang>/<id>`) to prove nested partition output paths."""
-    _ = context
-    repartitioned: dict[str, dict[str, Any]] = {}
+def gold_partition_by_language(value: StructuredRecords, *, context: StepContext) -> GoldRecords:
+    """Emit path-style keys (`<lang>/<id>`) to prove nested storage keys.
 
-    for key in sorted(partitions):
-        record = partitions[key]
+    These are *storage* partition keys inside one payload. They occupy a
+    different namespace from execution partition identity, which the engine
+    keeps stable across steps.
+    """
+    repartitioned: GoldRecords = {}
+    for key, record in sorted(value.items()):
         lang = str(record["lang"])
         item_id = str(record["id"])
-        repartitioned[f"{lang}/{item_id}"] = {
-            "id": item_id,
-            "lang": lang,
-            "title": record["title"],
-            "normalized_snippet": record["normalized_snippet"],
-            "origin_partition": key,
-        }
-
+        output_key = f"{lang}/{item_id}"
+        if output_key in repartitioned:
+            raise ValueError(f"Duplicate record key: {output_key}")
+        repartitioned[output_key] = GoldRecord(
+            id=item_id,
+            lang=lang,
+            title=record["title"],
+            normalized_snippet=record["normalized_snippet"],
+            origin_partition=key,
+        )
     return repartitioned
 
 
@@ -109,27 +137,40 @@ def build_partitioned_pipeline(input_dir: Path | str | None = None) -> Pipeline:
     """Build the partitioned pipeline declaration."""
     seed_dir = Path(input_dir) if input_dir is not None else _DEFAULT_INPUT_DIR
 
-    loader = dataset_as_loader(PartitionedJSONDataset(name="partitioned_seed", path=seed_dir))
-
     return Pipeline(
         name=PIPELINE_NAME,
-        loader=loader,
+        source=dataset_as_loader(PartitionedJSONDataset(name="partitioned_seed", path=seed_dir)),
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[bronze_render_html]),
-            Stage(name=SILVER_STAGE_NAME, entries=[silver_extract_structured]),
-            Stage(name=GOLD_STAGE_NAME, entries=[gold_partition_by_language]),
+            Stage(
+                name=BRONZE_STAGE_NAME,
+                entries=[
+                    Step(
+                        bronze_render_html,
+                        output=PartitionedTextDataset(suffix=".html", encoding="utf-8"),
+                    )
+                ],
+            ),
+            Stage(
+                name=SILVER_STAGE_NAME,
+                entries=[Step(silver_extract_structured, output=PartitionedJSONDataset())],
+            ),
+            Stage(
+                name=GOLD_STAGE_NAME,
+                entries=[Step(gold_partition_by_language, output=PartitionedJSONDataset())],
+            ),
         ],
     )
 
 
 def run_partitioned_pipeline(
     *,
-    run_root: Path | str | None = None,
+    state_root: Path | str,
+    job_id: str = "partitioned-1",
     input_dir: Path | str | None = None,
-) -> Path | str:
-    """Run the partitioned example pipeline and return resolved run root."""
+) -> RunResult:
+    """Run the partitioned example and return its structured status."""
     pipeline = build_partitioned_pipeline(input_dir=input_dir)
-    return run(pipeline, run_root=run_root)
+    return run(durable(pipeline, job_id), output=Path(state_root) / "output")
 
 
 __all__ = [

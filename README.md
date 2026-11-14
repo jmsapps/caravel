@@ -67,341 +67,318 @@ python3 -m mypy src/caravel
 
 ## Core Declaration Pattern
 
-```python
-from pathlib import Path
+A pipeline is a name and ordered stages. A step's function is **ordinary
+processing code**: it receives the complete value the previous step produced
+and the runtime context, and returns its own complete result.
 
-from caravel import (
-    Branch,
-    MultiSourceLoader,
-    PartitionedJSONDataset,
-    PartitionedTextDataset,
-    Pipeline,
-    Stage,
-    step,
+```python
+from caravel import DurabilityOptions, InMemorySource, Pipeline, Stage, Step, run
+
+def load(value, *, context):
+    return {key: {**record, "loaded": True} for key, record in value.items()}
+
+def enrich(value, *, context):
+    return {key: {**record, "enriched": True} for key, record in value.items()}
+
+def summarize(value, *, context):
+    return {"documents": len(value)}
+
+pipeline = Pipeline(
+    name="documents",
+    stages=[
+        Stage(name="prepare", entries=[Step(load), Step(enrich)]),
+        Stage(name="summary", entries=[Step(summarize)]),
+    ],
+    source=InMemorySource({"doc-1": {...}, "doc-2": {...}}),
+    durability_options=DurabilityOptions(
+        schema_version="v1.0.0", job_id="snapshot-2026-11-12", commit_scope="step"
+    ),
 )
 
-
-@step(output=PartitionedJSONDataset())
-def silver_transform(records: dict[str, dict], *, context):
-    return records
-
-
-def build_pipeline() -> Pipeline:
-    loader = MultiSourceLoader(
-        [
-            PartitionedJSONDataset(name="json_source", path=Path("fixtures/json")),
-            PartitionedTextDataset(
-                name="html_source",
-                path=Path("fixtures/html"),
-                suffix=".html",
-            ),
-        ]
-    )
-
-    branch = Branch(
-        name="route_by_source",
-        by="source",
-        routes={
-            "json_source": [],
-            "html_source": [],
-        },
-    )
-
-    return Pipeline(
-        name="example_pipeline",
-        loader=loader,
-        stages=[
-            Stage(name="bronze", entries=[branch]),
-            Stage(name="silver", entries=[silver_transform]),
-        ],
-    )
+result = run(pipeline, output="data/documents/output")
 ```
 
-## Add A New Step
+`Step(load)` is complete: its output defaults to a JSON dataset named for the
+processor. No loader stub and no dataset are required.
 
-1. Define a function that accepts the prior step payload as the first positional
-   argument and `context` as a keyword-only argument.
-2. Attach output and persistence policy with `@step(output=<Dataset>, persist=<bool>)`.
-   `persist` defaults to `True`.
-3. Add the function to the target `Stage(entries=[...])` in declaration order.
-4. Add or update pytest coverage for the happy path and at least one edge path.
+### One execution model
 
-### Persistence Policy
+There is one engine, reached through `run()`. Steps run in declaration order,
+each over the complete value its predecessor returned. Iteration, batching,
+parallel calls, and API limits inside a step are ordinary code you write.
 
-- `persist=True` (default): Caravel writes the step output to the step folder.
-- `persist=False`: Caravel keeps the step output in memory for downstream steps in
-  the same run and does not write step files.
+Nothing about a processor's signature, name, annotations, or return value
+selects an execution mode. The declaration decides what runs and in what order,
+before any processor is called.
 
-Example with five steps where only the final step writes checkpoint files:
+### One value per step
+
+A processor is called `fn(value, context=...)`. The first step receives what the
+source loaded; every later step receives what the step before it returned.
+A dataset decides how that value is written and read back, so a partitioned
+dataset's value is a complete keyed mapping.
+
+### Durability is a declaration
+
+`durability_options` on the `Pipeline` is what makes a run durable.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | The storage format this declaration was written against. `"v1.0.0"`. |
+| `job_id` | The identity this run resumes under. You supply it; Caravel never derives one. |
+| `commit_scope` | When transactions commit: `"pipeline"` (default), `"stage"`, or `"step"`. |
+
+Supplying the options adds the recovery database, executor ownership,
+snapshots, status rows, and transactions. Omitting them runs the same
+processors with the same retry controls, in memory.
 
 ```python
-@step(output=JSONDataset(), persist=False)
-def step_1(payload, *, context): ...
-
-@step(output=JSONDataset(), persist=False)
-def step_2(payload, *, context): ...
-
-@step(output=JSONDataset(), persist=False)
-def step_3(payload, *, context): ...
-
-@step(output=JSONDataset(), persist=False)
-def step_4(payload, *, context): ...
-
-@step(output=JSONDataset(), persist=True)
-def step_5(payload, *, context): ...
+Pipeline(..., durability_options=DurabilityOptions(
+    schema_version="v1.0.0", job_id="snapshot-1", commit_scope="step"
+))
 ```
 
-## Dataset Quick Reference
+Reopening a job restores every committed step and runs only what is left. A new
+job id starts fresh, and one pipeline database holds many job ids
+independently.
 
-| Dataset                   | Typical payload                | Writes                                 |
-| ------------------------- | ------------------------------ | -------------------------------------- |
-| `JSONDataset`             | Any JSON-serializable object   | Single JSON file in step folder        |
-| `PartitionedJSONDataset`  | `dict[str, JSON-serializable]` | One JSON file per partition key        |
-| `TextDataset`             | `str`                          | Single text file (configurable suffix) |
-| `PartitionedTextDataset`  | `dict[str, str]`               | One text file per partition key        |
-| `BytesDataset`            | `bytes`                        | Single binary file                     |
-| `PartitionedBytesDataset` | `dict[str, bytes]`             | One binary file per partition key      |
+[`examples/durable_partitions`](examples/durable_partitions/README.md) is a
+runnable demo: it sleeps and logs per step, takes `--fail-at` to interrupt a
+run, and shows committed steps being restored on the next one.
 
-Partitioned datasets reject empty mappings by default. Set `allow_empty=True`
-when an empty result is valid:
+### Reading output
+
+`run()` returns a result describing what the invocation did and where each step
+wrote:
 
 ```python
-output = PartitionedJSONDataset(name="optional_records", allow_empty=True)
+result = run(pipeline, output="data/documents/output")
+
+result.pipeline_name    # "documents"
+result.job_id           # "snapshot-2026-11-12", or None without durability options
+result.output_root      # where generated output goes
+result.steps_executed   # steps whose processors ran
+result.steps_restored   # steps restored from committed snapshots
+result.outputs          # {step name: the directory its dataset wrote}
+
+JSONDataset().load_from(result.outputs["summarize"])
 ```
 
-Dataset output directories are data-only; Caravel writes no sentinel or
-control files next to your data. An allowed empty output is simply an empty
-step directory, and on object stores without durable empty directories it
-leaves no loadable artifact — durable empty-output evidence is a
-checkpoint-plugin concern. With the default `allow_empty=False`, saving `{}`
-raises `EmptyOutputError` at the producing step before any prior output is
-touched.
+Generated output is written through the declared dataset, under a directory per
+stage and step. The recovery database lives in `.caravel` beside the output
+root:
 
-Partition keys may use path-style nesting like `en/record_001`; partitioned
-datasets resolve those keys into nested output directories.
+```text
+data/documents/
+├── .caravel/             reserved execution storage — do not write here
+│   ├── state.sqlite3     runs, stages, steps, and their snapshots
+│   └── owner.sqlite3     executor ownership
+└── output/
+    ├── _001_prepare/_001_load/load.json
+    ├── _001_prepare/_002_enrich/enrich.json
+    └── _002_summary/_001_summarize/summarize.json
+```
 
-Dataset `path` values can be local paths or `fsspec` URLs such as:
+`.caravel/` is **reserved execution storage** required for recovery: deleting it
+loses the ability to resume a job, and nothing but Caravel may write there. It
+must be a local filesystem path. Configurations where it would sit inside the
+output directory, or vice versa, are rejected, so writing output can never
+destroy authoritative state.
+
+SQLite is the recovery authority. Deleting generated output costs nothing:
+reopening the job regenerates it from committed snapshots without rerunning a
+processor.
+
+```python
+run(pipeline, output="exports/output")                              # state beside it
+run(pipeline, output="exports/output", state="/persistent/.caravel")  # explicit
+run(pipeline, output="s3://bucket/output", state="data/docs/.caravel")  # remote output
+```
+
+Remote output cannot host the recovery database, so pass `state` explicitly for
+it; the CLI falls back to `data/<pipeline-name>/.caravel`.
+
 
 - `./examples/fsspec/data/input_partitions.json`
 - `abfs://caravel/input/input_partitions.json`
 - `gs://my-bucket/prefix/input_partitions.json`
 - `s3://my-bucket/prefix/input_partitions.json`
 
-## Multi-Source And Branch Pattern
-
-- Use `MultiSourceLoader([...])` to combine named source datasets.
-- Loader composition tags dict records with `__source__`.
-- Route source-specific normalization with `Branch(by="source", routes={...})`.
-- A step declared after the branch in the same stage receives the merged
-  branch output.
-
-## Output Folder Layout
-
-`run_root` is required for execution. The caller chooses the run root path
-or URL (for example a local directory, `abfs://...`, `gs://...`, or `s3://...`).
-
-Inside a run root, outputs are stage/step-scoped:
-
-```text
-_<stage_index>_<stage_name>/_<step_index>_<step_name>/...
-```
-
-Example:
-
-```text
-_001_bronze/_001_branch_by_source/...
-_001_bronze/_002_bronze_converged_records/...
-_002_silver/_001_silver_unify_records/...
-_003_gold/_001_gold_partition_by_language/en/*.json
-```
-
 ## Plugins
 
-Plugins are runner capabilities, not CLI-only extensions. Applications can
-pass explicit ordered plugin instances directly to `run()`:
+Two capabilities, because only these extend behaviour the engine does not
+already own.
+
+- **Observers** receive lifecycle events after committed transitions
+  (`run_started`, `node_started`, `node_completed`, `run_completed`,
+  `run_failed`). Each declares `criticality` as `"required"` or
+  `"best_effort"`; a required failure fails the run, a best-effort one does
+  not. An observer reports what committed; it never changes it.
+- **Run guards** wrap one invocation in an external precondition. They enter in
+  plugin order and exit in reverse, and teardown is attempted for every guard
+  whose startup completed.
 
 ```python
-from caravel.runner import run
-
-run(pipeline, run_root="data/output", plugins=[observer, checkpoint_policy])
+run(pipeline, output="data/documents/output", plugins=[MyObserver()])
 ```
 
-An application CLI forwards the same instances:
+The recovery database owns progress, committed output, and executor ownership,
+so evidence is what a plugin contributes.
+
+
+## Multi-Source Input And Branches
+
+`MultiSourceLoader` tags each record with `__source__` and is accepted directly
+as a `source`. Tags are stripped before output is written by default; pass
+`keep_source_tag=True` to retain them.
+
+### Branches
+
+A `Branch` routes the value it receives to one of several step chains, then
+merges. Every declared route contributes its steps to the declared structure;
+the chosen route runs, and the other routes' steps are recorded as `skipped`,
+so a stage containing a branch still completes.
+
+Routing happens **at the branch**, so a predicate may read values earlier steps
+produced. The decision is committed with the branch step, which means the
+predicate is consulted exactly once per job: reopening a job reuses the route it
+already chose, and a flapping or externally-dependent predicate cannot re-route
+after a crash.
+
+`by="source"` routes on the source tag the incoming value carries, either a
+tagged record or a mapping of records that share one tag. A callable predicate
+receives the complete value and returns a declared route key.
+
+## Supported Envelope
+
+| Component | Supported | Not supported |
+| --- | --- | --- |
+| Recovery database | SQLite on a local filesystem that survives invocations. | Network filesystems, ephemeral disk, multi-host metadata. |
+| Executors | One executor per recovery database, with sequential step execution. Parallel calls inside a step are your code. | Concurrent executors on one database; multi-host workers. |
+| Generated output | Any fsspec target, including object storage. | — |
+| Branches | One route per run, with the other routes' steps recorded as skipped. | Nested branches. |
+| Recovery granularity | The step. A failure inside a step repeats that step's uncommitted work. | Record- or operation-level recovery. |
+| Remote output | Implemented and locally qualified against an fsspec non-local store. | **Not cloud-credential verified.** |
+
+
+## Retries
+
+One `RetryOptions` type and one `retry_operation` utility cover every boundary:
+a stage, a step, a managed helper, or a single operation. The same instance is
+accepted as `retry=` at every one, and nested boundaries acquire **no** options
+automatically, because nested attempts multiply.
 
 ```python
-from caravel.cli import make_cli
+from caravel import RetryOptions, Stage, Step, retry_operation
 
-cli = make_cli(pipeline, plugins=[observer, checkpoint_policy])
+default_retry = RetryOptions()      # 4 total attempts, capped exponential backoff
+
+def retryable(error):
+    return default_retry.should_retry_error(error) or (
+        isinstance(error, VendorError) and error.code == "TEMPORARILY_BUSY"
+    )
+
+vendor_retry = RetryOptions(should_retry_error=retryable)
+
+# The same instance at every supported boundary.
+Stage(name="prepare", retry=vendor_retry, entries=[
+    Step(fn=enrich, output=dataset, retry=vendor_retry),
+])
+
+# ...or just one operation inside the processor. Only that call repeats.
+def enrich(value, *, context):
+    results = []
+    for record in value.values():
+        enriched, attempts = retry_operation(
+            operation=lambda record=record: call_vendor(record), retry=vendor_retry
+        )
+        results.append(enriched)
+    return results
 ```
 
-Plugins may implement observer, run-guard, or checkpoint-policy capabilities.
-Any stateful plugin owns and requires its metadata store/root configuration;
-Caravel does not choose a metadata location or derive one from `run_root`.
+An ordinary loop iteration acquires no retry of its own. Recovery granularity is
+the step, so a failed step repeats its uncommitted work and successful
+iterations inside it run again.
 
-### CheckpointPlugin
+`retry_operation` is callable anywhere: inside a processor to retry a smaller
+scope, or in ordinary application code. Only the operation it is given
+repeats.
 
-`CheckpointPlugin` is the first-party checkpoint capability. It writes one
-schema-versioned record per persisted plan node after each successful save and
-verifies records against the declaration and the physical output before
-blessing a skipped node's output for reuse:
+| Setting | Default |
+| --- | --- |
+| `should_retry_error` | Recognized transient failures: connection failures, timeouts, rate limits, temporary service failures. |
+| `should_retry_result` | Off. A successful return is accepted unless you pass a predicate. |
+| `max_attempts` | 4, counting the initial call. `1` permits the initial call without retry; `retry=None` disables the boundary. |
+| `delay_seconds` | `compute_retry_delay`: `min(2^(n-1), 16)` seconds plus up to one second of jitter, so at most 17s. |
 
-```python
-from caravel.plugins import CheckpointPlugin
+Invalid input, authentication failures, programming errors, and cancellation are
+never retried, and arbitrary exception text is never classified as transient.
+`KeyboardInterrupt`, `SystemExit`, and other `BaseException` control signals
+propagate without retry.
 
-plugin = CheckpointPlugin(metadata_root="data/metadata/checkpoints")
-run(pipeline, run_root="data/output", plugins=[plugin])
-run(pipeline, run_root="data/output", only_stage="silver", plugins=[plugin])
-```
+## Executor ownership
 
-`metadata_root` is required and explicit; configure it outside any output tree
-that a run may replace or clean. Records contain identifiers, partition keys,
-and counts only — never credentials, storage options, payloads, or parameter
-values. A committed empty partitioned output is represented by a count-zero
-record, so it stays reusable on storage without durable empty directories.
-Removing the plugin leaves records inert: bare core ignores them and rejects
-checkpoint-dependent selective requests at binding.
+One executor runs a recovery database at a time, with sequential step
+execution. Ownership is a transaction held open on `owner.sqlite3` beside the
+database for the executor's lifetime, so the operating system answers the
+liveness question: the lock lasts exactly as long as the process holding it,
+and a crash releases it.
 
-### OwnershipPlugin
+A second executor on the same database is refused immediately, naming the
+database. Two job ids of the same pipeline therefore do not execute
+concurrently. Parallel calls inside a step are ordinary code you write.
 
-`OwnershipPlugin` removes stale cross-run output — directories left behind by
-renamed or removed stages, steps, routes, and route steps — using durable
-recorded ownership, never filename conventions:
 
-```python
-from caravel.plugins import CheckpointPlugin, OwnershipPlugin
+## Guarantees
 
-plugins = [
-    CheckpointPlugin(metadata_root="data/metadata/checkpoints"),
-    OwnershipPlugin(metadata_root="data/metadata/ownership"),
-]
-run(pipeline, run_root="data/output", plugins=plugins)
-```
+- A step's snapshot and its completion status become durable together, so a
+  completed step always has a readable result.
+- Every successful boundary writes its state under every commit scope;
+  `commit_scope` selects only when transactions commit.
+- A step retry runs in memory and writes a snapshot when its output is
+  accepted. Each attempt receives the original input, isolated from a previous
+  attempt's mutations.
+- A stage retry restarts the stage, restoring committed steps and rerunning
+  discarded work.
+- Reopening a job restores its committed steps and regenerates output deleted
+  from disk.
+- Recovery matches declared stage and step identity and order. Nothing hashes
+  processor code, and input data is never inspected.
+- Retries do not provide exactly-once external effects. SQLite governs stored
+  state; an external effect is the processor's own concern.
 
-Each full run records the bound plan's managed persisted output directories
-as a versioned inventory under the plugin's required `metadata_root`. A later
-full run deletes exactly the directories a prior valid inventory recorded but
-the current plan no longer declares; every candidate must stay inside the
-managed pipeline root. Without a prior valid inventory nothing is deleted.
-`stage_root` trees are user-owned and never pruned, selective runs neither
-prune nor replace the inventory, and interrupted reconciliation converges on
-rerun. In the reference production profile, compose it with
-`CheckpointPlugin` so evidence pointing at pruned output can never authorize
-reuse.
-
-### RunEvidencePlugin
-
-`RunEvidencePlugin` makes runs diagnosable from durable artifacts. It records
-one immutable event object per committed lifecycle transition (run/node
-start, success, failure, skip) under its required `metadata_root`, emits
-structured logs from the same vocabulary, and derives a regenerable summary
-exclusively from the recorded events:
-
-```python
-from caravel.plugins import RunEvidencePlugin
-
-plugin = RunEvidencePlugin(metadata_root="data/metadata/evidence")
-run(pipeline, run_root="data/output", plugins=[plugin])
-summary = plugin.regenerate_summary(run_id)
-```
-
-Events carry identifiers, node facts, and exception class names only — never
-payloads, credentials, storage options, environment values, or parameter
-values. With the default `criticality="required"`, an evidence write failure
-fails the run as a distinct operational failure without invalidating already
-committed checkpoints; `criticality="best_effort"` surfaces failures in
-`RunResult.best_effort_errors` without changing execution. Summary corruption
-never affects recovery: nothing reads a summary to make an execution
-decision, and it can always be regenerated from events. Removing the plugin
-removes history, not execution behavior.
-
-### LeasePlugin
-
-`LeasePlugin` provides advisory writer-conflict evidence and abandoned-run
-diagnostics. It is **not a distributed lock**: generic fsspec storage has no
-portable atomic create-if-absent, so two racing writers can both acquire. The
-external scheduler or container owns the authoritative contract: one writer
-per pipeline run root, run-level retries, and hard timeout with process
-termination.
-
-```python
-from caravel.plugins import LeasePlugin
-
-plugin = LeasePlugin(
-    metadata_root="data/metadata/leases",
-    heartbeat_interval=10.0,
-    stale_threshold=60.0,
-)
-run(pipeline, run_root="data/output", plugins=[plugin])
-```
-
-At startup the plugin refuses an apparently live foreign lease before any
-user code runs; a lease whose heartbeat is older than `stale_threshold` is
-recovered, leaving a durable recovery record that names the abandoned run ID
-(diagnosable against `RunEvidencePlugin` history when that plugin is also
-configured). A plugin-owned daemon thread refreshes the heartbeat and never
-executes user code; a mid-run heartbeat failure surfaces at teardown as a
-distinct operational failure without changing run output. Normal shutdown
-releases the lease and leaves no worker thread behind. If the whole process
-is killed, the lease remains with an aging heartbeat, which the next
-invocation classifies as stale.
 
 ## CLI Usage
 
-Each example entry point wires `make_cli(pipeline)`, so supported options are
-consistent:
+`make_cli(pipeline)` builds an entry point for one pipeline.
 
-- `--run-root <path>`
-- `--stage <name|index>`
-- `--step <name|index>`
-- `--param key=value` (repeatable)
-- `--keep-source-tag`
-- `--mermaid <out_path>`
+```python
+from caravel import make_cli
+from .pipeline import build_pipeline
 
-`--run-root` is optional. If omitted, Caravel writes under
-`data/output/<pipeline_name>/...`.
-When provided, `--run-root` accepts local paths and `fsspec` URL roots.
-
-Selective execution (`--stage`, `--step`) runs only slices that need no prior
-output: the first stage, or step 1 of the first stage. Any selection that
-would have to load output from a step it does not execute fails closed before
-running user code, because bare Caravel has no checkpoint evidence to trust
-existing files. Applications may provide a checkpoint capability when
-selective execution must load committed output from skipped nodes.
-
-Run an example from the repo root:
-
-```bash
-python3 -m examples.minimal
+cli = make_cli(build_pipeline())
+raise SystemExit(cli())
 ```
 
-Explicit root override:
+| Flag | Meaning |
+| --- | --- |
+| `--output PATH` | Where generated output goes. `make_cli(..., default_output=...)` sets the default; the examples put theirs in `examples/<name>/data/output`. May be an fsspec URL. |
+| `--state PATH` | The recovery directory. Defaults to `.caravel` beside the output root. |
+| `--job-id ID` | The identity this run resumes under. Supplying it makes the run durable. |
+| `--commit-scope SCOPE` | `pipeline`, `stage`, or `step`. Default `step`. |
+| `--param KEY=VALUE` | A run-scoped parameter, repeatable. Reaches `context.params`. |
+| `--graph` | Print the pipeline as a Mermaid graph and exit without running. |
 
-```bash
-python3 -m examples.minimal --run-root data/minimal_example/smoke_run
+```console
+$ python -m examples.minimal --job-id run-1
+pipeline=minimal_example job_id=run-1 executed=2 restored=0
+output=examples/minimal/data/output
+
+$ python -m examples.minimal --job-id run-1
+pipeline=minimal_example job_id=run-1 executed=0 restored=2
+output=examples/minimal/data/output
 ```
 
-Fsspec-backed input example:
-
-```bash
-CARAVEL_INPUT_URL=./examples/fsspec/data/input_partitions.json \
-python3 -m examples.fsspec_minimal --run-root data/fsspec_example/smoke_run
-```
-
-Remote run-root example:
-
-```bash
-CARAVEL_INPUT_URL=abfs://caravel/input/input_partitions.json \
-python3 -m examples.fsspec_minimal --run-root abfs://caravel/output/smoke_run
-```
-
-`--mermaid` is diagram-only mode and is mutually exclusive with execution flags:
-
-```bash
-python3 -m examples.minimal --mermaid test_out.mmd
-```
-
-The generated content starts with `flowchart TD` and is deterministic for a
-fixed pipeline declaration.
 
 ## Production Status And Support Statement
 

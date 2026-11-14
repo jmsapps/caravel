@@ -9,6 +9,10 @@ resources:
 - `index/` represents an index that is deleted and recreated in place;
 - backup directories make the compensating actions visible.
 
+Processors iterate input handles and return document-keyed mappings. The simulated
+index and version metadata also retain document keys, so processing multiple
+documents in an all-input call preserves each document's result and chunks.
+
 The steps stage chunks, replace the simulated index, promote staging to current,
 and commit version metadata. By default the final step fails and the run guard
 restores the prior `current/`, index, and version:
@@ -23,7 +27,7 @@ Run the commit path with:
 python -m examples.rag_ingestion_saga --succeed
 ```
 
-Inspect `data/output/rag_ingestion_saga/external_workspace`. Pipeline step
+Inspect `examples/rag_ingestion_saga/data/external_workspace`. Pipeline step
 outputs remain under the adjacent `pipeline/` directory as execution history.
 
 This is a saga, not an ACID transaction. The local index backup demonstrates a

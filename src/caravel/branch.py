@@ -32,11 +32,7 @@ class Branch:
 
     def _route_key_for(self, partition_key: str, record: Any) -> str:
         if self.by == "source":
-            if not isinstance(record, dict) or SOURCE_FIELD not in record:
-                raise MissingSourceTagError(
-                    f"Branch '{self.name}' missing '{SOURCE_FIELD}' for partition '{partition_key}'."
-                )
-            route_key = record[SOURCE_FIELD]
+            route_key = self._shared_source(record)
         elif callable(self.by):
             route_key = self.by(record)
         else:
@@ -54,6 +50,48 @@ class Branch:
             raise KeyError(f"Branch '{self.name}' has no route for key '{route_key}'.")
 
         return route_key
+
+    def _shared_source(self, value: Any) -> str:
+        """The source tag the incoming value carries.
+
+        A branch receives the complete value its upstream step produced, so
+        ``by="source"`` routes on the source that value came from: either a
+        tagged record, or a mapping of records that share one tag.
+        """
+        if isinstance(value, dict) and SOURCE_FIELD in value:
+            tag = value[SOURCE_FIELD]
+            if isinstance(tag, str):
+                return tag
+
+        if isinstance(value, dict):
+            tags = {
+                item[SOURCE_FIELD]
+                for item in value.values()
+                if isinstance(item, dict) and SOURCE_FIELD in item
+            }
+            if len(tags) == 1:
+                return str(next(iter(tags)))
+            if len(tags) > 1:
+                raise MissingSourceTagError(
+                    f"Branch '{self.name}' received records from "
+                    f"{', '.join(sorted(str(tag) for tag in tags))}. A branch chooses "
+                    "one route for the value it receives, so route a value whose "
+                    "records share a source."
+                )
+
+        raise MissingSourceTagError(
+            f"Branch '{self.name}' received a value carrying no '{SOURCE_FIELD}'. "
+            "Tag records with their source, or declare a callable predicate."
+        )
+
+    def route_key_for(self, partition_key: str, record: Any) -> str:
+        """Decide one partition's route.
+
+        Durable execution calls this at the branch boundary and commits the
+        result, so the predicate is consulted exactly once per partition even
+        across restarts.
+        """
+        return self._route_key_for(partition_key, record)
 
     def route_partitions(self, partitions: Partitions) -> dict[str, Partitions]:
         grouped: dict[str, Partitions] = {route_key: {} for route_key in self.routes}

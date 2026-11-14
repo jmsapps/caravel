@@ -41,3 +41,11 @@ index.html
 # Local agent instructions and task plans; intentionally untracked.
 AGENTS.md
 .skills/
+
+# Example runs keep their generated output and recovery database beside the
+# example, never in the repository root.
+examples/*/data/output/
+examples/*/data/.caravel/
+examples/*/data/external_workspace/
+examples/*/data/external_state.json
+examples/*/data/compensation_journal.json

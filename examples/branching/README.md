@@ -86,18 +86,18 @@ After running, outputs are written under your `--run-root`.
 
 Route lineage files:
 
-- `data/branching_example/smoke_run/_001_bronze/_001_branch_by_source/json_source/bronze_normalize_json_source/json-alpha.json`
-- `data/branching_example/smoke_run/_001_bronze/_001_branch_by_source/html_source/bronze_normalize_html_source/html-alpha.json`
+- `.../001-bronze/001-bronze_normalize_json_source/json_alpha/json-alpha.json`
+- `.../001-bronze/001-bronze_normalize_html_source/html_alpha/html-alpha.json`
 
 Converged bronze output:
 
-- `data/branching_example/smoke_run/_001_bronze/_002_bronze_converged_records/`
+- `.../001-bronze/002-bronze_converged_records/`
 
 Downstream outputs:
 
-- `data/branching_example/smoke_run/_002_silver/_001_silver_unify_records/`
-- `data/branching_example/smoke_run/_003_gold/_001_gold_partition_by_language/en/`
-- `data/branching_example/smoke_run/_003_gold/_001_gold_partition_by_language/fr/`
+- `.../002-silver/001-silver_unify_records/`
+- `.../003-gold/001-gold_partition_by_language/<partition>/en/`
+- `.../003-gold/001-gold_partition_by_language/<partition>/fr/`
 
 ## Smoke Test Flow
 

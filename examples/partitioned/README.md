@@ -83,14 +83,17 @@ After running, outputs are written under your `--run-root`.
 - Bronze output folder:
   `data/partitioned_example/smoke_run/_001_bronze/_001_bronze_render_html/`
 - Silver output folder:
-  `data/partitioned_example/smoke_run/_002_silver/_001_silver_extract_structured/`
+  `data/partitioned_example/output/partitioned_example/<job-id>/002-silver/001-silver_extract_structured/`
 - Gold output folder:
-  `data/partitioned_example/smoke_run/_003_gold/_001_gold_partition_by_language/`
+  `data/partitioned_example/output/partitioned_example/<job-id>/003-gold/001-gold_partition_by_language/`
 
 Example nested gold files:
 
-- `data/partitioned_example/smoke_run/_003_gold/_001_gold_partition_by_language/en/alpha.json`
-- `data/partitioned_example/smoke_run/_003_gold/_001_gold_partition_by_language/fr/beta.json`
+- `.../003-gold/001-gold_partition_by_language/alpha/en/alpha.json`
+- `.../003-gold/001-gold_partition_by_language/beta/fr/beta.json`
+
+Each file sits under its own partition directory; the `en/` and `fr/` segments
+are the keys the callback returned, kept inside that partition's output.
 
 ## Smoke Test Flow
 
