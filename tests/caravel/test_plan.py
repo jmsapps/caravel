@@ -5,7 +5,7 @@ import pytest
 
 from caravel import Branch
 from caravel.datasets import JSONDataset, PartitionedJSONDataset
-from caravel.pipeline import Pipeline, Stage, Step, step
+from caravel.pipeline import Pipeline, Stage, Step
 from caravel.plan import LogicalPlan, SEED_INPUT, compile_pipeline
 
 repo_root = Path(__file__).resolve().parents[2]
@@ -24,51 +24,64 @@ class _StubLoader:
 
 
 def _linear_pipeline(name: str = "linear_demo") -> Pipeline:
-    @step(output=PartitionedJSONDataset(name="normalized"), persist=False)
-    def normalize(
-        partitions: dict[str, dict[str, object]], *, context: object
-    ) -> dict[str, dict[str, object]]:
+    def normalize(inputs, *, context: object) -> dict[str, dict[str, object]]:
+        [partition] = inputs.partitions()
+        partitions: dict[str, dict[str, object]] = partition.load()
         _ = context
         return partitions
 
-    @step(output=JSONDataset(name="summary"))
-    def summarize(
-        partitions: dict[str, dict[str, object]], *, context: object
-    ) -> dict[str, object]:
+    def summarize(inputs, *, context: object) -> dict[str, object]:
+        [partition] = inputs.partitions()
+        partitions: dict[str, dict[str, object]] = partition.load()
         _ = context
         return {"count": len(partitions)}
 
     return Pipeline(
         name=name,
-        loader=_StubLoader(),
-        stages=[Stage(name="bronze", entries=[normalize, summarize])],
+        stages=[
+            Stage(
+                name="bronze",
+                entries=[
+                    Step(normalize, output=PartitionedJSONDataset(name="normalized")),
+                    Step(summarize, output=JSONDataset(name="summary")),
+                ],
+            )
+        ],
     )
 
 
 def _branching_pipeline() -> Pipeline:
-    @step(output=PartitionedJSONDataset(name="parsed"), persist=False)
-    def parse(partitions: object, *, context: object) -> object:
+    def parse(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
-    @step(output=PartitionedJSONDataset(name="normalized_json"))
-    def normalize(partitions: object, *, context: object) -> object:
+    def normalize(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
-    @step(output=PartitionedJSONDataset(name="decoded"))
-    def decode(partitions: object, *, context: object) -> object:
+    def decode(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
     branch = Branch(
         name="by_source",
         by="source",
-        routes={"json": [parse, normalize], "text": [decode]},
+        routes={
+            "json": [
+                Step(parse, output=PartitionedJSONDataset(name="parsed")),
+                Step(normalize, output=PartitionedJSONDataset(name="normalized_json")),
+            ],
+            "text": [Step(decode, output=PartitionedJSONDataset(name="decoded"))],
+        },
     )
     return Pipeline(
         name="branch_demo",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -83,13 +96,11 @@ def test_linear_pipeline_compiles_to_expected_nodes() -> None:
     assert first.node_id == "stage-001-entry-001"
     assert first.name == "normalize"
     assert first.input_ref == SEED_INPUT
-    assert first.persist is False
     assert first.dataset_type == "PartitionedJSONDataset"
     assert first.dataset_name == "normalized"
 
     assert second.node_id == "stage-001-entry-002"
     assert second.input_ref == "node:stage-001-entry-001"
-    assert second.persist is True
     assert second.dataset_type == "JSONDataset"
 
 
@@ -145,13 +156,15 @@ def test_node_ids_are_index_based_and_survive_renames() -> None:
 
 
 def test_repeated_route_step_names_across_routes_get_distinct_node_ids() -> None:
-    @step(output=PartitionedJSONDataset(name="left"))
-    def normalize(partitions: object, *, context: object) -> object:
+    def normalize(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
-    @step(output=PartitionedJSONDataset(name="right"))
-    def normalize_right(partitions: object, *, context: object) -> object:
+    def normalize_right(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
@@ -165,7 +178,6 @@ def test_repeated_route_step_names_across_routes_get_distinct_node_ids() -> None
     )
     pipeline = Pipeline(
         name="dup_across_routes",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -176,8 +188,9 @@ def test_repeated_route_step_names_across_routes_get_distinct_node_ids() -> None
 
 
 def test_duplicate_route_step_names_within_one_route_are_rejected() -> None:
-    @step(output=PartitionedJSONDataset(name="one"))
-    def normalize(partitions: object, *, context: object) -> object:
+    def normalize(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
@@ -188,7 +201,6 @@ def test_duplicate_route_step_names_within_one_route_are_rejected() -> None:
     branch = Branch(name="dup_route", by="source", routes={"a": duplicate})
     pipeline = Pipeline(
         name="dup_in_route",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -196,32 +208,45 @@ def test_duplicate_route_step_names_within_one_route_are_rejected() -> None:
         compile_pipeline(pipeline)
 
 
-def test_undecorated_route_callable_is_rejected() -> None:
-    def bare(partitions: object, *, context: object) -> object:
-        _ = context
-        return partitions
-
-    branch = Branch(name="undecorated", by="source", routes={"a": [bare]})
+def test_non_callable_route_entry_is_rejected() -> None:
+    branch = Branch(name="not_a_step", by="source", routes={"a": ["normalize"]})
     pipeline = Pipeline(
-        name="undecorated_route",
-        loader=_StubLoader(),
+        name="non_callable_route",
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
-    with pytest.raises(TypeError, match="must be decorated with @step"):
+    with pytest.raises(TypeError, match="must be a Step or a callable"):
         compile_pipeline(pipeline)
 
 
+def test_bare_route_callable_uses_documented_step_defaults() -> None:
+    def normalize(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
+        _ = context
+        return partitions
+
+    branch = Branch(name="shorthand", by="source", routes={"a": [normalize]})
+    pipeline = Pipeline(
+        name="shorthand_route",
+        stages=[Stage(name="bronze", entries=[branch])],
+    )
+
+    plan = compile_pipeline(pipeline)
+    route_nodes = [node for node in plan.nodes if node.kind == "route-step"]
+    assert [node.name for node in route_nodes] == ["normalize"]
+
+
 def test_unsupported_branch_by_shape_is_rejected() -> None:
-    @step(output=PartitionedJSONDataset(name="ok"))
-    def fine(partitions: object, *, context: object) -> object:
+    def fine(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
     branch = Branch(name="bad_by", by=42, routes={"a": [fine]})  # type: ignore[arg-type]
     pipeline = Pipeline(
         name="bad_by_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -233,7 +258,6 @@ def test_branch_without_routes_is_rejected() -> None:
     branch = Branch(name="empty_routes", by="source", routes={})
     pipeline = Pipeline(
         name="empty_routes_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -242,15 +266,19 @@ def test_branch_without_routes_is_rejected() -> None:
 
 
 def test_empty_route_step_list_models_pass_through_to_merge() -> None:
-    @step(output=PartitionedJSONDataset(name="only"))
-    def only(partitions: object, *, context: object) -> object:
+    def only(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
-    branch = Branch(name="passthrough", by="source", routes={"a": [only], "b": []})
+    branch = Branch(
+        name="passthrough",
+        by="source",
+        routes={"a": [Step(only, output=PartitionedJSONDataset(name="only"))], "b": []},
+    )
     pipeline = Pipeline(
         name="passthrough_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -268,8 +296,9 @@ def test_empty_route_step_list_models_pass_through_to_merge() -> None:
     ["with/slash", "with\\backslash", "..", ""],
 )
 def test_path_unsafe_stage_names_are_rejected(bad_name: str) -> None:
-    @step(output=JSONDataset(name="x"))
-    def fine(partitions: object, *, context: object) -> object:
+    def fine(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
@@ -277,14 +306,12 @@ def test_path_unsafe_stage_names_are_rejected(bad_name: str) -> None:
         with pytest.raises(ValueError):
             Pipeline(
                 name="unsafe_stage",
-                loader=_StubLoader(),
                 stages=[Stage(name=bad_name, entries=[fine])],
             )
         return
 
     pipeline = Pipeline(
         name="unsafe_stage",
-        loader=_StubLoader(),
         stages=[Stage(name=bad_name, entries=[fine])],
     )
     with pytest.raises(ValueError, match="path"):
@@ -292,15 +319,15 @@ def test_path_unsafe_stage_names_are_rejected(bad_name: str) -> None:
 
 
 def test_path_unsafe_route_keys_are_rejected() -> None:
-    @step(output=PartitionedJSONDataset(name="x"))
-    def fine(partitions: object, *, context: object) -> object:
+    def fine(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
     branch = Branch(name="unsafe_route", by="source", routes={"a/b": [fine]})
     pipeline = Pipeline(
         name="unsafe_route_pipeline",
-        loader=_StubLoader(),
         stages=[Stage(name="bronze", entries=[branch])],
     )
 
@@ -309,15 +336,18 @@ def test_path_unsafe_route_keys_are_rejected() -> None:
 
 
 def test_empty_stage_compiles_to_no_nodes_and_preserves_flow() -> None:
-    @step(output=JSONDataset(name="final"))
-    def final(partitions: object, *, context: object) -> object:
+    def final(inputs, *, context: object) -> object:
+        [partition] = inputs.partitions()
+        partitions: object = partition.load()
         _ = context
         return partitions
 
     pipeline = Pipeline(
         name="empty_stage_pipeline",
-        loader=_StubLoader(),
-        stages=[Stage(name="empty", entries=[]), Stage(name="silver", entries=[final])],
+        stages=[
+            Stage(name="empty", entries=[]),
+            Stage(name="silver", entries=[Step(final, output=JSONDataset(name="final"))]),
+        ],
     )
 
     plan = compile_pipeline(pipeline)
@@ -329,6 +359,7 @@ def test_empty_stage_compiles_to_no_nodes_and_preserves_flow() -> None:
 
 def test_every_example_pipeline_compiles_deterministically() -> None:
     from examples.branching.pipeline import build_branching_pipeline
+    from examples.combining_results.pipeline import build_combining_pipeline
     from examples.custom_context.pipeline import build_custom_context_pipeline
     from examples.fsspec_minimal.pipeline import build_fsspec_pipeline
     from examples.fsspec_partitioned.pipeline import build_fsspec_partitioned_pipeline
@@ -339,6 +370,7 @@ def test_every_example_pipeline_compiles_deterministically() -> None:
 
     builders = [
         build_branching_pipeline,
+        build_combining_pipeline,
         build_custom_context_pipeline,
         build_fsspec_pipeline,
         build_fsspec_partitioned_pipeline,

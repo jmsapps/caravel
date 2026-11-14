@@ -5,7 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, cast
 
-from caravel import Branch, JSONDataset, Pipeline, Stage, Step, dataset_as_loader, run
+from caravel import (
+    Branch,
+    CallableLoader,
+    DurableStorage,
+    JSONDataset,
+    Pipeline,
+    Stage,
+    Step,
+    run,
+)
 from caravel.plugins import RunFacts, RunOutcome
 
 PIPELINE_NAME = "saga_rollback_example"
@@ -44,7 +53,7 @@ class SagaTransaction:
             )
         _write_json(
             self.journal_path,
-            {"run_id": run.run_id, "status": "active", "compensations": []},
+            {"run_id": run.invocation_id, "status": "active", "compensations": []},
         )
 
     def exit(self, run: RunFacts, outcome: RunOutcome) -> None:
@@ -90,61 +99,87 @@ def build_saga_pipeline(
 ) -> Pipeline:
     seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
 
-    def reserve_inventory(order: dict[str, Any], *, context: object) -> dict[str, Any]:
-        _ = context
-        quantity = int(order["quantity"])
-        state = transaction.state()
-        if state["available_inventory"] < quantity:
-            raise ValueError("Insufficient inventory")
-        transaction.update_state(available_inventory=state["available_inventory"] - quantity)
-        transaction.record("release_inventory", quantity=quantity)
-        return {**order, "inventory_reserved": True}
+    def reserve_inventory(inputs, *, context: object) -> dict[str, Any]:
+        orders = {}
+        for partition in inputs.partitions():
+            order = partition.load()
+            quantity = int(order["quantity"])
+            state = transaction.state()
+            if state["available_inventory"] < quantity:
+                raise ValueError("Insufficient inventory")
+            transaction.update_state(available_inventory=state["available_inventory"] - quantity)
+            transaction.record("release_inventory", quantity=quantity)
+            orders[partition.partition_id] = {**order, "inventory_reserved": True}
+        return orders
 
-    def charge_account(order: dict[str, Any], *, context: object) -> dict[str, Any]:
-        _ = context
-        amount = int(order["amount"])
-        state = transaction.state()
-        if state["account_balance"] < amount:
-            raise ValueError("Insufficient account balance")
-        transaction.update_state(account_balance=state["account_balance"] - amount)
-        transaction.record("refund_account", amount=amount)
-        return {**order, "account_charged": True}
+    def charge_account(inputs, *, context: object) -> dict[str, Any]:
+        orders = {}
+        for partition in inputs.partitions():
+            for key, order in partition.load().items():
+                if key in orders:
+                    raise ValueError(f"Duplicate order key: {key}")
+                amount = int(order["amount"])
+                state = transaction.state()
+                if state["account_balance"] < amount:
+                    raise ValueError("Insufficient account balance")
+                transaction.update_state(account_balance=state["account_balance"] - amount)
+                transaction.record("refund_account", amount=amount)
+                orders[key] = {**order, "account_charged": True}
+        return orders
 
-    def create_shipment(order: dict[str, Any], *, context: object) -> dict[str, Any]:
-        _ = context
-        shipment_id = f"shipment-{order['order_id']}"
-        state = transaction.state()
-        transaction.update_state(shipments=[*state["shipments"], shipment_id])
-        transaction.record("cancel_shipment", shipment_id=shipment_id)
-        return {**order, "shipment_id": shipment_id}
+    def create_shipment(inputs, *, context: object) -> dict[str, Any]:
+        orders = {}
+        for partition in inputs.partitions():
+            for key, order in partition.load().items():
+                if key in orders:
+                    raise ValueError(f"Duplicate order key: {key}")
+                shipment_id = f"shipment-{order['order_id']}"
+                state = transaction.state()
+                transaction.update_state(shipments=[*state["shipments"], shipment_id])
+                transaction.record("cancel_shipment", shipment_id=shipment_id)
+                orders[key] = {**order, "shipment_id": shipment_id}
+        return orders
 
-    def finalize_order(order: dict[str, Any], *, context: object) -> dict[str, Any]:
-        if _params(context).get("fail") == "true":
-            raise RuntimeError("Simulated failure after all reversible actions")
-        return {**order, "status": "completed"}
+    def finalize_order(inputs, *, context: object) -> dict[str, Any]:
+        orders = {}
+        for partition in inputs.partitions():
+            for key, order in partition.load().items():
+                if key in orders:
+                    raise ValueError(f"Duplicate order key: {key}")
+                if _params(context).get("fail") == "true":
+                    raise RuntimeError("Simulated failure after all reversible actions")
+                orders[key] = {**order, "status": "completed"}
+        return orders
 
     steps: list[Step | Branch | Callable[..., Any]] = [
-        Step(reserve_inventory, JSONDataset(), name="reserve_inventory"),
-        Step(charge_account, JSONDataset(), name="charge_account"),
-        Step(create_shipment, JSONDataset(), name="create_shipment"),
-        Step(finalize_order, JSONDataset(), name="finalize_order"),
+        Step(reserve_inventory, JSONDataset(), name="reserve_inventory", revision="2"),
+        Step(charge_account, JSONDataset(), name="charge_account", revision="2"),
+        Step(create_shipment, JSONDataset(), name="create_shipment", revision="2"),
+        Step(finalize_order, JSONDataset(), name="finalize_order", revision="2"),
     ]
-    loader = dataset_as_loader(JSONDataset(name="order", path=seed_path))
-    return Pipeline(name=PIPELINE_NAME, loader=loader, stages=[Stage(STAGE_NAME, steps)])
+
+    # One order is one execution partition: the whole document is the
+    # recovery unit, not each of its fields.
+    def load_order() -> dict[str, Any]:
+        return {"order": cast(dict[str, Any], JSONDataset(name="order", path=seed_path).load())}
+
+    loader = CallableLoader("order", load_order)
+    return Pipeline(name=PIPELINE_NAME, source=loader, stages=[Stage(STAGE_NAME, steps)])
 
 
 def run_saga_pipeline(
     *,
-    run_root: Path | str,
+    state_root: Path | str,
     state_path: Path,
     journal_path: Path,
     fail: bool = False,
-) -> Path | str:
+) -> Any:
     transaction = SagaTransaction(state_path=state_path, journal_path=journal_path)
     pipeline = build_saga_pipeline(transaction)
     return run(
         pipeline,
-        run_root=run_root,
+        job_id="saga-1",
+        storage=DurableStorage.at(Path(state_root) / "output"),
         params={"fail": "true"} if fail else None,
         plugins=[transaction],
     )

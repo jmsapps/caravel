@@ -1,107 +1,126 @@
+"""Every step commits; aggregation is an explicit barrier.
+
+The legacy ``persist=False`` option is gone: durable recovery requires each
+step's output to be committed so a later invocation restores it instead of
+recomputing. What used to be "only the last step persists" is now expressed as
+cheap per-partition steps feeding one ``input_scope="all"`` aggregation.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from caravel import JSONDataset, Pipeline, Stage, dataset_as_loader, run, step
+from caravel import (
+    CallableLoader,
+    DurableStorage,
+    JSONDataset,
+    Pipeline,
+    Stage,
+    Step,
+    run,
+)
 
 PIPELINE_NAME = "persist_only_final_example"
-STAGE_NAME = "single_stage"
-
+STAGE_NAME = "pipeline"
 STEP_1_NAME = "step_1_collect"
 STEP_2_NAME = "step_2_scale"
-STEP_3_NAME = "step_3_tag"
+STEP_3_NAME = "step_3_label"
 STEP_4_NAME = "step_4_aggregate"
-STEP_5_NAME = "step_5_finalize"
+STEP_5_NAME = STEP_4_NAME
+FINAL_STEP_NAME = STEP_4_NAME
 
-_DEFAULT_INPUT_PATH = Path(__file__).resolve().parent / "data" / "input" / "input_partitions.json"
+PARTITIONS: dict[str, dict[str, Any]] = {
+    f"record-{index}": {"id": f"record-{index}", "value": index} for index in range(1, 5)
+}
 
 
-@step(output=JSONDataset(), persist=False)
-def step_1_collect(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
+def step_1_collect(inputs, *, context: object) -> dict[str, Any]:
+    records = {}
+    for partition in inputs.partitions():
+        records[partition.partition_id] = {**partition.load(), "collected": True}
+    return records
+
+
+def step_2_scale(inputs, *, context: object) -> dict[str, Any]:
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = {**record, "scaled": int(record["value"]) * 10}
+    return records
+
+
+def step_3_label(inputs, *, context: object) -> dict[str, Any]:
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = {**record, "label": f"v{record['scaled']}"}
+    return records
+
+
+def step_4_aggregate(inputs, *, context: object) -> dict[str, Any]:
+    """Aggregate every committed partition behind the barrier."""
     _ = context
-    return {k: {**v, "seen": True} for k, v in partitions.items()}
-
-
-@step(output=JSONDataset(), persist=False)
-def step_2_scale(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    _ = context
-    return {k: {**v, "scaled": int(v["value"]) * 10} for k, v in partitions.items()}
-
-
-@step(output=JSONDataset(), persist=False)
-def step_3_tag(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    _ = context
-    return {k: {**v, "tag": f"row-{k}"} for k, v in partitions.items()}
-
-
-@step(output=JSONDataset(), persist=False)
-def step_4_aggregate(partitions: dict[str, dict[str, Any]], *, context: object) -> dict[str, Any]:
-    _ = context
+    records = {}
+    for partition in inputs.partitions():
+        for key, record in partition.load().items():
+            if key in records:
+                raise ValueError(f"Duplicate record key: {key}")
+            records[key] = record
     return {
-        "count": len(partitions),
-        "total_scaled": sum(int(v["scaled"]) for v in partitions.values()),
-        "records": partitions,
+        "pipeline": PIPELINE_NAME,
+        "count": len(records),
+        "ids": sorted(records),
+        "total_scaled": sum(int(record["scaled"]) for record in records.values()),
     }
 
 
-@step(output=JSONDataset())
-def step_5_finalize(payload: dict[str, Any], *, context: object) -> dict[str, Any]:
-    _ = context
-    records = payload["records"]
-    return {
-        "count": payload["count"],
-        "total_scaled": payload["total_scaled"],
-        "ids": sorted(records.keys()),
-        "records": records,
-    }
-
-
-def build_persist_only_final_pipeline(input_path: Path | str | None = None) -> Pipeline:
-    seed_path = Path(input_path) if input_path is not None else _DEFAULT_INPUT_PATH
-    loader = dataset_as_loader(JSONDataset(name="persist_only_final_seed", path=seed_path))
+def build_persist_only_final_pipeline() -> Pipeline:
     return Pipeline(
         name=PIPELINE_NAME,
-        loader=loader,
         stages=[
             Stage(
                 name=STAGE_NAME,
                 entries=[
-                    step_1_collect,
-                    step_2_scale,
-                    step_3_tag,
-                    step_4_aggregate,
-                    step_5_finalize,
+                    Step(step_1_collect, output=JSONDataset(), revision="2"),
+                    Step(step_2_scale, output=JSONDataset(), revision="2"),
+                    Step(step_3_label, output=JSONDataset(), revision="2"),
+                    Step(
+                        step_4_aggregate,
+                        input_scope="all",
+                        output=JSONDataset(name="aggregate"),
+                    ),
                 ],
             )
         ],
+        source=CallableLoader("partitions", lambda: PARTITIONS),
     )
 
 
 def run_persist_only_final_pipeline(
-    *, run_root: Path | str | None = None, input_path: Path | str | None = None
-) -> Path | str:
-    pipeline = build_persist_only_final_pipeline(input_path=input_path)
-    resolved_root = (
-        Path(run_root) if run_root is not None else Path(__file__).resolve() / "data" / "output"
+    *, state_root: Path | str, job_id: str = "persist-only-final-1"
+) -> Any:
+    return run(
+        build_persist_only_final_pipeline(),
+        job_id=job_id,
+        storage=DurableStorage.at(Path(state_root) / "output"),
     )
-    return run(pipeline, run_root=resolved_root)
 
 
 __all__ = [
     "PIPELINE_NAME",
     "STAGE_NAME",
+    "FINAL_STEP_NAME",
     "STEP_1_NAME",
     "STEP_2_NAME",
     "STEP_3_NAME",
     "STEP_4_NAME",
     "STEP_5_NAME",
+    "PARTITIONS",
     "build_persist_only_final_pipeline",
     "run_persist_only_final_pipeline",
 ]

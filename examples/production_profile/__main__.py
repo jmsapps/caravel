@@ -4,12 +4,9 @@ import os
 
 from caravel.cli import make_cli
 
-from examples.fsspec_minimal.pipeline import (
-    _storage_options_for_url,
-    build_fsspec_pipeline,
-)
+from examples.fsspec_minimal.pipeline import build_fsspec_pipeline
 
-from .profile import build_production_plugins
+from .profile import build_production_plugins, storage_options_for_url
 
 
 def main() -> int:
@@ -17,12 +14,18 @@ def main() -> int:
     if not metadata_root:
         raise SystemExit("CARAVEL_METADATA_ROOT is required for the production profile")
 
-    pipeline = build_fsspec_pipeline()
+    # Input and evidence may live in different places with different
+    # credentials, so each resolves its own options from the environment.
+    input_url = os.getenv("CARAVEL_INPUT_URL", "").strip() or None
+    pipeline = build_fsspec_pipeline(
+        input_path=input_url,
+        storage_options=storage_options_for_url(input_url),
+    )
     plugins = build_production_plugins(
         metadata_root,
-        storage_options=_storage_options_for_url(metadata_root),
+        storage_options=storage_options_for_url(metadata_root),
     )
-    return make_cli(pipeline, plugins=plugins)()
+    return make_cli(pipeline, source=pipeline.source, plugins=plugins)()
 
 
 if __name__ == "__main__":

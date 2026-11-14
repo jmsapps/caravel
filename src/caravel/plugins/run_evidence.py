@@ -59,8 +59,9 @@ _EVENT_FIELDS = frozenset(
         "schema_version",
         "run_id",
         "pipeline",
-        "is_selective",
-        "run_root",
+        "job_id",
+        "pipeline_id",
+        "restart_safe",
         "sequence",
         "kind",
         "node",
@@ -69,19 +70,20 @@ _EVENT_FIELDS = frozenset(
     }
 )
 
+# Exactly the fields of one NodeFacts record. Durable execution identifies work
+# by node and partition under a declared input scope; it has no step directory,
+# no per-node persist switch, and no route key on the fact itself.
 _NODE_FIELDS = frozenset(
     {
         "node_id",
-        "kind",
+        "partition_id",
         "stage_index",
         "stage_name",
         "entry_index",
         "name",
-        "persist",
+        "input_scope",
         "dataset_type",
         "dataset_name",
-        "step_dir",
-        "route_key",
     }
 )
 
@@ -139,12 +141,11 @@ def validate_run_event(payload: object) -> dict[str, Any]:
     if not isinstance(pipeline, str) or not pipeline:
         raise ValueError("Run event pipeline must be a non-empty string.")
 
-    if not isinstance(payload["is_selective"], bool):
-        raise ValueError("Run event is_selective must be a boolean.")
-
-    run_root = payload["run_root"]
-    if not isinstance(run_root, str) or not run_root:
-        raise ValueError("Run event run_root must be a non-empty string.")
+    if not isinstance(payload["restart_safe"], bool):
+        raise ValueError("Run event restart_safe must be a boolean.")
+    for field in ("job_id", "pipeline_id"):
+        if not isinstance(payload[field], str) or not payload[field]:
+            raise ValueError(f"Run event {field} must be a non-empty string.")
 
     sequence = payload["sequence"]
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
@@ -158,8 +159,9 @@ def validate_run_event(payload: object) -> dict[str, Any]:
     if node is not None:
         if not isinstance(node, dict) or set(node) != _NODE_FIELDS:
             raise ValueError("Run event node must carry exactly the node fact fields.")
-        if not isinstance(node["node_id"], str) or not node["node_id"]:
-            raise ValueError("Run event node_id must be a non-empty string.")
+        for field in ("node_id", "partition_id"):
+            if not isinstance(node[field], str) or not node[field]:
+                raise ValueError(f"Run event node {field} must be a non-empty string.")
 
     error_type = payload["error_type"]
     if error_type is not None and (not isinstance(error_type, str) or not error_type):
@@ -308,7 +310,7 @@ class RunEvidencePlugin:
     # -- RunObserver -----------------------------------------------------------
 
     def on_event(self, event: RunEvent) -> None:
-        run_id = event.run.run_id
+        run_id = event.run.invocation_id
         sequence = self._sequences.get(run_id, 0) + 1
         self._sequences[run_id] = sequence
 
@@ -316,16 +318,14 @@ class RunEvidencePlugin:
         if event.node is not None:
             node_block = {
                 "node_id": event.node.node_id,
-                "kind": event.node.kind,
                 "stage_index": event.node.stage_index,
                 "stage_name": event.node.stage_name,
                 "entry_index": event.node.entry_index,
                 "name": event.node.name,
-                "persist": event.node.persist,
+                "partition_id": event.node.partition_id,
+                "input_scope": event.node.input_scope,
                 "dataset_type": event.node.dataset_type,
                 "dataset_name": event.node.dataset_name,
-                "step_dir": event.node.step_dir,
-                "route_key": event.node.route_key,
             }
 
         record = validate_run_event(
@@ -333,8 +333,9 @@ class RunEvidencePlugin:
                 "schema_version": RUN_EVENT_SCHEMA_VERSION,
                 "run_id": run_id,
                 "pipeline": event.run.pipeline_name,
-                "is_selective": event.run.is_selective,
-                "run_root": event.run.run_root,
+                "job_id": event.run.job_id,
+                "pipeline_id": event.run.pipeline_id,
+                "restart_safe": event.run.restart_safe,
                 "sequence": sequence,
                 "kind": event.kind,
                 "node": node_block,

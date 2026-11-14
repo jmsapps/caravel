@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 
 from caravel import (
+    DurableStorage,
+    Step,
     SOURCE_FIELD,
     JSONDataset,
     MultiSourceLoader,
@@ -11,7 +13,6 @@ from caravel import (
     Pipeline,
     Stage,
     run,
-    step,
 )
 
 PIPELINE_NAME = "multisource_example"
@@ -47,36 +48,39 @@ def make_multisource_loader(
     )
 
 
-@step(output=JSONDataset())
-def summarize_by_source(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, Any]:
-    """Validate source tags and emit deterministic counts by source."""
+def summarize_by_source(inputs, *, context: object) -> dict[str, Any]:
+    """Count records by source tag behind an explicit all-input barrier.
+
+    ``MultiSourceLoader`` still tags every record with ``__source__``. Durable
+    execution preserves the tag through commits: unlike the retired runner,
+    nothing strips it, so the tag is visible to downstream steps and in
+    committed output.
+    """
     _ = context
     counts_by_source: dict[str, int] = {SOURCE_A_NAME: 0, SOURCE_B_NAME: 0}
 
-    for key in sorted(partitions):
-        record = partitions[key]
+    for partition in inputs.partitions():
+        record = partition.load()
         if not isinstance(record, dict):
             raise TypeError(
-                f"Expected dict record for partition '{key}', got {type(record).__name__}."
+                f"Expected dict record for partition '{partition.partition_id}', "
+                f"got {type(record).__name__}."
             )
-
         if SOURCE_FIELD not in record:
-            raise KeyError(f"Partition '{key}' is missing source tag '{SOURCE_FIELD}'.")
-
+            raise KeyError(
+                f"Partition '{partition.partition_id}' is missing source tag '{SOURCE_FIELD}'."
+            )
         source_name = str(record[SOURCE_FIELD])
         if source_name not in counts_by_source:
-            raise ValueError(f"Unexpected source tag '{source_name}' for partition '{key}'.")
-
+            raise ValueError(
+                f"Unexpected source tag '{source_name}' for partition '{partition.partition_id}'."
+            )
         counts_by_source[source_name] += 1
-
-    total_records = sum(counts_by_source.values())
 
     return {
         "pipeline": PIPELINE_NAME,
         "counts_by_source": counts_by_source,
-        "total_records": total_records,
+        "total_records": sum(counts_by_source.values()),
     }
 
 
@@ -86,24 +90,34 @@ def build_multisource_pipeline(
     source_b_dir: Path | str | None = None,
 ) -> Pipeline:
     """Build the multisource pipeline declaration."""
-    loader = make_multisource_loader(source_a_dir=source_a_dir, source_b_dir=source_b_dir)
-
     return Pipeline(
         name=PIPELINE_NAME,
-        loader=loader,
-        stages=[Stage(name=STAGE_NAME, entries=[summarize_by_source])],
+        stages=[
+            Stage(
+                name=STAGE_NAME,
+                entries=[
+                    Step(
+                        summarize_by_source,
+                        input_scope="all",
+                        output=JSONDataset(name="summary"),
+                    )
+                ],
+            )
+        ],
+        source=make_multisource_loader(source_a_dir=source_a_dir, source_b_dir=source_b_dir),
     )
 
 
 def run_multisource_pipeline(
     *,
-    run_root: Path | str | None = None,
+    state_root: Path | str,
+    job_id: str = "multisource-1",
     source_a_dir: Path | str | None = None,
     source_b_dir: Path | str | None = None,
-) -> Path | str:
-    """Run the multisource example pipeline and return resolved run root."""
+) -> Any:
+    """Run the multisource example and return its structured status."""
     pipeline = build_multisource_pipeline(source_a_dir=source_a_dir, source_b_dir=source_b_dir)
-    return run(pipeline, run_root=run_root)
+    return run(pipeline, job_id=job_id, storage=DurableStorage.at(Path(state_root) / "output"))
 
 
 __all__ = [

@@ -1,13 +1,19 @@
+"""Plugin capabilities for one durable execution invocation.
+
+Two capabilities remain, because only these extend behavior the engine does not
+already own: observers receive lifecycle events after committed transitions,
+and run guards wrap one invocation in an external precondition.
+
+Checkpoint, ownership, and lease capabilities were retired when Caravel
+consolidated onto one durable execution model. The authoritative progress store
+owns committed-output evidence, cross-run inventory, and worker leases.
+"""
+
+from .run_evidence import RunEvidencePlugin
 from .api import (
-    CheckpointCapability,
-    CheckpointContext,
-    CheckpointReuse,
     EventKind,
     NodeFacts,
     ObserverCriticality,
-    OwnershipCapability,
-    OwnershipContext,
-    PlanOutput,
     PluginFailureError,
     PluginSet,
     RunEvent,
@@ -17,69 +23,18 @@ from .api import (
     RunOutcome,
     validate_plugins,
 )
-from .checkpoint import CHECKPOINT_SCHEMA_VERSION, CheckpointPlugin, validate_checkpoint_record
-from .lease import (
-    LEASE_SCHEMA_VERSION,
-    LeaseError,
-    LeaseHeldError,
-    LeaseIntegrityError,
-    LeasePlugin,
-    UnsupportedLeaseVersionError,
-    validate_lease,
-)
-from .ownership import (
-    INVENTORY_SCHEMA_VERSION,
-    OwnershipIntegrityError,
-    OwnershipPlugin,
-    ReconciliationFacts,
-    UnsupportedInventoryVersionError,
-    validate_inventory,
-)
-from .run_evidence import (
-    RUN_EVENT_SCHEMA_VERSION,
-    RunEvidenceIntegrityError,
-    RunEvidencePlugin,
-    UnsupportedRunEventVersionError,
-    validate_run_event,
-)
 
 __all__ = [
-    "CHECKPOINT_SCHEMA_VERSION",
-    "INVENTORY_SCHEMA_VERSION",
-    "RUN_EVENT_SCHEMA_VERSION",
-    "LEASE_SCHEMA_VERSION",
-    "CheckpointCapability",
-    "CheckpointContext",
-    "CheckpointReuse",
-    "CheckpointPlugin",
+    "RunEvidencePlugin",
     "EventKind",
-    "LeaseError",
-    "LeaseHeldError",
-    "LeaseIntegrityError",
-    "LeasePlugin",
-    "UnsupportedLeaseVersionError",
-    "validate_lease",
     "NodeFacts",
     "ObserverCriticality",
-    "OwnershipCapability",
-    "OwnershipContext",
-    "OwnershipIntegrityError",
-    "OwnershipPlugin",
-    "PlanOutput",
     "PluginFailureError",
     "PluginSet",
-    "ReconciliationFacts",
     "RunEvent",
-    "RunEvidenceIntegrityError",
-    "RunEvidencePlugin",
     "RunFacts",
     "RunGuard",
     "RunObserver",
     "RunOutcome",
-    "UnsupportedInventoryVersionError",
-    "UnsupportedRunEventVersionError",
-    "validate_run_event",
-    "validate_checkpoint_record",
-    "validate_inventory",
     "validate_plugins",
 ]

@@ -1,418 +1,353 @@
-"""Typed plugin capability tests.
+"""Plugin capabilities on the one durable execution model.
 
-Covers plugin validation, deterministic ordering and reverse teardown,
-observer failure semantics, and the checkpoint capability seam driven
-end-to-end by a recording fake.
+Only observers and run guards remain. Checkpoint, ownership, and lease
+capabilities were retired when execution consolidated: the authoritative
+progress store owns committed-output evidence, cross-run inventory, and worker
+leases, so a plugin can no longer contradict it.
 """
 
+from __future__ import annotations
+
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from caravel.datasets import JSONDataset, PartitionedJSONDataset
-from caravel.pipeline import Pipeline, Stage, step
+from caravel import DurableStorage, InMemorySource, Pipeline, Stage, Step, run
 from caravel.plugins import (
-    CheckpointContext,
-    CheckpointReuse,
     PluginFailureError,
     RunEvent,
     RunFacts,
     RunOutcome,
     validate_plugins,
 )
-from caravel.runner import ExecutionRequest, bind_execution, execute
-from caravel.plan import compile_pipeline
-from caravel.types import Dataset, MissingPriorOutputError, UnsupportedCapabilityError
+
+DOCUMENTS = {"doc-1": {"id": "doc-1"}, "doc-2": {"id": "doc-2"}}
 
 
-class _StubLoader:
-    name = "stub_loader"
-
-    def __init__(self, partitions: dict[str, dict[str, object]]) -> None:
-        self.partitions = partitions
-        self.load_calls = 0
-
-    def load(self) -> dict[str, dict[str, object]]:
-        self.load_calls += 1
-        return self.partitions
+def load(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
+    document: Any = partition.load()
+    return document
 
 
-class RecordingObserver:
-    def __init__(self, plugin_id: str, log: list[str], criticality: str = "best_effort") -> None:
-        self.plugin_id = plugin_id
-        self.criticality = criticality
-        self.log = log
+def _pipeline() -> Pipeline:
+    return Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(load)])])
+
+
+class Recorder:
+    """Best-effort observer that records the events it receives."""
+
+    plugin_id = "recorder"
+    criticality = "best_effort"
+
+    def __init__(self) -> None:
         self.events: list[RunEvent] = []
 
     def on_event(self, event: RunEvent) -> None:
-        self.log.append(f"{self.plugin_id}:{event.kind}")
         self.events.append(event)
 
 
-class FailingObserver:
-    def __init__(self, plugin_id: str, criticality: str) -> None:
-        self.plugin_id = plugin_id
+class Exploder:
+    plugin_id = "exploder"
+
+    def __init__(self, criticality: str, *, on: str = "node_completed") -> None:
         self.criticality = criticality
+        self._on = on
 
     def on_event(self, event: RunEvent) -> None:
-        raise RuntimeError("observer exploded")
+        if event.kind == self._on:
+            raise RuntimeError("observer exploded")
 
 
-class RecordingGuard:
-    def __init__(self, plugin_id: str, log: list[str]) -> None:
+class Guard:
+    def __init__(self, plugin_id: str, log: list[str], *, fail_exit: bool = False) -> None:
         self.plugin_id = plugin_id
-        self.log = log
-        self.outcomes: list[RunOutcome] = []
+        self._log = log
+        self._fail_exit = fail_exit
 
     def enter(self, run: RunFacts) -> None:
-        self.log.append(f"{self.plugin_id}:enter")
+        self._log.append(f"enter:{self.plugin_id}")
 
     def exit(self, run: RunFacts, outcome: RunOutcome) -> None:
-        self.log.append(f"{self.plugin_id}:exit:{outcome.status}")
-        self.outcomes.append(outcome)
+        self._log.append(f"exit:{self.plugin_id}:{outcome.status}")
+        if self._fail_exit:
+            raise RuntimeError("teardown failed")
 
 
-class FakeCheckpointPlugin:
-    """Test-only checkpoint capability with in-memory evidence."""
-
-    plugin_id = "fake-checkpoint"
-
-    def __init__(self, grant: bool = True) -> None:
-        self.grant = grant
-        self.evidence: dict[str, str] = {}
-        self.calls: list[str] = []
-        self.contexts: list[CheckpointContext] = []
-
-    def reuse_verdict(self, context: CheckpointContext, dataset: Dataset) -> bool:
-        self.contexts.append(context)
-        self.calls.append(f"verdict:{context.node.node_id}")
-        return self.grant and context.node.node_id in self.evidence
-
-    def before_replacement(self, context: CheckpointContext, dataset: Dataset) -> None:
-        self.contexts.append(context)
-        self.calls.append(f"invalidate:{context.node.node_id}")
-        self.evidence.pop(context.node.node_id, None)
-
-    def after_save(self, context: CheckpointContext, dataset: Dataset) -> None:
-        self.contexts.append(context)
-        self.calls.append(f"commit:{context.node.node_id}")
-        assert context.node.step_dir is not None
-        self.evidence[context.node.node_id] = context.node.step_dir
+# ---------------------------------------------------------------------------
+# Observers
+# ---------------------------------------------------------------------------
 
 
-def test_committed_empty_reuse_must_be_reusable() -> None:
-    with pytest.raises(ValueError, match="must be reusable"):
-        CheckpointReuse(reusable=False, committed_empty=True)
-
-
-def _linear_pipeline(loader: _StubLoader, calls: dict[str, int]) -> Pipeline:
-    @step(output=PartitionedJSONDataset(name="bronze_out"))
-    def bronze_map(
-        partitions: dict[str, dict[str, object]], *, context: object
-    ) -> dict[str, dict[str, object]]:
-        _ = context
-        calls["bronze"] = calls.get("bronze", 0) + 1
-        return {key: {**record, "mapped": True} for key, record in partitions.items()}
-
-    @step(output=JSONDataset(name="silver_out"))
-    def silver_summary(
-        partitions: dict[str, dict[str, object]], *, context: object
-    ) -> dict[str, object]:
-        _ = context
-        calls["silver"] = calls.get("silver", 0) + 1
-        return {"count": len(partitions)}
-
-    return Pipeline(
-        name="plugin_seam",
-        loader=loader,
-        stages=[
-            Stage(name="bronze", entries=[bronze_map]),
-            Stage(name="silver", entries=[silver_summary]),
-        ],
+def test_an_observer_sees_the_run_and_work_unit_lifecycle(tmp_path: Path) -> None:
+    recorder = Recorder()
+    result = run(
+        _pipeline(),
+        job_id="j1",
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.at(tmp_path / "output"),
+        plugins=[recorder],
     )
+    assert result.status == "completed"
+
+    kinds = [event.kind for event in recorder.events]
+    assert kinds[0] == "run_started"
+    assert kinds[-1] == "run_completed"
+    assert kinds.count("node_started") == len(DOCUMENTS)
+    assert kinds.count("node_completed") == len(DOCUMENTS)
 
 
-def _run(pipeline: Pipeline, tmp_path: Path, **kwargs: Any) -> Any:
-    request = ExecutionRequest(run_root=tmp_path, **kwargs)
-    plan = bind_execution(pipeline, compile_pipeline(pipeline), request)
-    return execute(plan)
+def test_event_facts_describe_the_durable_work_unit(tmp_path: Path) -> None:
+    recorder = Recorder()
+    run(
+        _pipeline(),
+        job_id="j1",
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.at(tmp_path / "output"),
+        plugins=[recorder],
+    )
+    completed = [e for e in recorder.events if e.kind == "node_completed"]
+    node = completed[0].node
+    assert node is not None
+    assert node.partition_id in DOCUMENTS
+    assert node.input_scope == "partition"
+    assert node.dataset_type == "JSONDataset"
+    assert node.name == "load"
+
+    facts = completed[0].run
+    assert facts.job_id == "j1"
+    assert facts.pipeline_id == "documents"
+    assert facts.restart_safe is True
+    assert facts.invocation_id
 
 
-# ---------------------------------------------------------------- validation
+def test_an_ephemeral_run_tells_observers_it_is_not_restart_safe(
+    tmp_path: Path,
+) -> None:
+    recorder = Recorder()
+    run(
+        _pipeline(),
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.ephemeral(tmp_path / "output"),
+        plugins=[recorder],
+    )
+    assert all(event.run.restart_safe is False for event in recorder.events)
 
 
-def test_plugin_without_capability_is_rejected() -> None:
-    class Inert:
-        plugin_id = "inert"
+def test_a_required_observer_failure_fails_the_run(tmp_path: Path) -> None:
+    with pytest.raises(PluginFailureError, match="Required observer"):
+        run(
+            _pipeline(),
+            job_id="j1",
+            source=InMemorySource(DOCUMENTS),
+            storage=DurableStorage.at(tmp_path / "output"),
+            plugins=[Exploder("required")],
+        )
 
-    with pytest.raises(ValueError, match="declares no supported capability"):
-        validate_plugins((Inert(),))
+
+def test_a_best_effort_observer_failure_does_not_fail_the_run(
+    tmp_path: Path,
+) -> None:
+    result = run(
+        _pipeline(),
+        job_id="j1",
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.at(tmp_path / "output"),
+        plugins=[Exploder("best_effort")],
+    )
+    assert result.status == "completed"
+
+
+def test_committed_work_survives_a_required_observer_failure(tmp_path: Path) -> None:
+    """An observer cannot undo what already committed."""
+    storage = DurableStorage.at(tmp_path / "output")
+    pipeline = _pipeline()
+    with pytest.raises(PluginFailureError):
+        run(
+            pipeline,
+            job_id="j1",
+            source=InMemorySource(DOCUMENTS),
+            storage=storage,
+            plugins=[Exploder("required")],
+        )
+    assert len(storage.results(pipeline, job_id="j1").of("load")) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Run guards
+# ---------------------------------------------------------------------------
+
+
+def test_guards_enter_in_order_and_exit_in_reverse(tmp_path: Path) -> None:
+    log: list[str] = []
+    run(
+        _pipeline(),
+        job_id="j1",
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.at(tmp_path / "output"),
+        plugins=[Guard("outer", log), Guard("inner", log)],
+    )
+    assert log == [
+        "enter:outer",
+        "enter:inner",
+        "exit:inner:completed",
+        "exit:outer:completed",
+    ]
+
+
+def test_a_failing_run_still_exits_its_guards(tmp_path: Path) -> None:
+    log: list[str] = []
+
+    def explode(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
+        raise RuntimeError("step failed")
+
+    pipeline = Pipeline(name="documents", stages=[Stage(name="prepare", entries=[Step(explode)])])
+    with pytest.raises(RuntimeError, match="step failed"):
+        run(
+            pipeline,
+            job_id="j1",
+            source=InMemorySource(DOCUMENTS),
+            storage=DurableStorage.at(tmp_path / "output"),
+            plugins=[Guard("outer", log)],
+        )
+    assert log == ["enter:outer", "exit:outer:failed"]
+
+
+def test_teardown_is_attempted_for_every_entered_guard(tmp_path: Path) -> None:
+    log: list[str] = []
+    with pytest.raises(PluginFailureError, match="teardown failed"):
+        run(
+            _pipeline(),
+            job_id="j1",
+            source=InMemorySource(DOCUMENTS),
+            storage=DurableStorage.at(tmp_path / "output"),
+            plugins=[Guard("outer", log), Guard("inner", log, fail_exit=True)],
+        )
+    # The outer guard still got its exit despite the inner one failing.
+    assert "exit:outer:completed" in log
+
+
+# ---------------------------------------------------------------------------
+# Composition validation
+# ---------------------------------------------------------------------------
 
 
 def test_duplicate_plugin_ids_are_rejected() -> None:
-    log: list[str] = []
     with pytest.raises(ValueError, match="Duplicate plugin id"):
-        validate_plugins((RecordingObserver("same", log), RecordingObserver("same", log)))
+        validate_plugins((Recorder(), Recorder()))
 
 
-@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "..", None])
-def test_unsafe_plugin_ids_are_rejected(bad_id: object) -> None:
-    log: list[str] = []
-    observer = RecordingObserver("placeholder", log)
-    observer.plugin_id = bad_id  # type: ignore[assignment]
-    with pytest.raises(ValueError):
-        validate_plugins((observer,))
+def test_a_plugin_with_no_capability_is_rejected() -> None:
+    class Inert:
+        plugin_id = "inert"
+
+    with pytest.raises(ValueError, match="no supported capability"):
+        validate_plugins((Inert(),))
 
 
-def test_observer_criticality_must_be_explicit() -> None:
-    class NoCriticality:
-        plugin_id = "silent"
+def test_an_observer_must_declare_criticality_explicitly() -> None:
+    class Vague:
+        plugin_id = "vague"
 
         def on_event(self, event: RunEvent) -> None: ...
 
     with pytest.raises(ValueError, match="criticality"):
-        validate_plugins((NoCriticality(),))
+        validate_plugins((Vague(),))
 
 
-def test_only_one_checkpoint_capability_allowed() -> None:
-    second = FakeCheckpointPlugin()
-    second.plugin_id = "fake-checkpoint-2"  # type: ignore[misc]
-    with pytest.raises(ValueError, match="Only one plugin may provide the checkpoint"):
-        validate_plugins((FakeCheckpointPlugin(), second))
+def test_a_plugin_id_must_be_one_safe_path_segment() -> None:
+    recorder = Recorder()
+    recorder.plugin_id = "../escape"
+    with pytest.raises(ValueError, match="safe path segment"):
+        validate_plugins((recorder,))
 
 
-# ------------------------------------------------------- ordering / teardown
+def test_the_retired_capabilities_are_gone() -> None:
+    import caravel.plugins as plugins
+
+    for retired in ("CheckpointCapability", "OwnershipCapability", "CheckpointPlugin"):
+        assert not hasattr(plugins, retired), f"{retired} should have been retired"
 
 
-def test_observer_order_and_guard_reverse_teardown(tmp_path: Path) -> None:
-    log: list[str] = []
-    first_obs = RecordingObserver("first", log)
-    second_obs = RecordingObserver("second", log)
-    first_guard = RecordingGuard("guard-a", log)
-    second_guard = RecordingGuard("guard-b", log)
+# ---------------------------------------------------------------------------
+# Run evidence
+# ---------------------------------------------------------------------------
 
-    loader = _StubLoader({"a": {"id": "a"}})
-    pipeline = _linear_pipeline(loader, {})
 
-    result = _run(pipeline, tmp_path, plugins=(first_guard, first_obs, second_guard, second_obs))
+def test_the_evidence_plugin_records_a_real_run(tmp_path: Path) -> None:
+    """The shipped observer must accept the facts this engine actually emits.
 
-    assert log[0] == "guard-a:enter"
-    assert log[1] == "guard-b:enter"
-    assert log[-2:] == ["guard-b:exit:completed", "guard-a:exit:completed"]
+    It validates its own payload against a field set, so a fact renamed in the
+    engine turns every run into a plugin failure. That is only caught by
+    running it, which is what this test does.
+    """
+    from caravel.plugins.run_evidence import RunEvidencePlugin, validate_run_event
 
-    event_pairs = [entry for entry in log if ":" in entry and "guard" not in entry]
-    for i in range(0, len(event_pairs), 2):
-        assert event_pairs[i].startswith("first:")
-        assert event_pairs[i + 1].startswith("second:")
-        assert event_pairs[i].split(":")[1] == event_pairs[i + 1].split(":")[1]
+    evidence = RunEvidencePlugin(metadata_root=tmp_path / "metadata")
+    result = run(
+        _pipeline(),
+        job_id="j1",
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.at(tmp_path / "output"),
+        plugins=[evidence],
+    )
+    assert result.status == "completed"
 
-    kinds = [entry.split(":", 1)[1] for entry in event_pairs if entry.startswith("first:")]
-    assert kinds == [
-        "run_started",
-        "node_started",
-        "node_completed",
-        "node_started",
-        "node_completed",
-        "run_completed",
+    events_dir = Path(evidence.events_dir(result.invocation_id))
+    written = sorted(events_dir.glob("*.json"))
+    assert written, "a completed run must leave evidence"
+
+    kinds = []
+    for path in written:
+        payload = json.loads(path.read_text())
+        # Re-validating proves the record on disk satisfies the same contract,
+        # not merely that something was written.
+        validate_run_event(payload)
+        kinds.append(payload["kind"])
+
+    assert kinds[0] == "run_started"
+    assert kinds[-1] == "run_completed"
+    assert kinds.count("node_started") == len(DOCUMENTS)
+
+    node_events = [
+        json.loads(path.read_text()) for path in written if json.loads(path.read_text())["node"]
     ]
-    assert result.best_effort_errors == ()
+    node = node_events[0]["node"]
+    assert node["partition_id"] in DOCUMENTS
+    assert node["input_scope"] == "partition"
+    assert Path(evidence.summary_path(result.invocation_id)).is_file()
 
 
-def test_guards_receive_failed_outcome_and_run_failed_event(tmp_path: Path) -> None:
-    log: list[str] = []
-    observer = RecordingObserver("obs", log)
-    guard = RecordingGuard("guard", log)
+def test_the_evidence_plugin_records_an_all_scope_node(tmp_path: Path) -> None:
+    def summarize(inputs, *, context: Any) -> Any:
+        del context
+        return {"documents": sum(1 for _ in inputs.partitions())}
 
-    @step(output=JSONDataset(name="boom"))
-    def explode(partitions: object, *, context: object) -> object:
-        _ = context
-        raise RuntimeError("user step failed")
+    from caravel.plugins.run_evidence import RunEvidencePlugin
 
+    evidence = RunEvidencePlugin(metadata_root=tmp_path / "metadata")
     pipeline = Pipeline(
-        name="failing_run",
-        loader=_StubLoader({"a": {"id": "a"}}),
-        stages=[Stage(name="bronze", entries=[explode])],
+        name="documents",
+        stages=[
+            Stage(name="prepare", entries=[Step(load)]),
+            Stage(name="finish", entries=[Step(summarize, input_scope="all")]),
+        ],
     )
-
-    with pytest.raises(RuntimeError, match="user step failed"):
-        _run(pipeline, tmp_path, plugins=(guard, observer))
-
-    assert "guard:exit:failed" in log
-    kinds = [event.kind for event in observer.events]
-    assert kinds == ["run_started", "node_started", "node_failed", "run_failed"]
-    failed_event = observer.events[-2]
-    assert failed_event.error_type == "RuntimeError"
-    assert "user step failed" not in repr(failed_event)
-
-
-def test_required_observer_failure_fails_the_run(tmp_path: Path) -> None:
-    loader = _StubLoader({"a": {"id": "a"}})
-    calls: dict[str, int] = {}
-    pipeline = _linear_pipeline(loader, calls)
-
-    with pytest.raises(PluginFailureError, match="Required observer 'boom'"):
-        _run(pipeline, tmp_path, plugins=(FailingObserver("boom", "required"),))
-
-
-def test_best_effort_observer_failure_is_collected_not_fatal(tmp_path: Path) -> None:
-    loader = _StubLoader({"a": {"id": "a"}})
-    calls: dict[str, int] = {}
-    pipeline = _linear_pipeline(loader, calls)
-
-    result = _run(pipeline, tmp_path, plugins=(FailingObserver("soft", "best_effort"),))
-
-    assert calls == {"bronze": 1, "silver": 1}
-    assert result.best_effort_errors
-    assert all("soft" in message for message in result.best_effort_errors)
-
-
-def test_guard_startup_failure_prevents_user_code(tmp_path: Path) -> None:
-    class BrokenGuard:
-        plugin_id = "broken-guard"
-
-        def enter(self, run: RunFacts) -> None:
-            raise RuntimeError("cannot acquire")
-
-        def exit(self, run: RunFacts, outcome: RunOutcome) -> None: ...
-
-    loader = _StubLoader({"a": {"id": "a"}})
-    calls: dict[str, int] = {}
-    pipeline = _linear_pipeline(loader, calls)
-
-    with pytest.raises(PluginFailureError, match="failed to start"):
-        _run(pipeline, tmp_path, plugins=(BrokenGuard(),))
-
-    assert calls == {}
-    assert loader.load_calls == 0
-
-
-def test_guard_teardown_failure_fails_a_successful_run(tmp_path: Path) -> None:
-    class LeakyGuard:
-        plugin_id = "leaky-guard"
-
-        def enter(self, run: RunFacts) -> None: ...
-
-        def exit(self, run: RunFacts, outcome: RunOutcome) -> None:
-            raise RuntimeError("release failed")
-
-    loader = _StubLoader({"a": {"id": "a"}})
-    calls: dict[str, int] = {}
-    pipeline = _linear_pipeline(loader, calls)
-
-    with pytest.raises(PluginFailureError, match="teardown failed"):
-        _run(pipeline, tmp_path, plugins=(LeakyGuard(),))
-
-    assert calls == {"bronze": 1, "silver": 1}
-
-
-# ------------------------------------------------------ checkpoint seam
-
-
-def test_checkpoint_capability_enables_selective_execution(tmp_path: Path) -> None:
-    from caravel.runner import run
-
-    loader = _StubLoader({"a": {"id": "a"}, "b": {"id": "b"}})
-    calls: dict[str, int] = {}
-    pipeline = _linear_pipeline(loader, calls)
-    plugin = FakeCheckpointPlugin()
-
-    run(pipeline, run_root=tmp_path, plugins=[plugin])
-    assert calls == {"bronze": 1, "silver": 1}
-    assert "invalidate:stage-001-entry-001" in plugin.calls
-    assert plugin.calls.index("invalidate:stage-001-entry-001") < plugin.calls.index(
-        "commit:stage-001-entry-001"
+    result = run(
+        pipeline,
+        job_id="j1",
+        source=InMemorySource(DOCUMENTS),
+        storage=DurableStorage.at(tmp_path / "output"),
+        plugins=[evidence],
     )
+    assert result.status == "completed"
 
-    run(pipeline, run_root=tmp_path, only_stage="silver", plugins=[plugin])
-
-    assert calls == {"bronze": 1, "silver": 2}
-    assert "verdict:stage-001-entry-001" in plugin.calls
-    verdict_context = next(
-        context
-        for context in plugin.contexts
-        if context.node.node_id == "stage-001-entry-001" and context.run.is_selective
-    )
-    assert verdict_context.run.pipeline_name == pipeline.name
-    assert verdict_context.run.run_root == str(tmp_path)
-    assert len(verdict_context.run.run_id) == 32
-
-    silver_file = (
-        tmp_path
-        / pipeline.name
-        / "_002_silver"
-        / "_001_silver_summary"
-        / "_001_silver_summary.json"
-    )
-    assert silver_file.exists()
-
-
-def test_checkpoint_capability_denial_forces_recompute_error(tmp_path: Path) -> None:
-    from caravel.runner import run
-
-    loader = _StubLoader({"a": {"id": "a"}})
-    calls: dict[str, int] = {}
-    pipeline = _linear_pipeline(loader, calls)
-    plugin = FakeCheckpointPlugin(grant=False)
-
-    run(pipeline, run_root=tmp_path, plugins=[plugin])
-
-    with pytest.raises(MissingPriorOutputError, match="no committed evidence"):
-        run(pipeline, run_root=tmp_path, only_stage="silver", plugins=[plugin])
-
-    assert calls == {"bronze": 1, "silver": 1}
-
-
-def test_selective_still_fails_closed_without_capability_plugin(tmp_path: Path) -> None:
-    from caravel.runner import run
-
-    loader = _StubLoader({"a": {"id": "a"}})
-    calls: dict[str, int] = {}
-    pipeline = _linear_pipeline(loader, calls)
-    log: list[str] = []
-
-    run(pipeline, run_root=tmp_path, plugins=[RecordingObserver("only-obs", log)])
-
-    with pytest.raises(UnsupportedCapabilityError):
-        run(
-            pipeline,
-            run_root=tmp_path,
-            only_stage="silver",
-            plugins=[RecordingObserver("only-obs", log)],
-        )
-
-
-def test_skipped_node_emits_node_skipped_event(tmp_path: Path) -> None:
-    from caravel.runner import run
-
-    loader = _StubLoader({"a": {"id": "a"}})
-    pipeline = _linear_pipeline(loader, {})
-    plugin = FakeCheckpointPlugin()
-    log: list[str] = []
-    observer = RecordingObserver("obs", log)
-
-    run(pipeline, run_root=tmp_path, plugins=[plugin, observer])
-    observer.events.clear()
-
-    run(pipeline, run_root=tmp_path, only_stage="silver", plugins=[plugin, observer])
-
-    kinds = [event.kind for event in observer.events]
-    assert kinds == [
-        "run_started",
-        "node_skipped",
-        "node_started",
-        "node_completed",
-        "run_completed",
-    ]
-    skipped = observer.events[1]
-    assert skipped.node is not None
-    assert skipped.node.node_id == "stage-001-entry-001"
-
-
-def test_plugins_empty_executes_without_plugin_callbacks(tmp_path: Path) -> None:
-    from caravel.runner import run
-
-    loader = _StubLoader({"a": {"id": "a"}})
-    pipeline = _linear_pipeline(loader, {})
-
-    run(pipeline, run_root=tmp_path, plugins=[])
+    scopes = {
+        json.loads(path.read_text())["node"]["input_scope"]
+        for path in Path(evidence.events_dir(result.invocation_id)).glob("*.json")
+        if json.loads(path.read_text())["node"]
+    }
+    assert scopes == {"partition", "all"}

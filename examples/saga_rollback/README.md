@@ -26,8 +26,8 @@ the created shipment. The journal has status `committed`, and the intended
 pipeline result is written to:
 
 ```text
-data/output/saga_rollback_example/pipeline/saga_rollback_example/
-  _001_fulfillment/_004_finalize_order/_004_finalize_order.json
+data/output/saga_rollback_example/output/saga_rollback_example/saga-1/
+  001-fulfillment/004-finalize_order/order/order.json
 ```
 
 This is not an ACID transaction. Other processes can observe intermediate

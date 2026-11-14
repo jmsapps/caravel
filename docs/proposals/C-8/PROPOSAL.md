@@ -210,7 +210,7 @@ Names below are illustrative; implementation must preserve the semantics.
 | `BatchSink` | Writes isolated durable batch output and loads output referenced by committed records. |
 | `ProgressStore` | Reads state and conditionally commits progress using a generation/version check. |
 | `BatchFeed` | Lists committed batch references after a consumer position and exposes node/job completion state. |
-| `RetryPolicy` and retry utility | Define and execute the same retry contract at a selected step, batch, record, or operation boundary. |
+| `RetryOptions` and `retry_operation` | Define and execute the same retry contract at a selected stage, step, helper, or operation boundary. |
 | `run(..., pipeline_id=..., job_id=..., budget=...)` | Starts or continues a bounded snapshot/incremental run and returns a structured status. |
 
 ### Unified step and batching defaults
@@ -244,13 +244,20 @@ batched output use the same publication contract.
 
 | Configuration | Readiness and execution |
 | --- | --- |
-| `input_scope="partition"` (default) | Run for each partition as soon as its required upstream partition output commits, while other partitions may still be loading. |
-| `input_scope="all"` | Wait for sealed upstream production and completion of every required upstream partition, then execute once logically over the full committed dataset. |
+| `Step(fn)` / `input_scope="partition"` (default) | Run for each partition as soon as its required upstream partition output commits, while other partitions may still be loading. |
+| `Step(fn, input_scope="all")` | Wait for sealed upstream production and completion of every required upstream partition, then execute once logically over the full committed dataset. |
 
-All-input steps receive a dataset reader or manifest rather than an eagerly
+Scope is declared on the step and compiled without running the processor. Both
+scopes pass the same `StepInputs` object, yielding the same `InputPartition`
+handles; scope changes readiness and membership, never the argument type.
+All-input steps receive handles that load on demand rather than an eagerly
 materialized dataset. Optional batching bounds their work within one logical
 aggregate operation. Aggregate output becomes one stable partition for subsequent
-steps. Partition-scoped steps preserve partition identity; arbitrary repartitioning
+steps. That partition's identity is private scheduling and recovery state:
+published paths, result keys, manifest entries, and feed addresses use the step's
+declared dataset name, which defaults to the declared step name. `input_scope="all"`
+selects input availability and readiness; it does not select an output name.
+Partition-scoped steps preserve partition identity; arbitrary repartitioning
 and partition fan-out require a separate contract.
 
 "All" means the selected snapshot or bounded incremental range, never an endless
@@ -305,7 +312,7 @@ pipeline = Pipeline(
 )
 ```
 
-Every step defaults to `input_scope="partition"` and `batch_size=None`. With a
+Every step runs per partition unless it declares `input_scope="all"`, and defaults to `batch_size=None`. With a
 partitioned source, the default single worker can execute:
 
 ```text
@@ -398,7 +405,7 @@ pipeline = Pipeline(
         Stage(name="publish", entries=[Step(sync_index)]),
         Stage(
             name="summary",
-            entries=[Step(summarize, input_scope="all")],
+            entries=[Step(summarize)],
         ),
     ],
 )
@@ -410,53 +417,55 @@ and sealed upstream production. For incremental input, it summarizes this run's
 change output; a full current-state summary requires an application-provided
 materialized view.
 
-### Choose recovery granularity and reuse one retry policy
+### Choose recovery granularity and reuse one retry configuration
 
 ```python
-from caravel import RetryPolicy, retry
+from caravel import RetryOptions, Step, retry_operation
 from application.errors import VendorError
 
-default_retry = RetryPolicy()            # 3 retries, exponential backoff + jitter
+default_retry = RetryOptions()           # 4 total attempts, backoff + jitter
 
-def retryable(failure):
-    error = failure.exception
+def retryable(error):
     return (
-        default_retry.should_retry(failure)
+        default_retry.should_retry_error(error)
         or isinstance(error, VendorError) and error.code == "TEMPORARILY_BUSY"
     )
 
-vendor_retry = RetryPolicy(when=retryable)
+vendor_retry = RetryOptions(should_retry_error=retryable)
 
-# Retry only a record operation inside the batch.
-def enrich_batch(records, context):
+# Retry only a record operation inside the batch. The managed deadline,
+# cancellation, and shared allowance are inherited; there is no context to pass.
+def enrich(inputs, *, context):
     return [
-        retry(
-            lambda: enrich_record(record),
-            policy=vendor_retry,
-            context=context,             # shares deadline and any retry budget
-        )
-        for record in records
+        retry_operation(
+            operation=lambda record=record: enrich_record(record), retry=vendor_retry
+        )[0]
+        for partition in inputs.partitions()
+        for record in partition.load()
     ]
 
-record_retry_step = Step(enrich_batch, batch_size=100)  # no outer retry enabled
+record_retry_step = Step(enrich, batch_size=100)   # no outer retry enabled
 
 # Alternatively, retry the batch as a whole, using a processor without inner retries.
-def enrich_without_inner_retry(records, context):
-    return [enrich_record(record) for record in records]
+def enrich_without_inner_retry(inputs, *, context):
+    return [
+        enrich_record(record)
+        for partition in inputs.partitions()
+        for record in partition.load()
+    ]
 
 batched_step = Step(enrich_without_inner_retry, batch_size=100, retry=vendor_retry)
-per_record_commit_step = Step(
-    enrich_without_inner_retry, batch_size=1, retry=vendor_retry
-)
+per_record_commit_step = Step(enrich_without_inner_retry, batch_size=1, retry=vendor_retry)
 ```
 
 These are alternative configurations. A batch-enabled step requires a replayable
-batch reader over its selected input scope. Batch processors receive a collection,
+batch reader over its selected input scope. A batched step's handle `load()` returns a collection,
 including a one-record collection when size is 1. With size 100, record retry
 success remains in memory until the batch commits: termination
 can repeat those records. Size 1 gives each record a durable commit boundary.
-Applications can also match explicit error text through the failure context;
-default classification does not guess from arbitrary messages.
+Applications can also match explicit error text in their own
+`should_retry_error` predicate; default classification does not guess from
+arbitrary messages.
 
 ### Optional parallel workers
 
@@ -595,15 +604,16 @@ must retain its uncertain-outcome reconciliation rules under every policy.
 | Setting | Default and contract |
 | --- | --- |
 | Retry condition | Recognized transient failures: connection failures, timeouts, rate limits, and temporary service failures. |
-| Maximum retries | Three retries after the initial attempt: at most four attempts at the selected boundary. Zero disables retries. |
-| Backoff | Full jitter exponential backoff: before retry number `n` (starting at 1), sample uniformly between zero and `min(30 seconds, 1 second * 2^(n-1))`. |
-| Maximum elapsed time | Bounded by the enclosing execution budget; users may set a stricter elapsed-time limit. |
-| Activation | The default policy applies when retries are enabled at a selected boundary. Nested boundaries acquire no automatic retry policy. |
+| Maximum attempts | `max_attempts=4`, counting the initial call: three retries at the selected boundary. `max_attempts=1` permits the initial call without retry; `retry=None` disables the boundary. |
+| Backoff | `compute_retry_delay`: capped exponential plus jitter. Before retry number `n` (starting at 1), wait `min(2^(n-1), 16)` seconds plus up to one second, so at most 17 seconds. |
+| Maximum elapsed time | Bounded by the enclosing execution budget, plus a shared invocation allowance (`ExecutionPolicy(max_retry_attempts=...)`, 100 by default) that only retries consume. |
+| Activation | The default options apply when retries are enabled at a selected boundary. Nested boundaries acquire no automatic retry options. |
 
-Conditions are user-definable predicates over a structured failure context,
-including the exception, attempt number, scope identity, elapsed time, and
-available error code, response status, or error text. Users can extend the default
-classifier or replace it. SDK-specific status/code extraction uses explicit
+Conditions are user-definable predicates over the bare exception.
+`should_retry_error` receives the raised exception and `should_retry_result`
+receives the returned value. Users can extend the default classification by
+calling `RetryOptions().should_retry_error(error)` inside their own predicate,
+or replace it outright. SDK-specific status/code extraction uses explicit
 adapters; arbitrary exception text is not classified as transient by default.
 Successful return values are accepted unless the caller explicitly supplies a
 result classifier for APIs that return failures instead of raising exceptions.

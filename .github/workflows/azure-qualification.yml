@@ -49,21 +49,31 @@ jobs:
             echo "Configure an account key, SAS token, or complete service-principal credentials." >&2
             exit 1
           fi
-      - name: Run full and selective qualification
+      - name: Run the production profile and prove it resumes
         env:
           QUALIFICATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           export CARAVEL_METADATA_ROOT="${CARAVEL_AZURE_QUALIFICATION_PREFIX%/}/${QUALIFICATION_ID}/metadata"
           RUN_ROOT="${CARAVEL_AZURE_QUALIFICATION_PREFIX%/}/${QUALIFICATION_ID}/output"
-          python -m examples.production_profile --run-root "$RUN_ROOT"
-          python -m examples.production_profile --run-root "$RUN_ROOT" --stage silver
+          # The authoritative progress store requires a local filesystem; only
+          # committed artifacts go to Azure.
+          STATE_ROOT="${RUNNER_TEMP}/caravel-state/${QUALIFICATION_ID}"
+          python -m examples.production_profile \
+            --output "$RUN_ROOT" --state "$STATE_ROOT" --job-id "$QUALIFICATION_ID"
+          # Re-invoking the same job must restore committed work rather than
+          # recompute it, which is the durable claim worth qualifying.
+          python -m examples.production_profile \
+            --output "$RUN_ROOT" --state "$STATE_ROOT" --job-id "$QUALIFICATION_ID"
       - name: Run Azure backend contracts
         env:
           QUALIFICATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          export CARAVEL_AZURE_TEST_ROOT="${CARAVEL_AZURE_QUALIFICATION_PREFIX%/}/${QUALIFICATION_ID}/contracts"
+          export CARAVEL_QUALIFICATION_ARTIFACTS_ROOT="${CARAVEL_AZURE_QUALIFICATION_PREFIX%/}/${QUALIFICATION_ID}/contracts"
+          # Pinning a credentialed root disables emulator auto-start, so the
+          # artifact contracts run against the real service.
+          export CARAVEL_QUALIFICATION_STORAGE_OPTIONS="$(python -c 'import json, os; from examples.production_profile.profile import storage_options_for_url; print(json.dumps(storage_options_for_url(os.environ["CARAVEL_QUALIFICATION_ARTIFACTS_ROOT"]) or {}))')"
           mkdir -p qualification-results
-          python -m pytest -q tests/qualification/test_azure_profile.py \
+          python -m pytest -q tests/qualification/test_remote_artifacts.py \
             --junitxml=qualification-results/azure-contracts.xml
           python -m pip freeze > qualification-results/dependencies.txt
       - name: Publish sanitized qualification report

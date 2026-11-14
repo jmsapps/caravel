@@ -1,204 +1,156 @@
+"""The CLI drives the one durable execution model."""
+
+from __future__ import annotations
+
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from caravel.cli import make_cli
+from caravel import InMemorySource, JSONDataset, Pipeline, Stage, Step, make_cli
+
+DOCUMENTS = {"doc-1": {"id": "doc-1"}, "doc-2": {"id": "doc-2"}}
 
 
-class _StubPipeline:
-    def __init__(self, name: str = "cli_pipeline") -> None:
-        self.name = name
-        self.stages: list[object] = []
+def load(inputs, *, context: Any) -> Any:
+    [partition] = inputs.partitions()
+    document: Any = partition.load()
+    return {**document, "loaded": True}
 
 
-def test_make_cli_executes_without_run_root_and_uses_runner_default() -> None:
-    calls: list[dict[str, object]] = []
-
-    def _fake_run(pipeline: object, **kwargs: object) -> Path:
-        calls.append({"pipeline": pipeline, **kwargs})
-        return Path(".")
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-
-    exit_code = cli([])
-
-    assert exit_code == 0
-    assert len(calls) == 1
-    assert calls[0]["run_root"] is None
+def _pipeline() -> Pipeline:
+    return Pipeline(
+        name="documents",
+        stages=[Stage(name="prepare", entries=[Step(load, output=JSONDataset(name="load"))])],
+        source=InMemorySource(DOCUMENTS),
+    )
 
 
-def test_make_cli_forwards_run_root_to_runner(tmp_path: Path) -> None:
-    calls: list[dict[str, object]] = []
-
-    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
-        calls.append(kwargs)
-        return tmp_path
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-    run_root = tmp_path / "custom_root"
-
-    exit_code = cli(["--run-root", str(run_root)])
-
-    assert exit_code == 0
-    assert calls[0]["run_root"] == run_root
+def test_a_durable_run_needs_a_state_directory_and_a_job_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = make_cli(_pipeline())
+    assert cli(["--output", str(tmp_path / "output"), "--job-id", "j1"]) == 0
+    out = capsys.readouterr().out
+    assert "status=completed" in out
+    assert "restart_safe=True" in out
 
 
-def test_make_cli_preserves_url_run_root_as_string(tmp_path: Path) -> None:
-    calls: list[dict[str, object]] = []
-
-    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
-        calls.append(kwargs)
-        return tmp_path
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-    remote_root = "memory://caravel/runs/demo"
-
-    exit_code = cli(["--run-root", remote_root])
-
-    assert exit_code == 0
-    assert calls[0]["run_root"] == remote_root
+def test_omitting_a_storage_decision_is_an_error(tmp_path: Path) -> None:
+    cli = make_cli(_pipeline())
+    with pytest.raises(SystemExit):
+        cli([])
 
 
-def test_make_cli_forwards_stage_and_step_selectors(tmp_path: Path) -> None:
-    calls: list[dict[str, object]] = []
-
-    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
-        calls.append(kwargs)
-        return tmp_path
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-
-    exit_code = cli(["--run-root", str(tmp_path), "--stage", "silver", "--step", "normalize"])
-
-    assert exit_code == 0
-    assert calls[0]["only_stage"] == "silver"
-    assert calls[0]["only_step"] == "normalize"
+def test_state_without_a_job_id_is_an_error(tmp_path: Path) -> None:
+    cli = make_cli(_pipeline())
+    with pytest.raises(SystemExit):
+        cli(["--output", str(tmp_path / "output")])
 
 
-def test_make_cli_parses_numeric_stage_step_as_int(tmp_path: Path) -> None:
-    calls: list[dict[str, object]] = []
-
-    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
-        calls.append(kwargs)
-        return tmp_path
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-
-    exit_code = cli(["--run-root", str(tmp_path), "--stage", "2", "--step", "03"])
-
-    assert exit_code == 0
-    assert calls[0]["only_stage"] == 2
-    assert calls[0]["only_step"] == 3
+def test_state_and_ephemeral_are_mutually_exclusive(tmp_path: Path) -> None:
+    cli = make_cli(_pipeline())
+    with pytest.raises(SystemExit):
+        cli(
+            [
+                "--output",
+                str(tmp_path / "output"),
+                "--state",
+                str(tmp_path / ".caravel"),
+                "--ephemeral",
+            ]
+        )
 
 
-def test_make_cli_forwards_custom_params_map(tmp_path: Path) -> None:
-    calls: list[dict[str, object]] = []
-
-    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
-        calls.append(kwargs)
-        return tmp_path
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-
-    exit_code = cli(["--run-root", str(tmp_path), "--param", "refresh=hard", "--param", "lang=en"])
-
-    assert exit_code == 0
-    assert calls[0]["params"] == {"refresh": "hard", "lang": "en"}
+def test_an_ephemeral_run_needs_no_job_id_and_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = make_cli(_pipeline())
+    assert cli(["--output", str(tmp_path / "output"), "--ephemeral"]) == 0
+    assert "restart_safe=False" in capsys.readouterr().out
 
 
-def test_make_cli_forwards_keep_source_tag_flag(tmp_path: Path) -> None:
-    calls: list[dict[str, object]] = []
+def test_params_reach_the_run(tmp_path: Path) -> None:
+    seen: dict[str, str] = {}
 
-    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
-        calls.append(kwargs)
-        return tmp_path
+    def capture(inputs, *, context: Any) -> Any:
+        [partition] = inputs.partitions()
+        document: Any = partition.load()
+        seen.update(context.params)
+        return document
 
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-
-    exit_code = cli(["--run-root", str(tmp_path), "--keep-source-tag"])
-
-    assert exit_code == 0
-    assert calls[0]["keep_source_tag"] is True
-
-
-def test_make_cli_mermaid_mode_emits_graph_without_running_pipeline(tmp_path: Path) -> None:
-    run_calls: list[dict[str, object]] = []
-    mermaid_calls: list[object] = []
-
-    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
-        run_calls.append(kwargs)
-        return tmp_path
-
-    def _fake_mermaid(pipeline: object) -> str:
-        mermaid_calls.append(pipeline)
-        return "flowchart TD\n  A-->B\n"
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run, mermaid_fn=_fake_mermaid)
-    out_file = tmp_path / "graph.mmd"
-
-    exit_code = cli(["--mermaid", str(out_file)])
-
-    assert exit_code == 0
-    assert len(run_calls) == 0
-    assert len(mermaid_calls) == 1
-    assert out_file.read_text(encoding="utf-8").startswith("flowchart TD")
+    pipeline = Pipeline(
+        name="documents",
+        stages=[Stage(name="prepare", entries=[Step(capture)])],
+        source=InMemorySource(DOCUMENTS),
+    )
+    cli = make_cli(pipeline)
+    assert (
+        cli(["--output", str(tmp_path / "output"), "--job-id", "j1", "--param", "env=staging"]) == 0
+    )
+    assert seen["env"] == "staging"
 
 
-def test_make_cli_rejects_mermaid_with_execution_flags() -> None:
-    cli = make_cli(_StubPipeline(), run_fn=lambda _pipeline, **_kwargs: Path("."))
-
-    with pytest.raises(SystemExit) as exc:
-        cli(["--mermaid", "out.mmd", "--stage", "1"])
-
-    assert exc.value.code == 2
+def test_a_malformed_param_is_rejected(tmp_path: Path) -> None:
+    cli = make_cli(_pipeline())
+    with pytest.raises(SystemExit):
+        cli(["--output", str(tmp_path / "output"), "--job-id", "j1", "--param", "novalue"])
 
 
-def test_make_cli_mermaid_uses_default_renderer_when_available(tmp_path: Path) -> None:
-    run_calls: list[dict[str, object]] = []
-
-    def _fake_run(_pipeline: object, **kwargs: object) -> Path:
-        run_calls.append(kwargs)
-        return tmp_path
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-    out_file = tmp_path / "default_graph.mmd"
-
-    exit_code = cli(["--mermaid", str(out_file)])
-
-    assert exit_code == 0
-    assert len(run_calls) == 0
-    assert out_file.exists()
-    assert out_file.read_text(encoding="utf-8").startswith("flowchart TD")
-
-
-def test_make_cli_selector_validation_error_surfaces_user_message(
+def test_the_graph_flag_prints_mermaid_without_running(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def _fake_run(_pipeline: object, **_kwargs: object) -> Path:
-        raise ValueError("Invalid stage name selector: 'missing'.")
-
-    cli = make_cli(_StubPipeline(), run_fn=_fake_run)
-
-    with pytest.raises(SystemExit) as exc:
-        cli(["--run-root", "data/run", "--stage", "missing"])
-
-    assert exc.value.code == 2
-    err = capsys.readouterr().err
-    assert "Invalid stage name selector" in err
+    cli = make_cli(_pipeline())
+    assert cli(["--graph"]) == 0
+    assert "flowchart" in capsys.readouterr().out.lower()
 
 
-def test_make_cli_help_contains_expected_options(capsys: pytest.CaptureFixture[str]) -> None:
-    cli = make_cli(_StubPipeline(), run_fn=lambda _pipeline, **_kwargs: Path("."))
+def test_resuming_the_same_job_reprocesses_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = make_cli(_pipeline())
+    cli(["--output", str(tmp_path / "output"), "--job-id", "j1"])
+    capsys.readouterr()
+    assert cli(["--output", str(tmp_path / "output"), "--job-id", "j1"]) == 0
+    assert "batches=0" in capsys.readouterr().out
 
-    with pytest.raises(SystemExit) as exc:
+
+def test_help_describes_the_storage_decision(capsys: pytest.CaptureFixture[str]) -> None:
+    cli = make_cli(_pipeline())
+    with pytest.raises(SystemExit):
         cli(["--help"])
+    help_text = capsys.readouterr().out
+    for flag in ("--state", "--ephemeral", "--job-id", "--param", "--graph"):
+        assert flag in help_text
 
-    assert exc.value.code == 0
-    out = capsys.readouterr().out
-    assert "--run-root" in out
-    assert "--stage" in out
-    assert "--step" in out
-    assert "--param" in out
-    assert "--hard-refresh" not in out
-    assert "--keep-source-tag" in out
-    assert "--mermaid" in out
+
+def test_observers_passed_to_the_cli_reach_the_run(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class Recorder:
+        plugin_id = "recorder"
+        criticality = "best_effort"
+
+        def on_event(self, event: Any) -> None:
+            events.append(event.kind)
+
+    cli = make_cli(_pipeline(), plugins=[Recorder()])
+    assert cli(["--output", str(tmp_path / "output"), "--job-id", "j1"]) == 0
+    assert "run_started" in events and "run_completed" in events
+
+
+def test_committed_output_is_readable_after_a_cli_run(tmp_path: Path) -> None:
+    from caravel import DurableStorage
+
+    pipeline = _pipeline()
+    cli = make_cli(pipeline)
+    cli(["--output", str(tmp_path / "output"), "--job-id", "j1"])
+
+    storage = DurableStorage.at(tmp_path / "output")
+    try:
+        results = storage.results(pipeline, job_id="j1").of("load")
+        assert results["doc-1"] == {"id": "doc-1", "loaded": True}
+        assert json.dumps(results, sort_keys=True)
+    finally:
+        storage.close()

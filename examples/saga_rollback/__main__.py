@@ -18,7 +18,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     root = Path("data/output/saga_rollback_example")
     run_saga_pipeline(
-        run_root=root / "pipeline",
+        state_root=root,
         state_path=root / "external_state.json",
         journal_path=root / "compensation_journal.json",
         fail=not args.succeed,

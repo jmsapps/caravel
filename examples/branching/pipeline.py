@@ -4,15 +4,15 @@ from pathlib import Path
 from typing import Any
 
 from caravel import (
-    SOURCE_FIELD,
+    DurableStorage,
     Branch,
     MultiSourceLoader,
     PartitionedJSONDataset,
     PartitionedTextDataset,
     Pipeline,
     Stage,
+    Step,
     run,
-    step,
 )
 
 PIPELINE_NAME = "branching_example"
@@ -67,140 +67,78 @@ def make_branching_loader(
     )
 
 
-@step(output=PartitionedJSONDataset())
-def bronze_normalize_json_source(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Normalize JSON-source records onto a shared schema keyed by logical `id`."""
-    _ = context
-    normalized: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
-        if not isinstance(record, dict):
-            raise TypeError(
-                f"Expected dict record for partition '{key}', got {type(record).__name__}."
-            )
-
-        source_name = str(record.get(SOURCE_FIELD, ""))
-        if source_name != JSON_SOURCE_NAME:
-            raise ValueError(
-                f"Expected source '{JSON_SOURCE_NAME}' for partition '{key}', got '{source_name}'."
-            )
-
-        item_id = str(record["id"])
-        language = str(record["language"])
-        content = str(record["body"])
-
-        normalized[item_id] = {
+def bronze_normalize_json_source(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+    """Normalize one JSON-sourced record. Runs only for partitions routed here."""
+    records = {}
+    for partition in inputs.partitions():
+        record = partition.load()
+        payload = record.get("content", record)
+        item_id = str(payload["id"])
+        if item_id in records:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        records[item_id] = {
             "id": item_id,
-            "language": language,
-            "source": source_name,
-            "content": content,
-            "title": str(record.get("title", "")),
-            "origin_partition": key,
+            "lang": str(payload["language"]),
+            "title": str(payload["title"]),
+            "body": str(payload["body"]),
+            "origin": "json",
         }
+    return records
 
-    return normalized
 
-
-@step(output=PartitionedJSONDataset())
-def bronze_normalize_html_source(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Normalize HTML-source records onto the same schema keyed by logical `id`."""
-    _ = context
-    normalized: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
-        if not isinstance(record, dict):
-            raise TypeError(
-                f"Expected dict record for partition '{key}', got {type(record).__name__}."
-            )
-
-        source_name = str(record.get(SOURCE_FIELD, ""))
-        if source_name != HTML_SOURCE_NAME:
-            raise ValueError(
-                f"Expected source '{HTML_SOURCE_NAME}' for partition '{key}', got '{source_name}'."
-            )
-
-        html = str(record["content"])
+def bronze_normalize_html_source(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+    """Normalize one HTML-sourced record. Runs only for partitions routed here."""
+    records = {}
+    for partition in inputs.partitions():
+        record = partition.load()
+        html = record.get("content", record)
+        if not isinstance(html, str):
+            raise TypeError(f"Expected HTML text, got {type(html).__name__}.")
         item_id = _extract_between(html, 'data-id="', '"')
-        language = _extract_between(html, 'data-lang="', '"')
-        title = _extract_between(html, "<h1>", "</h1>")
-        content = _extract_between(html, "<p>", "</p>")
-
-        normalized[item_id] = {
+        if item_id in records:
+            raise ValueError(f"Duplicate record key: {item_id}")
+        records[item_id] = {
             "id": item_id,
-            "language": language,
-            "source": source_name,
-            "content": content,
-            "title": title,
-            "origin_partition": key,
+            "lang": _extract_between(html, 'data-lang="', '"'),
+            "title": _extract_between(html, "<h1>", "</h1>"),
+            "body": _extract_between(html, "<p>", "</p>"),
+            "origin": "html",
         }
+    return records
 
-    return normalized
 
-
-@step(output=PartitionedJSONDataset())
-def silver_unify_records(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Validate and preserve a uniform record contract after branch convergence."""
-    _ = context
+def silver_unify_records(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+    """Unify the available normalized records."""
     unified: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
-        required = {"id", "language", "source", "content"}
-        missing = required.difference(record)
-        if missing:
-            raise KeyError(f"Unified record '{key}' missing required fields: {sorted(missing)}")
-
-        unified[key] = {
-            "id": str(record["id"]),
-            "language": str(record["language"]),
-            "source": str(record["source"]),
-            "content": str(record["content"]),
-            "title": str(record.get("title", "")),
-            "origin_partition": str(record.get("origin_partition", key)),
-        }
-
+    for partition in inputs.partitions():
+        for key, record in sorted(partition.load().items()):
+            if key in unified:
+                raise ValueError(f"Duplicate record key: {key}")
+            unified[key] = {**record, "unified": True}
     return unified
 
 
-@step(output=PartitionedJSONDataset())
-def bronze_converged_records(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Persist merged branch output as a stage-terminal Step for downstream seeding."""
-    _ = context
-    return {key: dict(record) for key, record in sorted(partitions.items())}
+def bronze_converged_records(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+    """Collect available converged records without changing their keys."""
+    unified: dict[str, dict[str, Any]] = {}
+    for partition in inputs.partitions():
+        for key, record in sorted(partition.load().items()):
+            if key in unified:
+                raise ValueError(f"Duplicate record key: {key}")
+            unified[key] = {**record, "unified": True}
+    return unified
 
 
-@step(output=PartitionedJSONDataset())
-def gold_partition_by_language(
-    partitions: dict[str, dict[str, Any]], *, context: object
-) -> dict[str, dict[str, Any]]:
-    """Repartition converged records using path-style language keys (`<lang>/<id>`)."""
-    _ = context
-    repartitioned: dict[str, dict[str, Any]] = {}
-
-    for key in sorted(partitions):
-        record = partitions[key]
-        item_id = str(record["id"])
-        language = str(record["language"])
-
-        repartitioned[f"{language}/{item_id}"] = {
-            "id": item_id,
-            "language": language,
-            "source": str(record["source"]),
-            "content": str(record["content"]),
-            "origin_key": key,
-        }
-
-    return repartitioned
+def gold_partition_by_language(inputs, *, context: object) -> dict[str, dict[str, Any]]:
+    """Key available records by language, under either input scope."""
+    unified: dict[str, dict[str, Any]] = {}
+    for partition in inputs.partitions():
+        for record in partition.load().values():
+            key = f"{record['lang']}/{record['id']}"
+            if key in unified:
+                raise ValueError(f"Duplicate record key: {key}")
+            unified[key] = {**record, "unified": True}
+    return unified
 
 
 def build_branching_pipeline(
@@ -218,34 +156,51 @@ def build_branching_pipeline(
         name=BRANCH_STEP_NAME,
         by="source",
         routes={
-            JSON_SOURCE_NAME: [bronze_normalize_json_source],
-            HTML_SOURCE_NAME: [bronze_normalize_html_source],
+            JSON_SOURCE_NAME: [Step(bronze_normalize_json_source, output=PartitionedJSONDataset())],
+            HTML_SOURCE_NAME: [Step(bronze_normalize_html_source, output=PartitionedJSONDataset())],
         },
     )
 
     return Pipeline(
         name=PIPELINE_NAME,
-        loader=loader,
+        source=loader,
         stages=[
-            Stage(name=BRONZE_STAGE_NAME, entries=[branch_entry, bronze_converged_records]),
-            Stage(name=SILVER_STAGE_NAME, entries=[silver_unify_records]),
-            Stage(name=GOLD_STAGE_NAME, entries=[gold_partition_by_language]),
+            Stage(
+                name=BRONZE_STAGE_NAME,
+                entries=[
+                    branch_entry,
+                    Step(bronze_converged_records, output=PartitionedJSONDataset()),
+                ],
+            ),
+            Stage(
+                name=SILVER_STAGE_NAME,
+                entries=[Step(silver_unify_records, output=PartitionedJSONDataset())],
+            ),
+            Stage(
+                name=GOLD_STAGE_NAME,
+                entries=[Step(gold_partition_by_language, output=PartitionedJSONDataset())],
+            ),
         ],
     )
 
 
 def run_branching_pipeline(
     *,
-    run_root: Path | str | None = None,
+    state_root: Path | str,
+    job_id: str = "branching-1",
     json_source_dir: Path | str | None = None,
     html_source_dir: Path | str | None = None,
-) -> Path | str:
-    """Run the branching pipeline and return the resolved run root."""
+) -> Any:
+    """Run the branching example and return its structured status."""
     pipeline = build_branching_pipeline(
-        json_source_dir=json_source_dir,
-        html_source_dir=html_source_dir,
+        json_source_dir=json_source_dir, html_source_dir=html_source_dir
     )
-    return run(pipeline, run_root=run_root)
+    return run(
+        pipeline,
+        job_id=job_id,
+        source=pipeline.source,
+        storage=DurableStorage.at(Path(state_root) / "output"),
+    )
 
 
 __all__ = [
